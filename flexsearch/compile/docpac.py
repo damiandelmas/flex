@@ -109,12 +109,9 @@ def parse_docpac(root, facet: str = None,
         # Infer temporal + doc_type from folder path
         temporal, doc_type = _infer_from_path(filepath, root)
 
-        # Extract temporal from filename (overrides folder if present)
-        file_temporal = _extract_temporal(filepath.name)
-
         entries.append(DocPacEntry(
             path=str(filepath),
-            temporal=file_temporal or temporal,
+            temporal=temporal,
             doc_type=doc_type,
             facet=entry_facet,
             title=_extract_title(filepath.name),

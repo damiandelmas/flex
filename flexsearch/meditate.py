@@ -153,7 +153,7 @@ def compute_scores(G) -> dict:
 
 def persist(db: sqlite3.Connection, scores: dict,
             table: str = '_enrich_source_graph',
-            id_col: str = 'chunk_id'):
+            id_col: str = None):
     """
     Write graph scores to enrichment table.
 
@@ -164,8 +164,12 @@ def persist(db: sqlite3.Connection, scores: dict,
         db: SQLite connection
         scores: Output from compute_scores()
         table: Target enrichment table
-        id_col: Column for the node identifier
+        id_col: Column for the node identifier. Auto-detected from table
+                name if None: 'source_id' if 'source' in table, else 'chunk_id'.
     """
+    if id_col is None:
+        id_col = 'source_id' if 'source' in table else 'chunk_id'
+
     # Create table if not exists
     db.execute(f"""
         CREATE TABLE IF NOT EXISTS [{table}] (

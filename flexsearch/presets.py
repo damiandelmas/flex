@@ -147,12 +147,13 @@ class PresetLoader:
 
     @staticmethod
     def _interpolate(sql: str, params: dict) -> str:
-        """Replace :named_params with values."""
+        """Replace :named_params with values (escaped)."""
         for key, value in params.items():
             placeholder = f":{key}"
             if placeholder in sql:
                 if isinstance(value, str):
-                    sql = sql.replace(placeholder, f"'{value}'")
+                    escaped = value.replace("'", "''")
+                    sql = sql.replace(placeholder, f"'{escaped}'")
                 else:
                     sql = sql.replace(placeholder, str(value))
         return sql
