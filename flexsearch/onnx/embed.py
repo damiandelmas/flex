@@ -66,7 +66,7 @@ class ONNXEmbedder:
         sentences: Union[str, List[str]],
         batch_size: int = 32,
         normalize: bool = True,
-        show_progress_bar: bool = False,
+        show_progress_bar: bool = False,  # noqa: ARG002 — sentence-transformers API compat
     ) -> np.ndarray:
         """
         Encode sentences to embeddings.
@@ -75,6 +75,7 @@ class ONNXEmbedder:
             sentences: Single sentence or list of sentences
             batch_size: Batch size for encoding
             normalize: Whether to L2-normalize embeddings
+            show_progress_bar: Ignored. Exists for sentence-transformers API compatibility.
 
         Returns:
             numpy array of shape (n_sentences, 384)

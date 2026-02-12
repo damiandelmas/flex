@@ -338,6 +338,23 @@ class TestFTS:
         assert 'raw_chunks_ad' in trigger_names, "Missing AFTER DELETE trigger"
         assert 'raw_chunks_au' in trigger_names, "Missing AFTER UPDATE trigger"
 
+    def test_fts_synced_on_delete(self, qmem_cell):
+        """Deleting a chunk should remove it from FTS."""
+        before = qmem_cell.execute("SELECT COUNT(*) FROM chunks_fts").fetchone()[0]
+        qmem_cell.execute("DELETE FROM _raw_chunks WHERE id = 'src-arch:0'")
+        after = qmem_cell.execute("SELECT COUNT(*) FROM chunks_fts").fetchone()[0]
+        assert after == before - 1
+
+    def test_fts_synced_on_update(self, qmem_cell):
+        """Updating chunk content should update FTS."""
+        qmem_cell.execute(
+            "UPDATE _raw_chunks SET content = 'UNIQUE_CANARY_TEXT' WHERE id = 'src-arch:0'"
+        )
+        result = qmem_cell.execute(
+            "SELECT COUNT(*) FROM chunks_fts WHERE chunks_fts MATCH 'UNIQUE_CANARY_TEXT'"
+        ).fetchone()[0]
+        assert result == 1
+
 
 # =============================================================================
 # Embedding Storage Tests

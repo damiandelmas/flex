@@ -315,14 +315,3 @@ def thread_cell():
     conn.close()
 
 
-@pytest.fixture
-def live_thread_db():
-    """Read-only connection to real thread cell (skips if not found)."""
-    from pathlib import Path
-    db_path = Path.home() / ".qmem" / "cells" / "projects" / "thread" / "main.db"
-    if not db_path.exists():
-        pytest.skip("Thread cell not found")
-    conn = sqlite3.connect(f"file:{db_path}?mode=ro", uri=True)
-    conn.row_factory = sqlite3.Row
-    yield conn
-    conn.close()

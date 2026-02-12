@@ -19,7 +19,7 @@ pipeline creation. The init script assigns facets, not docpac.
 """
 
 import re
-from dataclasses import dataclass, field
+from dataclasses import dataclass
 from pathlib import Path
 from typing import Optional
 
@@ -202,8 +202,13 @@ def _infer_from_path(filepath: Path, boundary: Path) -> tuple[Optional[str], Opt
     folder_path = '/'.join(folder_parts).lower()
 
     for key in _SORTED_KEYS:
-        if key in folder_path:
-            return FOLDER_MAP[key]
+        # Segment-based matching: key parts must align with folder boundaries
+        # e.g. 'changes/code' must match path segments, not substrings
+        key_parts = key.split('/')
+        path_parts = folder_path.split('/')
+        for i in range(len(path_parts) - len(key_parts) + 1):
+            if path_parts[i:i + len(key_parts)] == key_parts:
+                return FOLDER_MAP[key]
 
     return None, None
 
@@ -214,7 +219,7 @@ def _extract_file_date(filename: str) -> Optional[str]:
     if match:
         date = match.group(1)
         time = match.group(2)
-        return f"{date}-{time}" if time else date
+        return f"{date}-{time}" if time is not None else date
     return None
 
 

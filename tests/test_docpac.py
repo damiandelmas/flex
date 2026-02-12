@@ -293,6 +293,78 @@ class TestFileDate:
 # Edge Cases
 # =============================================================================
 
+class TestAllFolderMappings:
+    """Parametrized test covering all 22 FOLDER_MAP entries."""
+
+    @pytest.mark.parametrize("folder_key,expected", [
+        ('changes/code',     ('past', 'changelog')),
+        ('changes/testing',  ('past', 'testing')),
+        ('changes/workflow', ('past', 'workflow')),
+        ('changes/states',   ('past', 'states')),
+        ('changes/tracking', ('past', 'tracking')),
+        ('changes/audits',   ('past', 'audit')),
+        ('changes/review',   ('past', 'review')),
+        ('changes/design',   ('future', 'design')),
+        ('changes/session',  ('past', 'session')),
+        ('current/ast',      ('present', 'ast')),
+        ('current',          ('present', 'architecture')),
+        ('intended/proximate', ('future', 'plan')),
+        ('intended/ultimate',  ('future', 'vision')),
+        ('intended',         ('future', 'plan')),
+        ('knowledge',        ('exogenous', 'knowledge')),
+        ('philosophy',       ('exogenous', 'philosophy')),
+        ('onboard',          ('present', 'onboard')),
+        ('lexicon',          ('present', 'lexicon')),
+        ('reference',        ('present', 'reference')),
+        ('specs',            ('future', 'spec')),
+        ('slots',            ('future', 'slot')),
+        ('plans',            ('future', 'plan')),
+    ])
+    def test_folder_map_entry(self, tmp_path, folder_key, expected):
+        from flexsearch.compile.docpac import parse_docpac
+        root = tmp_path / "ctx"
+        target = root / folder_key
+        target.mkdir(parents=True)
+        (target / "test-file.md").write_text("# Test")
+        entries = parse_docpac(str(root))
+        indexable = [e for e in entries if not e.skip]
+        assert len(indexable) == 1, f"Expected 1 entry for {folder_key}, got {len(indexable)}"
+        assert indexable[0].temporal == expected[0], \
+            f"{folder_key}: expected temporal={expected[0]}, got {indexable[0].temporal}"
+        assert indexable[0].doc_type == expected[1], \
+            f"{folder_key}: expected doc_type={expected[1]}, got {indexable[0].doc_type}"
+
+
+class TestSegmentMatching:
+    """Path matching is segment-based, not substring-based."""
+
+    def test_no_false_positive_on_substring(self, tmp_path):
+        """'changes' should NOT match a folder named 'prechanges'."""
+        from flexsearch.compile.docpac import parse_docpac
+        root = tmp_path / "ctx"
+        (root / "prechanges" / "code").mkdir(parents=True)
+        (root / "prechanges" / "code" / "file.md").write_text("# Test")
+        entries = parse_docpac(str(root))
+        indexable = [e for e in entries if not e.skip]
+        # Should NOT match changes/code — 'prechanges' is not 'changes'
+        for e in indexable:
+            assert e.temporal is None or e.doc_type != 'changelog', \
+                f"False positive: 'prechanges/code' matched as changelog"
+
+
+class TestTitle:
+    """_extract_title produces human-readable titles."""
+
+    def test_strips_temporal_prefix(self, tmp_path):
+        from flexsearch.compile.docpac import parse_docpac
+        root = tmp_path / "ctx"
+        (root / "changes" / "code").mkdir(parents=True)
+        (root / "changes" / "code" / "260211-1538_sql-refactor.md").write_text("# Log")
+        entries = parse_docpac(str(root))
+        code = [e for e in entries if 'changes/code' in e.path]
+        assert 'sql refactor' in code[0].title.lower()
+
+
 class TestEdgeCases:
     """Edge cases and return format."""
 

@@ -17,7 +17,7 @@ from pathlib import Path
 
 def _can_import():
     try:
-        from flexsearch.presets import PresetLoader
+        from flexsearch.retrieve.presets import PresetLoader
         return True
     except ImportError:
         return False
@@ -69,7 +69,7 @@ SELECT id, content, timestamp FROM _raw_chunks ORDER BY timestamp
 
 @pytest.fixture
 def loader(preset_dir):
-    from flexsearch.presets import PresetLoader
+    from flexsearch.retrieve.presets import PresetLoader
     return PresetLoader(preset_dir)
 
 

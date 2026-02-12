@@ -95,7 +95,8 @@ class VectorCache:
 
     def search(self, query_vec: np.ndarray, *, not_like_vec: np.ndarray = None,
                diverse: bool = False, limit: int = 10, oversample: int = 200,
-               mask: np.ndarray = None, threshold: float = 0.0) -> List[Dict[str, Any]]:
+               mask: np.ndarray = None, threshold: float = 0.0,
+               mmr_lambda: float = 0.7) -> List[Dict[str, Any]]:
         """
         Search for similar vectors. The three numpy-only operations:
 
@@ -111,12 +112,20 @@ class VectorCache:
             oversample: Candidate pool size for diversity/contrastive
             mask: Boolean mask (n,) - True = include in search
             threshold: Minimum cosine similarity cutoff
+            mmr_lambda: Relevance vs diversity tradeoff (0-1). Higher = more relevant, lower = more diverse.
 
         Returns:
             List of {id, score} sorted by score desc
         """
         if self.matrix is None or len(self.ids) == 0:
             return []
+
+        # Validate dimensions
+        if query_vec.shape != (self.dims,):
+            raise ValueError(
+                f"Query vector dimension {query_vec.shape} doesn't match "
+                f"cache dimension ({self.dims},)"
+            )
 
         # Normalize query
         query_vec = query_vec.astype(np.float32)
@@ -157,7 +166,8 @@ class VectorCache:
 
         # 3. MMR diversity — iterative selection
         if diverse and len(top_indices) > limit:
-            selected_indices = self._mmr_select(top_indices, similarities, limit)
+            selected_indices = self._mmr_select(top_indices, similarities, limit,
+                                                   lambda_=mmr_lambda)
         else:
             selected_indices = top_indices[:limit]
 

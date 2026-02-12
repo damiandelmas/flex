@@ -116,13 +116,13 @@ def compute_scores(G) -> dict:
                 'members': list(members),
                 'size': len(members)
             })
-    except Exception:
+    except (nx.NetworkXError, ValueError, ZeroDivisionError):
         pass
 
     # PageRank centrality
     try:
         centralities = nx.pagerank(G, weight='weight')
-    except Exception:
+    except (nx.NetworkXError, nx.PowerIterationFailedConvergence, ZeroDivisionError):
         centralities = {}
 
     # Hub identification (top 10% by centrality)
@@ -140,7 +140,7 @@ def compute_scores(G) -> dict:
             sorted_bridges = sorted(betweenness.items(), key=lambda x: x[1], reverse=True)
             bridge_threshold = max(1, len(sorted_bridges) // 20)
             bridges = [node for node, _ in sorted_bridges[:bridge_threshold]]
-    except Exception:
+    except (nx.NetworkXError, ZeroDivisionError):
         pass
 
     return {
@@ -268,5 +268,7 @@ def run_sandbox(db: sqlite3.Connection, G, script: str) -> dict:
             result,
             default=lambda x: int(x) if hasattr(x, 'item') else str(x)
         ))
-    except Exception as e:
+    except (SyntaxError, NameError, TypeError, ValueError, KeyError,
+            AttributeError, IndexError, ZeroDivisionError, RuntimeError,
+            ArithmeticError, LookupError, StopIteration, ImportError) as e:
         return {'error': str(e), 'type': type(e).__name__}
