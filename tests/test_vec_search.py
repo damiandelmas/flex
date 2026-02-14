@@ -106,6 +106,9 @@ def mod_db():
             source_id TEXT PRIMARY KEY, centrality REAL,
             is_hub INTEGER DEFAULT 0, is_bridge INTEGER DEFAULT 0, community_id INTEGER
         );
+        CREATE TABLE _enrich_types (
+            chunk_id TEXT PRIMARY KEY, semantic_role TEXT, confidence REAL
+        );
         CREATE TABLE _meta (key TEXT PRIMARY KEY, value TEXT);
     """)
 
@@ -129,10 +132,17 @@ def mod_db():
             (id_, src)
         )
 
-    # src-1 is hub (high centrality), src-2 low, src-3 lowest
+    # src-1 is hub (high centrality, community 1), src-2 low (community 1), src-3 lowest (community 2)
     conn.execute("INSERT INTO _enrich_source_graph VALUES ('src-1', 0.85, 1, 0, 1)")
     conn.execute("INSERT INTO _enrich_source_graph VALUES ('src-2', 0.30, 0, 0, 1)")
     conn.execute("INSERT INTO _enrich_source_graph VALUES ('src-3', 0.10, 0, 0, 2)")
+
+    # Semantic kinds: a=delegation, b=response, c=prompt, d=command, e=delegation
+    conn.execute("INSERT INTO _enrich_types VALUES ('a', 'delegation', 0.5)")
+    conn.execute("INSERT INTO _enrich_types VALUES ('b', 'response', 0.5)")
+    conn.execute("INSERT INTO _enrich_types VALUES ('c', 'prompt', 0.5)")
+    conn.execute("INSERT INTO _enrich_types VALUES ('d', 'command', 0.5)")
+    conn.execute("INSERT INTO _enrich_types VALUES ('e', 'delegation', 0.5)")
 
     conn.execute("INSERT INTO _meta VALUES ('vec:hubs:weight', '1.3')")
     conn.execute("INSERT INTO _meta VALUES ('vec:recent:half_life', '30')")
@@ -607,6 +617,238 @@ class TestComposedModulations:
         results = mod_cache.search(query, limit=5, modifiers=modifiers, config=config,
                                    oversample=5)
         assert len(results) <= 3  # limit override from modifiers
+
+
+# =============================================================================
+# Pre-filter: community
+# =============================================================================
+
+class TestCommunityPreFilter:
+    """community:N pre-filters candidate pool to a single community."""
+
+    def test_community_filter_excludes_other_communities(self, mod_cache):
+        """Only chunks in community 2 survive."""
+        query = _make_vec([0.5, 0.5, 0.5])
+        modifiers = {'hubs': False, 'recent': False, 'recent_days': None,
+                     'unlike': None, 'diverse': False, 'limit': None,
+                     'community': 2, 'kind': None}
+        results = mod_cache.search(query, limit=5, modifiers=modifiers)
+        # Only d is in community 2 (src-3)
+        result_ids = {r['id'] for r in results}
+        assert 'd' in result_ids
+        assert 'a' not in result_ids
+        assert 'c' not in result_ids
+
+    def test_community_filter_with_hub_boost(self, mod_cache):
+        """Hub boost composes with community filter."""
+        query = _make_vec([1.0, 0.0, 0.0])
+        config = {'vec:hubs:weight': '1.3'}
+        modifiers = {'hubs': True, 'recent': False, 'recent_days': None,
+                     'unlike': None, 'diverse': False, 'limit': None,
+                     'community': 1, 'kind': None}
+        results = mod_cache.search(query, limit=5, modifiers=modifiers, config=config)
+        # a,b (src-1, community 1) and c,e (src-2, community 1) survive
+        # d (src-3, community 2) excluded
+        result_ids = {r['id'] for r in results}
+        assert 'd' not in result_ids
+        assert len(results) >= 1
+
+    def test_community_nonexistent_returns_empty(self, mod_cache):
+        """Non-existent community returns no results."""
+        query = _make_vec([1.0, 0.0, 0.0])
+        modifiers = {'hubs': False, 'recent': False, 'recent_days': None,
+                     'unlike': None, 'diverse': False, 'limit': None,
+                     'community': 999, 'kind': None}
+        results = mod_cache.search(query, limit=5, modifiers=modifiers)
+        assert len(results) == 0
+
+    def test_community_no_data_is_noop(self, cache):
+        """Cache without community_ids ignores community modifier."""
+        query = _make_vec([1.0, 0.0, 0.0])
+        modifiers = {'hubs': False, 'recent': False, 'recent_days': None,
+                     'unlike': None, 'diverse': False, 'limit': None,
+                     'community': 1, 'kind': None}
+        results = cache.search(query, limit=5, modifiers=modifiers)
+        assert len(results) > 0  # no crash, returns results
+
+
+# =============================================================================
+# Pre-filter: kind
+# =============================================================================
+
+class TestKindPreFilter:
+    """kind:TYPE pre-filters candidate pool to a semantic kind."""
+
+    def test_kind_filter_selects_delegation_only(self, mod_cache):
+        """Only delegation chunks survive."""
+        query = _make_vec([0.5, 0.5, 0.5])
+        modifiers = {'hubs': False, 'recent': False, 'recent_days': None,
+                     'unlike': None, 'diverse': False, 'limit': None,
+                     'community': None, 'kind': 'delegation'}
+        results = mod_cache.search(query, limit=5, modifiers=modifiers)
+        result_ids = {r['id'] for r in results}
+        # a and e are delegation
+        assert result_ids == {'a', 'e'}
+
+    def test_kind_filter_selects_prompt_only(self, mod_cache):
+        """Only prompt chunks survive."""
+        query = _make_vec([0.0, 1.0, 0.0])
+        modifiers = {'hubs': False, 'recent': False, 'recent_days': None,
+                     'unlike': None, 'diverse': False, 'limit': None,
+                     'community': None, 'kind': 'prompt'}
+        results = mod_cache.search(query, limit=5, modifiers=modifiers)
+        assert len(results) == 1
+        assert results[0]['id'] == 'c'
+
+    def test_kind_filter_with_hub_boost(self, mod_cache):
+        """Hub boost composes with kind filter — hub delegation ranks first."""
+        query = _make_vec([0.5, 0.5, 0.0])
+        config = {'vec:hubs:weight': '1.3'}
+        modifiers = {'hubs': True, 'recent': False, 'recent_days': None,
+                     'unlike': None, 'diverse': False, 'limit': None,
+                     'community': None, 'kind': 'delegation'}
+        results = mod_cache.search(query, limit=5, modifiers=modifiers, config=config)
+        # a (delegation, hub) should beat e (delegation, non-hub)
+        assert results[0]['id'] == 'a'
+
+    def test_kind_nonexistent_returns_empty(self, mod_cache):
+        """Non-existent kind returns no results."""
+        query = _make_vec([1.0, 0.0, 0.0])
+        modifiers = {'hubs': False, 'recent': False, 'recent_days': None,
+                     'unlike': None, 'diverse': False, 'limit': None,
+                     'community': None, 'kind': 'nonexistent'}
+        results = mod_cache.search(query, limit=5, modifiers=modifiers)
+        assert len(results) == 0
+
+    def test_kind_no_data_is_noop(self, cache):
+        """Cache without kinds ignores kind modifier."""
+        query = _make_vec([1.0, 0.0, 0.0])
+        modifiers = {'hubs': False, 'recent': False, 'recent_days': None,
+                     'unlike': None, 'diverse': False, 'limit': None,
+                     'community': None, 'kind': 'delegation'}
+        results = cache.search(query, limit=5, modifiers=modifiers)
+        assert len(results) > 0  # no crash, returns results
+
+
+# =============================================================================
+# Combined pre-filters
+# =============================================================================
+
+class TestCombinedPreFilters:
+    """community + kind compose as AND."""
+
+    def test_community_and_kind_together(self, mod_cache):
+        """community:1 AND kind:delegation = only 'a' (src-1, delegation) and 'e' (src-2, delegation)."""
+        query = _make_vec([0.5, 0.5, 0.5])
+        modifiers = {'hubs': False, 'recent': False, 'recent_days': None,
+                     'unlike': None, 'diverse': False, 'limit': None,
+                     'community': 1, 'kind': 'delegation'}
+        results = mod_cache.search(query, limit=5, modifiers=modifiers)
+        result_ids = {r['id'] for r in results}
+        # a (community 1, delegation) and e (community 1, delegation)
+        assert result_ids == {'a', 'e'}
+
+    def test_community_and_kind_no_overlap(self, mod_cache):
+        """community:2 AND kind:delegation = only d is community 2 but d is 'command'."""
+        query = _make_vec([0.5, 0.5, 0.5])
+        modifiers = {'hubs': False, 'recent': False, 'recent_days': None,
+                     'unlike': None, 'diverse': False, 'limit': None,
+                     'community': 2, 'kind': 'delegation'}
+        results = mod_cache.search(query, limit=5, modifiers=modifiers)
+        assert len(results) == 0
+
+    def test_all_prefilters_plus_modulations(self, mod_cache):
+        """Pre-filters + hubs + recent doesn't crash."""
+        query = _make_vec([0.5, 0.5, 0.0])
+        config = {'vec:hubs:weight': '1.3', 'vec:recent:half_life': '30'}
+        modifiers = {'hubs': True, 'recent': True, 'recent_days': 7,
+                     'unlike': None, 'diverse': True, 'limit': None,
+                     'community': 1, 'kind': 'delegation'}
+        results = mod_cache.search(query, limit=5, modifiers=modifiers, config=config,
+                                   oversample=5)
+        result_ids = {r['id'] for r in results}
+        assert result_ids <= {'a', 'e'}
+
+
+# =============================================================================
+# parse_modifiers: new tokens
+# =============================================================================
+
+class TestParseModifiersPreFilter:
+    """parse_modifiers handles community:N and kind:TYPE tokens."""
+
+    def test_community(self):
+        from flexsearch.retrieve.vec_search import parse_modifiers
+        result = parse_modifiers('community:12')
+        assert result['community'] == 12
+
+    def test_kind(self):
+        from flexsearch.retrieve.vec_search import parse_modifiers
+        result = parse_modifiers('kind:delegation')
+        assert result['kind'] == 'delegation'
+
+    def test_community_and_kind_composed(self):
+        from flexsearch.retrieve.vec_search import parse_modifiers
+        result = parse_modifiers('kind:delegation community:17 hubs')
+        assert result['kind'] == 'delegation'
+        assert result['community'] == 17
+        assert result['hubs'] is True
+
+    def test_community_invalid_ignored(self):
+        from flexsearch.retrieve.vec_search import parse_modifiers
+        result = parse_modifiers('community:abc')
+        assert result['community'] is None
+
+    def test_defaults_are_none(self):
+        from flexsearch.retrieve.vec_search import parse_modifiers
+        result = parse_modifiers('hubs')
+        assert result['community'] is None
+        assert result['kind'] is None
+
+
+# =============================================================================
+# load_columns: new arrays
+# =============================================================================
+
+class TestLoadColumnsPreFilter:
+    """load_columns populates community_ids and kinds arrays."""
+
+    def test_community_ids_loaded(self, mod_cache):
+        assert mod_cache.community_ids is not None
+        assert mod_cache.community_ids.shape == (5,)
+
+    def test_community_id_values(self, mod_cache):
+        # a,b in src-1 (community 1), c,e in src-2 (community 1), d in src-3 (community 2)
+        assert mod_cache.community_ids[mod_cache._id_to_idx['a']] == 1
+        assert mod_cache.community_ids[mod_cache._id_to_idx['d']] == 2
+
+    def test_kinds_loaded(self, mod_cache):
+        assert mod_cache.kinds is not None
+        assert mod_cache.kinds.shape == (5,)
+
+    def test_kind_values(self, mod_cache):
+        assert mod_cache.kinds[mod_cache._id_to_idx['a']] == 'delegation'
+        assert mod_cache.kinds[mod_cache._id_to_idx['b']] == 'response'
+        assert mod_cache.kinds[mod_cache._id_to_idx['c']] == 'prompt'
+        assert mod_cache.kinds[mod_cache._id_to_idx['d']] == 'command'
+        assert mod_cache.kinds[mod_cache._id_to_idx['e']] == 'delegation'
+
+    def test_missing_types_table_is_safe(self):
+        """Cells without _enrich_types get empty kinds."""
+        from flexsearch.retrieve.vec_search import VectorCache
+        conn = sqlite3.connect(':memory:')
+        conn.row_factory = sqlite3.Row
+        conn.execute("CREATE TABLE _raw_chunks (id TEXT PRIMARY KEY, content TEXT, embedding BLOB, timestamp INTEGER)")
+        conn.execute("INSERT INTO _raw_chunks VALUES ('x', 'test', ?, 1000000)",
+                     (_make_blob([1.0, 0.0, 0.0]),))
+        conn.commit()
+        vc = VectorCache()
+        vc.load_from_db(conn, '_raw_chunks', 'embedding', 'id')
+        vc.load_columns(conn, '_raw_chunks', 'id')
+        assert vc.kinds is not None
+        assert vc.kinds[0] == ''
+        assert vc.community_ids is not None
+        assert vc.community_ids[0] == -1
 
 
 # =============================================================================

@@ -5,6 +5,7 @@ Matrix-based semantic search. Trades memory for speed.
 Loads all vectors once, queries in <1ms via BLAS matmul.
 
 Landscape modulations (applied on full N array before top-k):
+- Pre-filter masks: community:N, kind:TYPE (zero non-matching)
 - Matrix multiply (corpus-wide cosine similarity)
 - Hub boost: scores *= (1 + weight * centrality)
 - Temporal decay: scores *= 1 / (1 + days_ago / half_life)
@@ -14,6 +15,7 @@ Landscape modulations (applied on full N array before top-k):
 SQL usage:
     vec_search('_raw_chunks', 'auth')                    -- raw cosine
     vec_search('_raw_chunks', 'auth', 'hubs')            -- hub boost
+    vec_search('_raw_chunks', 'auth', 'kind:delegation community:12 hubs')
     vec_search('_raw_chunks', 'auth', 'hubs recent:7 diverse unlike:jwt')
 
 Performance:
@@ -43,8 +45,11 @@ def parse_modifiers(modifier_str: str) -> dict:
         unlike:TEXT     contrastive — demote similarity to TEXT
         diverse         MMR diversity selection
         limit:N         override default candidate limit
+        community:N     pre-filter to community ID
+        kind:TYPE       pre-filter to semantic kind
 
-    Returns dict with keys: hubs, recent, recent_days, unlike, diverse, limit.
+    Returns dict with keys: hubs, recent, recent_days, unlike, diverse, limit,
+    community, kind.
     Unknown tokens silently ignored (forward-compatible).
     """
     result = {
@@ -54,6 +59,8 @@ def parse_modifiers(modifier_str: str) -> dict:
         'unlike': None,
         'diverse': False,
         'limit': None,
+        'community': None,
+        'kind': None,
     }
 
     if not modifier_str:
@@ -79,6 +86,13 @@ def parse_modifiers(modifier_str: str) -> dict:
                 result['limit'] = int(token.split(':', 1)[1])
             except ValueError:
                 pass
+        elif token.startswith('community:'):
+            try:
+                result['community'] = int(token.split(':', 1)[1])
+            except ValueError:
+                pass
+        elif token.startswith('kind:'):
+            result['kind'] = token.split(':', 1)[1]
 
     return result
 
@@ -107,6 +121,9 @@ class VectorCache:
         self.centrality: Optional[np.ndarray] = None   # (N,) float32, 0-1 normalized
         self.timestamps: Optional[np.ndarray] = None    # (N,) float64, epoch seconds
         self.is_hub: Optional[np.ndarray] = None        # (N,) bool
+        # Pre-filter arrays (N,), aligned with self.ids
+        self.community_ids: Optional[np.ndarray] = None  # (N,) int32, -1 = unmapped
+        self.kinds: Optional[np.ndarray] = None           # (N,) object, '' = unmapped
 
     def load_from_db(self, db, table: str, embedding_col: str = 'embedding',
                      id_col: str = 'id') -> 'VectorCache':
@@ -183,13 +200,14 @@ class VectorCache:
         except Exception:
             pass  # table has no timestamp column
 
-        # --- Centrality + is_hub: chunk -> source -> graph ---
+        # --- Graph columns: centrality, is_hub, community_id (single query) ---
         raw_centrality = np.zeros(N, dtype=np.float32)
         self.is_hub = np.zeros(N, dtype=bool)
+        self.community_ids = np.full(N, -1, dtype=np.int32)
 
         try:
             rows = db.execute("""
-                SELECT e.chunk_id, g.centrality, g.is_hub
+                SELECT e.chunk_id, g.centrality, g.is_hub, g.community_id
                 FROM _edges_source e
                 JOIN _enrich_source_graph g ON e.source_id = g.source_id
             """).fetchall()
@@ -198,6 +216,8 @@ class VectorCache:
                 if idx is not None:
                     raw_centrality[idx] = float(row[1]) if row[1] else 0.0
                     self.is_hub[idx] = bool(row[2])
+                    if row[3] is not None:
+                        self.community_ids[idx] = int(row[3])
         except Exception:
             pass  # _edges_source or _enrich_source_graph missing
 
@@ -207,6 +227,22 @@ class VectorCache:
             self.centrality = (raw_centrality - cmin) / (cmax - cmin)
         else:
             self.centrality = np.zeros(N, dtype=np.float32)
+
+        # --- Kinds: chunk -> _enrich_types ---
+        self.kinds = np.empty(N, dtype=object)
+        self.kinds[:] = ''
+        try:
+            rows = db.execute("""
+                SELECT chunk_id, semantic_role
+                FROM _enrich_types
+                WHERE semantic_role IS NOT NULL
+            """).fetchall()
+            for row in rows:
+                idx = self._id_to_idx.get(row[0])
+                if idx is not None:
+                    self.kinds[idx] = row[1]
+        except Exception:
+            pass  # no types data
 
     def search(self, query_vec: np.ndarray, *, not_like_vec: np.ndarray = None,
                diverse: bool = False, limit: int = 10, oversample: int = 200,
@@ -258,6 +294,13 @@ class VectorCache:
 
         # 1. Matrix multiply — all similarities at once
         similarities = self.matrix @ query_vec
+
+        # === PRE-FILTER MASKS (exclude non-matching before modulations) ===
+        if modifiers:
+            if modifiers.get('community') is not None and self.community_ids is not None:
+                similarities[self.community_ids != modifiers['community']] = -np.inf
+            if modifiers.get('kind') and self.kinds is not None:
+                similarities[self.kinds != modifiers['kind']] = -np.inf
 
         # === LANDSCAPE MODULATIONS (full N array, before candidate selection) ===
         if modifiers:
