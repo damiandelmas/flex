@@ -43,8 +43,7 @@ CREATE TABLE IF NOT EXISTS _enrich_session_summary (
     source_id TEXT PRIMARY KEY,
     topic_clusters TEXT,
     community_label TEXT,
-    topic_summary TEXT,
-    display_title TEXT
+    topic_summary TEXT
 )
 """
 
@@ -342,60 +341,6 @@ def build_community_labels(db):
 
 
 # ---------------------------------------------------------------------------
-# Display title
-# ---------------------------------------------------------------------------
-
-# Patterns that indicate a garbage title (raw path, XML, system prompt, etc.)
-import re
-
-_GARBAGE_TITLE_PATTERNS = [
-    re.compile(r"""^['"]?[/<\[]"""),  # starts with path, XML tag, or bracket (possibly quoted)
-    re.compile(r'^```'),              # starts with code fence
-    re.compile(r'^(SYSTEM|system|Human|Assistant)'),  # role prefix
-    re.compile(r'^\s*$'),             # blank
-    re.compile(r'^(Base directory|Read |Write |Edit )'),  # tool-like prefix
-    re.compile(r'^https?://'),        # URL
-]
-
-
-def _is_garbage_title(title):
-    """Check if title is a usable human string or garbage."""
-    if not title or len(title.strip()) < 10:
-        return True
-    if len(title) >= 95:  # likely truncated at 100
-        return True
-    for pat in _GARBAGE_TITLE_PATTERNS:
-        if pat.match(title):
-            return True
-    return False
-
-
-def make_display_title(title, chunks):
-    """Derive a clean display title from raw title or first user prompt.
-
-    Priority:
-    1. Raw title if it's clean (not a path, not XML, 10-94 chars)
-    2. First user prompt content, stripped, 80 chars
-    3. None (no usable title)
-    """
-    if title and not _is_garbage_title(title):
-        return title.strip()
-
-    # Fall back to first user prompt that isn't garbage
-    for chunk in chunks:
-        if chunk.get('kind') == 'prompt':
-            content = chunk.get('content', '').strip()
-            if content and not _is_garbage_title(content):
-                # Truncate to 80 chars at word boundary
-                if len(content) <= 80:
-                    return content
-                truncated = content[:77].rsplit(' ', 1)[0]
-                return truncated + '...' if truncated else content[:77] + '...'
-
-    return None
-
-
-# ---------------------------------------------------------------------------
 # Summary composition
 # ---------------------------------------------------------------------------
 
@@ -482,21 +427,16 @@ def main():
         # Compose summary
         summary = compose_summary(topics, comm)
 
-        # Display title (clean title or first user prompt)
-        dtitle = make_display_title(m.get('title'), chunks)
-
         # Insert
         db.execute("""
             INSERT OR REPLACE INTO _enrich_session_summary
-            (source_id, topic_clusters, community_label, topic_summary,
-             display_title)
-            VALUES (?, ?, ?, ?, ?)
+            (source_id, topic_clusters, community_label, topic_summary)
+            VALUES (?, ?, ?, ?)
         """, (
             sid,
             json.dumps(topics),
             comm,
             summary,
-            dtitle,
         ))
         processed += 1
 
