@@ -27,7 +27,7 @@ from flexsearch.core import open_cell, get_meta
 # ============================================================
 
 CELLS_ROOT = Path.home() / ".qmem/cells/projects"
-DEFAULT_CELLS = ['thread', 'claude', 'qmem', 'inventory', 'thread-codebase']
+DEFAULT_CELLS = ['thread', 'claude', 'qmem', 'inventory', 'thread-codebase', 'flexsearch-context', 'axpstack-context']
 
 # ============================================================
 # Cell Management

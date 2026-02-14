@@ -24,6 +24,8 @@ import time
 import numpy as np
 from pathlib import Path
 
+FLEX_ROOT = Path(__file__).resolve().parent.parent
+
 from flexsearch.compile.docpac import parse_docpac
 from flexsearch.compile.markdown import normalize_headers, extract_frontmatter, split_sections
 from flexsearch.core import open_cell, set_meta, run_sql, validate_cell
@@ -100,6 +102,14 @@ CREATE TABLE IF NOT EXISTS _enrich_types (
     confidence REAL DEFAULT 1.0
 );
 
+-- PRESETS (baked from .sql files at init time)
+CREATE TABLE IF NOT EXISTS _presets (
+    name TEXT PRIMARY KEY,
+    description TEXT,
+    params TEXT DEFAULT '',
+    sql TEXT
+);
+
 -- METADATA + FTS
 CREATE TABLE IF NOT EXISTS _meta (
     key TEXT PRIMARY KEY,
@@ -136,18 +146,43 @@ def make_chunk_id(source_id: str, position: int) -> str:
     return f"{source_id}:{position}"
 
 
+CELLS_ROOT = Path.home() / '.qmem' / 'cells' / 'projects'
+
+
+def derive_cell_name(corpus_path: str) -> str:
+    """Derive cell name from corpus path: /home/axp/projects/foo/context → foo-context."""
+    p = Path(corpus_path).resolve()
+    # Use parent + name to distinguish context/ folders across projects
+    # e.g. flexsearch/context → flexsearch-context
+    if p.name in ('context', 'docs', 'documentation'):
+        return f"{p.parent.name}-{p.name}"
+    return p.name
+
+
 def main():
     parser = argparse.ArgumentParser(description='Initialize a doc-pac chunk-atom cell')
-    parser.add_argument('--corpus', required=True, help='Root directory of the doc-pac corpus')
-    parser.add_argument('--cell', required=True, help='Cell directory (will be wiped and recreated)')
+    parser.add_argument('corpus', nargs='?', help='Root directory of the doc-pac corpus')
+    parser.add_argument('--corpus', dest='corpus_flag', help=argparse.SUPPRESS)
+    parser.add_argument('--cell', default=None,
+                        help='Cell directory (auto-derived from corpus if omitted)')
     parser.add_argument('--threshold', type=float, default=0.55,
                         help='Similarity threshold for graph building (default: 0.55)')
     parser.add_argument('--description', default=None,
                         help='Cell description for _meta (auto-generated if omitted)')
     args = parser.parse_args()
 
-    corpus_root = os.path.abspath(args.corpus)
-    cell_dir = os.path.expanduser(args.cell)
+    # Support both positional and --corpus flag
+    corpus_input = args.corpus or args.corpus_flag
+    if not corpus_input:
+        parser.error('corpus path is required')
+
+    corpus_root = os.path.abspath(corpus_input)
+    if args.cell:
+        cell_dir = os.path.expanduser(args.cell)
+    else:
+        cell_name = derive_cell_name(corpus_root)
+        cell_dir = str(CELLS_ROOT / cell_name)
+        print(f"Auto-derived cell name: {cell_name}")
     db_path = os.path.join(cell_dir, 'main.db')
 
     t0 = time.time()
@@ -400,7 +435,18 @@ def main():
     regenerate_views(db)
 
     # ═════════════════════════════════════════════════
-    # 11. DONE
+    # 11. INSTALL PRESETS
+    # ═════════════════════════════════════════════════
+    print("Installing presets...")
+    from flexsearch.retrieve.presets import install_presets
+
+    general_presets = FLEX_ROOT / 'flexsearch' / 'retrieve' / 'presets' / 'general'
+    install_presets(db, general_presets)
+    preset_count = db.execute("SELECT COUNT(*) FROM _presets").fetchone()[0]
+    print(f"Installed {preset_count} general presets.")
+
+    # ═════════════════════════════════════════════════
+    # 12. DONE
     # ═════════════════════════════════════════════════
     elapsed = time.time() - t0
     print(f"\n{'='*50}")
