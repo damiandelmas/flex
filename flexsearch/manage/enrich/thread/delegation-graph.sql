@@ -1,7 +1,7 @@
 -- @name: delegation-graph
 -- @description: Directed parent->child agent delegation graph
 -- @target: _enrich_delegation_graph
--- @script: scripts/enrich_delegation_graph.py (thin runner)
+-- @script: flexsearch/modules/claude_code/manage/enrich_delegation.py
 -- @module: flexsearch.modules.claude_code.manage.delegation_graph
 CREATE TABLE IF NOT EXISTS _enrich_delegation_graph (
     source_id TEXT PRIMARY KEY,

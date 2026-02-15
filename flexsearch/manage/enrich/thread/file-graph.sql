@@ -1,7 +1,7 @@
 -- @name: file-graph
 -- @description: File co-edit graph — bipartite projection from shared file_uuids
 -- @target: _enrich_file_graph
--- @script: scripts/enrich_file_graph.py (thin runner)
+-- @script: flexsearch/modules/claude_code/manage/enrich_file_graph.py
 -- @module: flexsearch.modules.claude_code.manage.file_graph
 CREATE TABLE IF NOT EXISTS _enrich_file_graph (
     source_id TEXT PRIMARY KEY,

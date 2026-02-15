@@ -1,7 +1,7 @@
 -- @name: session-summary
 -- @description: Embedding-relative session summaries via HDBSCAN clustering
 -- @target: _enrich_session_summary
--- @script: scripts/enrich_session_summary.py
+-- @script: flexsearch/modules/claude_code/manage/enrich_summary.py
 -- @module: flexsearch.modules.claude_code.manage.summary (label_cluster, short_session_label)
 -- @noise: flexsearch.modules.claude_code.manage.noise.session_filter_sql()
 CREATE TABLE IF NOT EXISTS _enrich_session_summary (

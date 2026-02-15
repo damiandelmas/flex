@@ -10,7 +10,7 @@ import sys
 import time
 from pathlib import Path
 
-FLEX_ROOT = Path(__file__).resolve().parent.parent
+FLEX_ROOT = Path(__file__).resolve().parent.parent.parent.parent.parent
 sys.path.insert(0, str(FLEX_ROOT))
 
 from flexsearch.core import open_cell

@@ -7,7 +7,7 @@ Composes flexsearch COMPILE primitives into a pipeline:
   → embed → mean-pool → validate → meditate → enrich_types → regenerate_views
 
 Usage:
-  python scripts/init-docpac.py \
+  python flexsearch/modules/docpac/compile/init.py \
     --corpus /path/to/docpac/root \
     --cell ~/.qmem/cells/projects/qmem \
     --threshold 0.55 \
@@ -26,7 +26,8 @@ from datetime import datetime
 import numpy as np
 from pathlib import Path
 
-FLEX_ROOT = Path(__file__).resolve().parent.parent
+# scripts/ -> docpac/ -> modules/ -> flexsearch/ -> main/
+FLEX_ROOT = Path(__file__).resolve().parent.parent.parent.parent.parent
 
 from flexsearch.compile.docpac import parse_docpac
 from flexsearch.compile.markdown import normalize_headers, extract_frontmatter, split_sections

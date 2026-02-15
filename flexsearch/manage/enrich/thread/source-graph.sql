@@ -1,7 +1,7 @@
 -- @name: source-graph
 -- @description: Source-level similarity graph — Louvain + PageRank + hubs + bridges
 -- @target: _enrich_source_graph
--- @script: scripts/rebuild_enrichments.py (rebuild_source_graph)
+-- @script: flexsearch/modules/claude_code/manage/rebuild_all.py (rebuild_source_graph)
 -- @module: flexsearch.manage.meditate (build_similarity_graph, compute_scores, persist)
 -- @noise: flexsearch.modules.claude_code.manage.noise.graph_filter_sql()
 CREATE TABLE IF NOT EXISTS _enrich_source_graph (
