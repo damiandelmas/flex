@@ -358,17 +358,21 @@ class VectorCache:
         detected_communities = None
         if modifiers and modifiers.get('detect_communities') and len(top_indices) >= 3:
             import networkx as nx
-            cand_indices = np.array(top_indices[:min(len(top_indices), oversample)])
+            # Cap at limit (not oversample) — communities beyond final results are wasted
+            comm_pool = min(len(top_indices), limit)
+            cand_indices = np.array(top_indices[:comm_pool])
             cand_vecs = self.matrix[cand_indices]
             sims = cand_vecs @ cand_vecs.T
+            # Build graph with vectorized edge extraction
+            # Threshold 0.65: candidates are pre-selected (already similar to query),
+            # so intra-similarity is high — 0.5 creates near-complete graphs
+            threshold = 0.65
+            rows, cols = np.where(np.triu(sims > threshold, k=1))
             G = nx.Graph()
-            for i in range(len(cand_indices)):
-                G.add_node(i)
-            threshold = 0.5
-            for i in range(len(cand_indices)):
-                for j in range(i + 1, len(cand_indices)):
-                    if sims[i, j] > threshold:
-                        G.add_edge(i, j, weight=float(sims[i, j]))
+            G.add_nodes_from(range(len(cand_indices)))
+            G.add_weighted_edges_from(
+                (int(r), int(c), float(sims[r, c])) for r, c in zip(rows, cols)
+            )
             if G.number_of_edges() > 0:
                 comms = nx.community.louvain_communities(G)
                 detected_communities = {}
@@ -427,8 +431,11 @@ class VectorCache:
         max_sim_to_selected = np.full(n, -np.inf)
         selected_mask = np.zeros(n, dtype=bool)
 
+        # Pre-compute relevance scores once (not per iteration)
+        relevance = similarities[candidates]  # numpy fancy indexing, (n,)
+
         # First item: highest cosine, MMR score = lambda * relevance
-        selected = [(candidates[0], lambda_ * float(similarities[candidates[0]]))]
+        selected = [(candidates[0], lambda_ * float(relevance[0]))]
         selected_mask[0] = True
         max_sim_to_selected = np.maximum(max_sim_to_selected, cand_sims[0])
 
@@ -437,7 +444,6 @@ class VectorCache:
                 break
 
             # MMR score for all unselected candidates (vectorized)
-            relevance = np.array([similarities[candidates[i]] for i in range(n)])
             mmr_scores = lambda_ * relevance - (1 - lambda_) * max_sim_to_selected
             mmr_scores[selected_mask] = -np.inf  # exclude already selected
 
