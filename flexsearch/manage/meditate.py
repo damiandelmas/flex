@@ -1,5 +1,5 @@
 """
-Flexsearch Meditate — offline graph intelligence.
+FlexSearch Meditate — offline graph intelligence.
 
 Produces columns that SQL consumes. networkx computes things SQL can't:
 PageRank, Louvain communities, hub/bridge identification.

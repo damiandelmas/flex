@@ -1,5 +1,5 @@
 """
-Flexsearch Views — self-describing view generation from sqlite_master.
+FlexSearch Views — self-describing view generation from sqlite_master.
 
 Discovers _edges_*, _types_*, _enrich_* tables, reads view config from _meta,
 emits CREATE VIEW statements that flatten the chunk-atom schema into queryable

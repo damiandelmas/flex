@@ -1,5 +1,5 @@
 """
-Flexsearch Core — cell loading, SQL execution, metadata access.
+FlexSearch Core — cell loading, SQL execution, metadata access.
 
 Infrastructure plumbing. Every domain depends on core. No domain logic here.
 

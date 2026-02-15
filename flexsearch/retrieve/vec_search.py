@@ -1,5 +1,5 @@
 """
-Flexsearch Vector Cache
+FlexSearch Vector Cache
 
 Matrix-based semantic search. Trades memory for speed.
 Loads all vectors once, queries in <1ms via BLAS matmul.
@@ -37,6 +37,7 @@ import json
 import re
 import sys
 import time
+import uuid
 
 import numpy as np
 from typing import Optional, List, Dict, Any
@@ -503,17 +504,17 @@ def materialize_vec_search(db, sql: str) -> str:
     except Exception:
         return sql  # let original SQL fail naturally
 
-    # Populate temp table
-    db.execute("DROP TABLE IF EXISTS _vec_results")
-    db.execute("CREATE TEMP TABLE _vec_results (id TEXT PRIMARY KEY, score REAL)")
+    # Populate temp table (unique name per call for HTTP concurrency)
+    tmp_name = f"_vec_results_{uuid.uuid4().hex[:8]}"
+    db.execute(f"CREATE TEMP TABLE [{tmp_name}] (id TEXT PRIMARY KEY, score REAL)")
     if results:
         db.executemany(
-            "INSERT INTO _vec_results VALUES (?, ?)",
+            f"INSERT INTO [{tmp_name}] VALUES (?, ?)",
             [(r['id'], r['score']) for r in results]
         )
 
-    # Rewrite: replace vec_search(...) with _vec_results
-    return sql[:start.start()] + "_vec_results" + sql[end_pos:]
+    # Rewrite: replace vec_search(...) with temp table
+    return sql[:start.start()] + tmp_name + sql[end_pos:]
 
 
 def register_vec_search(conn, caches: dict, embed_fn, cell_config: dict = None):

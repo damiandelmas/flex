@@ -1,5 +1,5 @@
 """
-Flexsearch — SQL-first agentic knowledge engine.
+FlexSearch — SQL-first agentic knowledge engine.
 
 The AI writes SQL. The schema speaks for itself.
 

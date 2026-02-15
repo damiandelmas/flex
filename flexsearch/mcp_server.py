@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-Flexsearch MCP Server — one tool, SQL endpoint.
+FlexSearch MCP Server — one tool, SQL endpoint.
 
 The AI writes SQL. The server executes it read-only.
 vec_search registered as a function for semantic queries.
@@ -15,7 +15,9 @@ import asyncio
 import json
 import sqlite3
 import sys
+import threading
 import time
+from contextlib import contextmanager
 from datetime import datetime, timezone
 from pathlib import Path
 
@@ -38,6 +40,7 @@ CELLS_ROOT = Path.home() / ".qmem/cells/projects"
 # VectorCache state — long-lived numpy matrices, independent of connections.
 # {cell_name: {'caches': {table: VectorCache}, 'config': dict, 'mtime': float}}
 _vec_state: dict = {}
+_vec_lock = threading.Lock()  # protects _vec_state writes in HTTP mode
 
 # Known cells (just names, for instructions). Populated at startup + lazily.
 _known_cells: set[str] = set()
@@ -63,44 +66,56 @@ def _db_mtime(name: str) -> float:
     return p.stat().st_mtime if p.exists() else 0
 
 
-def get_cell(name: str) -> sqlite3.Connection | None:
+@contextmanager
+def get_cell(name: str):
     """Open a fresh connection to a cell. Registers vec_search UDF if cached.
 
-    Returns None if cell doesn't exist on disk.
+    Yields None if cell doesn't exist on disk.
     Fresh connection every call = always see latest data.
+    Usage: with get_cell('thread') as db: ...
     """
     p = _db_path(name)
     if not p.exists():
-        return None
+        yield None
+        return
 
     db = open_cell(str(p))
-    is_new = name not in _known_cells
-    _known_cells.add(name)
+    try:
+        is_new = name not in _known_cells
+        _known_cells.add(name)
 
-    # Rebuild instructions when a new cell is discovered lazily
-    if is_new:
-        try:
-            server.instructions = build_instructions()
-        except Exception:
-            pass  # server may not be initialized yet during startup
+        # Rebuild instructions when a new cell is discovered lazily
+        if is_new:
+            try:
+                server.instructions = build_instructions()
+            except Exception:
+                pass  # server may not be initialized yet during startup
 
-    # Check if VectorCache needs warming or refreshing
-    current_mtime = p.stat().st_mtime
-    state = _vec_state.get(name)
+        # Check if VectorCache needs warming or refreshing
+        current_mtime = p.stat().st_mtime
+        state = _vec_state.get(name)
 
-    if state and state['mtime'] == current_mtime:
-        # Cache is fresh — just register UDF on this connection
-        _register_udf(db, state)
-    elif not _no_embed:
-        # Cache missing or stale — rebuild
-        new_state = _build_vec_state(name, db)
-        if new_state:
-            _vec_state[name] = new_state
-            _register_udf(db, new_state)
-            print(f"[flexsearch-mcp]   {name}: vec_cache {'refreshed' if state else 'warmed'}"
-                  f" ({list(new_state['caches'].keys())})", file=sys.stderr)
+        if state and state['mtime'] == current_mtime:
+            # Cache is fresh — just register UDF on this connection
+            _register_udf(db, state)
+        elif not _no_embed:
+            # Cache missing or stale — rebuild (locked for HTTP concurrency)
+            with _vec_lock:
+                # Re-check after acquiring lock (another thread may have built it)
+                state = _vec_state.get(name)
+                if state and state['mtime'] == current_mtime:
+                    _register_udf(db, state)
+                else:
+                    new_state = _build_vec_state(name, db)
+                    if new_state:
+                        _vec_state[name] = new_state
+                        _register_udf(db, new_state)
+                        print(f"[flexsearch-mcp]   {name}: vec_cache {'refreshed' if state else 'warmed'}"
+                              f" ({list(new_state['caches'].keys())})", file=sys.stderr)
 
-    return db
+        yield db
+    finally:
+        db.close()
 
 
 def _register_udf(db: sqlite3.Connection, state: dict):
@@ -133,23 +148,27 @@ def _read_vec_config(db) -> dict:
 
 
 _embedder = None
+_embedder_lock = threading.Lock()
 _no_embed = False
 
 
 def _get_embedder():
-    """Lazy-load embedder singleton."""
+    """Lazy-load embedder singleton (double-checked locking for HTTP mode)."""
     global _embedder
     if _embedder is not None:
         return _embedder
     if _no_embed:
         return None
-    try:
-        from flexsearch.onnx import get_model
-        _embedder = get_model()
-        return _embedder
-    except ImportError:
-        print("[flexsearch-mcp] Embedding not available (onnx/transformers missing)", file=sys.stderr)
-        return None
+    with _embedder_lock:
+        if _embedder is not None:
+            return _embedder
+        try:
+            from flexsearch.onnx import get_model
+            _embedder = get_model()
+            return _embedder
+        except ImportError:
+            print("[flexsearch-mcp] Embedding not available (onnx/transformers missing)", file=sys.stderr)
+            return None
 
 
 def _build_vec_state(name: str, db: sqlite3.Connection) -> dict | None:
@@ -183,9 +202,8 @@ def _build_vec_state(name: str, db: sqlite3.Connection) -> dict | None:
 def warm_all(cell_names: list[str]):
     """Pre-warm VectorCaches for all cells at startup."""
     for name in cell_names:
-        db = get_cell(name)
-        if db:
-            db.close()  # just warming the cache, don't hold connections
+        with get_cell(name):
+            pass  # just warming the cache, context manager closes connection
 
 
 def execute_preset(db: sqlite3.Connection, query: str) -> str:
@@ -241,7 +259,7 @@ def execute_query(db: sqlite3.Connection, query: str) -> str:
         rows = db.execute(sql).fetchall()
         results = [dict(r) for r in rows]
         return json.dumps(results, indent=2, default=str)
-    except sqlite3.OperationalError as e:
+    except (sqlite3.OperationalError, sqlite3.DatabaseError) as e:
         return json.dumps({"error": str(e)})
 
 
@@ -297,21 +315,19 @@ def _build_retrieval_instructions(db) -> list[str]:
 def build_instructions() -> str:
     """Build server instructions from cell _meta. The cell describes itself."""
     parts = [
-        "Flexsearch — SQL-first knowledge engine. Execute read-only SQL on knowledge cells.",
+        "FlexSearch — SQL-first knowledge engine. Execute read-only SQL on knowledge cells.",
         "",
         "CELLS:",
     ]
     # Open fresh connections to read descriptions, then close
-    first_db = None
+    retrieval_parts = None
     for name in sorted(_known_cells):
-        db = get_cell(name)
-        if db:
-            desc = get_meta(db, 'description') or f"Cell: {name}"
-            parts.append(f"  {name}: {desc}")
-            if first_db is None:
-                first_db = db
-            else:
-                db.close()
+        with get_cell(name) as db:
+            if db:
+                desc = get_meta(db, 'description') or f"Cell: {name}"
+                parts.append(f"  {name}: {desc}")
+                if retrieval_parts is None:
+                    retrieval_parts = _build_retrieval_instructions(db)
 
     parts.extend([
         "",
@@ -324,9 +340,8 @@ def build_instructions() -> str:
     ])
 
     # Build retrieval section from first cell that has keys (all cells share the model)
-    if first_db:
-        parts.extend(_build_retrieval_instructions(first_db))
-        first_db.close()
+    if retrieval_parts:
+        parts.extend(retrieval_parts)
     parts.append("")
 
     parts.extend([
@@ -448,23 +463,25 @@ async def handle_call_tool(
     query = arguments["query"]
     cell = arguments.get("cell", "thread")
 
-    db = get_cell(cell)
-    if db is None:
-        available = sorted(_known_cells)
-        on_disk = set(discover_cells()) - set(available)
-        msg = {"error": f"Unknown cell: {cell}", "available": available}
-        if on_disk:
-            msg["also_on_disk"] = sorted(on_disk)
-        return [types.TextContent(type="text", text=json.dumps(msg))]
+    with get_cell(cell) as db:
+        if db is None:
+            available = sorted(_known_cells)
+            on_disk = set(discover_cells()) - set(available)
+            msg = {"error": f"Unknown cell: {cell}", "available": available}
+            if on_disk:
+                msg["also_on_disk"] = sorted(on_disk)
+            return [types.TextContent(type="text", text=json.dumps(msg))]
 
-    try:
-        start = time.monotonic()
-        result = execute_query(db, query)
-        elapsed_ms = (time.monotonic() - start) * 1000
-        _log_query(cell, query, result, elapsed_ms)
-        return [types.TextContent(type="text", text=result)]
-    finally:
-        db.close()
+        try:
+            start = time.monotonic()
+            result = execute_query(db, query)
+            elapsed_ms = (time.monotonic() - start) * 1000
+            _log_query(cell, query, result, elapsed_ms)
+            return [types.TextContent(type="text", text=result)]
+        except Exception as e:
+            error_msg = json.dumps({"error": f"{type(e).__name__}: {e}"})
+            _log_query(cell, query, error_msg, (time.monotonic() - start) * 1000)
+            return [types.TextContent(type="text", text=error_msg)]
 
 
 # ============================================================
@@ -518,7 +535,7 @@ def run_http_server(port: int = 8080):
 def main():
     import argparse
 
-    parser = argparse.ArgumentParser(description="Flexsearch MCP server")
+    parser = argparse.ArgumentParser(description="FlexSearch MCP server")
     parser.add_argument("--cell", action="append", default=[],
                         help="Cell names to load (repeatable)")
     parser.add_argument("--no-embed", action="store_true",

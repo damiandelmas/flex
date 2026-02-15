@@ -1,5 +1,5 @@
 """
-Flexsearch Presets — SQL skills stored in the cell.
+FlexSearch Presets — SQL skills stored in the cell.
 
 Presets live in the _presets table (name, description, sql).
 The sql column contains annotated SQL text with @multi, @query, @params.
