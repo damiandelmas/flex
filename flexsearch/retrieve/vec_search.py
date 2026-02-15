@@ -47,16 +47,17 @@ def parse_modifiers(modifier_str: str) -> dict:
     """Parse a modifier string into modulation parameters.
 
     Tokens (space-separated, composable):
-        recent          temporal decay (cell-configured half-life)
-        recent:N        temporal decay with N-day half-life
-        unlike:TEXT     contrastive — demote similarity to TEXT
-        diverse         MMR diversity selection
-        limit:N         override default candidate limit
-        community:N     pre-filter to community ID
-        kind:TYPE       pre-filter to semantic kind
+        recent              temporal decay (cell-configured half-life)
+        recent:N            temporal decay with N-day half-life
+        unlike:TEXT         contrastive — demote similarity to TEXT
+        diverse             MMR diversity selection
+        limit:N             override default candidate limit
+        community:N         pre-filter to community ID
+        kind:TYPE           pre-filter to semantic kind
+        detect_communities  query-time Louvain on candidates, adds _community field
 
     Returns dict with keys: recent, recent_days, unlike, diverse,
-    limit, community, kind.
+    limit, community, kind, detect_communities.
     Unknown tokens silently ignored (forward-compatible).
     """
     result = {
@@ -67,6 +68,7 @@ def parse_modifiers(modifier_str: str) -> dict:
         'limit': None,
         'community': None,
         'kind': None,
+        'detect_communities': False,
     }
 
     if not modifier_str:
@@ -97,6 +99,8 @@ def parse_modifiers(modifier_str: str) -> dict:
                 pass
         elif token.startswith('kind:'):
             result['kind'] = token.split(':', 1)[1]
+        elif token == 'detect_communities':
+            result['detect_communities'] = True
 
     return result
 
@@ -350,16 +354,55 @@ class VectorCache:
         # Filter -inf
         top_indices = [i for i in top_indices if similarities[i] != -np.inf]
 
+        # Detect communities on candidate set (query-time Louvain)
+        detected_communities = None
+        if modifiers and modifiers.get('detect_communities') and len(top_indices) >= 3:
+            import networkx as nx
+            cand_indices = np.array(top_indices[:min(len(top_indices), oversample)])
+            cand_vecs = self.matrix[cand_indices]
+            sims = cand_vecs @ cand_vecs.T
+            G = nx.Graph()
+            for i in range(len(cand_indices)):
+                G.add_node(i)
+            threshold = 0.5
+            for i in range(len(cand_indices)):
+                for j in range(i + 1, len(cand_indices)):
+                    if sims[i, j] > threshold:
+                        G.add_edge(i, j, weight=float(sims[i, j]))
+            if G.number_of_edges() > 0:
+                comms = nx.community.louvain_communities(G)
+                detected_communities = {}
+                for ci, comm in enumerate(comms):
+                    for node in comm:
+                        detected_communities[int(node)] = ci
+
         # 3. MMR diversity — iterative selection (returns MMR scores)
         if diverse and len(top_indices) > limit:
             mmr_results = self._mmr_select(top_indices, similarities, limit,
                                            lambda_=mmr_lambda)
-            return [{'id': self.ids[idx], 'score': float(score)}
-                    for idx, score in mmr_results]
+            results = [{'id': self.ids[idx], 'score': float(score)}
+                       for idx, score in mmr_results]
+            if detected_communities is not None:
+                # Map selected indices back to candidate positions
+                cand_list = list(cand_indices)
+                for r in results:
+                    orig_idx = self._id_to_idx.get(r['id'])
+                    if orig_idx is not None and orig_idx in cand_list:
+                        pos = cand_list.index(orig_idx)
+                        r['_community'] = detected_communities.get(pos)
+            return results
 
         # Build results (cosine/modulated scores)
-        return [{'id': self.ids[idx], 'score': float(similarities[idx])}
-                for idx in top_indices[:limit]]
+        results = [{'id': self.ids[idx], 'score': float(similarities[idx])}
+                   for idx in top_indices[:limit]]
+        if detected_communities is not None:
+            cand_list = list(cand_indices)
+            for r in results:
+                orig_idx = self._id_to_idx.get(r['id'])
+                if orig_idx is not None and orig_idx in cand_list:
+                    pos = cand_list.index(orig_idx)
+                    r['_community'] = detected_communities.get(pos)
+        return results
 
     def _mmr_select(self, candidates: list, similarities: np.ndarray,
                     k: int, lambda_: float = 0.7) -> list:
@@ -506,12 +549,20 @@ def materialize_vec_search(db, sql: str) -> str:
 
     # Populate temp table (unique name per call for HTTP concurrency)
     tmp_name = f"_vec_results_{uuid.uuid4().hex[:8]}"
-    db.execute(f"CREATE TEMP TABLE [{tmp_name}] (id TEXT PRIMARY KEY, score REAL)")
-    if results:
+    has_community = results and '_community' in results[0]
+    if has_community:
+        db.execute(f"CREATE TEMP TABLE [{tmp_name}] (id TEXT PRIMARY KEY, score REAL, _community INT)")
         db.executemany(
-            f"INSERT INTO [{tmp_name}] VALUES (?, ?)",
-            [(r['id'], r['score']) for r in results]
+            f"INSERT INTO [{tmp_name}] VALUES (?, ?, ?)",
+            [(r['id'], r['score'], r.get('_community')) for r in results]
         )
+    else:
+        db.execute(f"CREATE TEMP TABLE [{tmp_name}] (id TEXT PRIMARY KEY, score REAL)")
+        if results:
+            db.executemany(
+                f"INSERT INTO [{tmp_name}] VALUES (?, ?)",
+                [(r['id'], r['score']) for r in results]
+            )
 
     # Rewrite: replace vec_search(...) with temp table
     return sql[:start.start()] + tmp_name + sql[end_pos:]
@@ -570,7 +621,8 @@ def register_vec_search(conn, caches: dict, embed_fn, cell_config: dict = None):
             oversample=min(limit * 3, cache.size),
         )
         return json.dumps([
-            {'id': r['id'], 'score': round(r['score'], 4)}
+            {k: (round(v, 4) if k == 'score' else v)
+             for k, v in r.items()}
             for r in results
         ])
 

@@ -305,7 +305,8 @@ def _build_retrieval_instructions(db) -> list[str]:
             "  vec_search('table', 'query', 'modifiers') → (id, score)",
             "  Modifiers (3rd arg, space-separated, composable):",
             "    community:N  kind:TYPE  limit:N     — pre-selection masks",
-            "    recent[:N]  diverse  unlike:TEXT          — score modulation",
+            "    recent[:N]  diverse  unlike:TEXT     — score modulation",
+            "    detect_communities                   — query-time Louvain on candidates, adds _community column",
             "  JOIN messages m ON v.id = m.id         — full SQL after",
         ])
 

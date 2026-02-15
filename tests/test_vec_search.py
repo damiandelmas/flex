@@ -429,6 +429,16 @@ class TestParseModifiers:
         assert result['unlike'] == 'jwt'
         assert result['limit'] == 50
 
+    def test_detect_communities(self):
+        from flexsearch.retrieve.vec_search import parse_modifiers
+        result = parse_modifiers('detect_communities')
+        assert result['detect_communities'] is True
+
+    def test_detect_communities_default_false(self):
+        from flexsearch.retrieve.vec_search import parse_modifiers
+        result = parse_modifiers('recent')
+        assert result['detect_communities'] is False
+
     def test_unknown_token_ignored(self):
         from flexsearch.retrieve.vec_search import parse_modifiers
         result = parse_modifiers('hubs foo bar')
@@ -778,6 +788,72 @@ class TestLoadColumnsPreFilter:
         assert vc.kinds[0] == ''
         assert vc.community_ids is not None
         assert vc.community_ids[0] == -1
+
+
+# =============================================================================
+# detect_communities
+# =============================================================================
+
+class TestDetectCommunities:
+    """detect_communities runs query-time Louvain on candidate embeddings."""
+
+    def test_adds_community_field(self, mod_cache):
+        """Results include _community when detect_communities is set."""
+        query = _make_vec([0.5, 0.5, 0.0])
+        modifiers = {'recent': False, 'recent_days': None,
+                     'unlike': None, 'diverse': False, 'limit': None,
+                     'community': None, 'kind': None,
+                     'detect_communities': True}
+        results = mod_cache.search(query, limit=5, modifiers=modifiers)
+        assert len(results) > 0
+        assert all('_community' in r for r in results)
+
+    def test_without_flag_no_community(self, mod_cache):
+        """Results don't have _community when not requested."""
+        query = _make_vec([0.5, 0.5, 0.0])
+        modifiers = {'recent': False, 'recent_days': None,
+                     'unlike': None, 'diverse': False, 'limit': None,
+                     'community': None, 'kind': None,
+                     'detect_communities': False}
+        results = mod_cache.search(query, limit=5, modifiers=modifiers)
+        assert all('_community' not in r for r in results)
+
+    def test_community_values_are_integers(self, mod_cache):
+        """_community values are non-negative integers."""
+        query = _make_vec([0.5, 0.5, 0.0])
+        modifiers = {'recent': False, 'recent_days': None,
+                     'unlike': None, 'diverse': False, 'limit': None,
+                     'community': None, 'kind': None,
+                     'detect_communities': True}
+        results = mod_cache.search(query, limit=5, modifiers=modifiers)
+        for r in results:
+            assert isinstance(r['_community'], int)
+            assert r['_community'] >= 0
+
+    def test_composable_with_diverse(self, mod_cache):
+        """detect_communities + diverse compose without crashing."""
+        query = _make_vec([0.5, 0.5, 0.0])
+        modifiers = {'recent': False, 'recent_days': None,
+                     'unlike': None, 'diverse': True, 'limit': None,
+                     'community': None, 'kind': None,
+                     'detect_communities': True}
+        results = mod_cache.search(query, limit=3, modifiers=modifiers,
+                                   oversample=5)
+        assert len(results) == 3
+        assert all('_community' in r for r in results)
+
+    def test_too_few_candidates_skips(self, cache):
+        """With <3 candidates after filtering, community detection skips."""
+        mask = cache.get_mask_for_ids(['a', 'b'])
+        query = _make_vec([1.0, 0.0, 0.0])
+        modifiers = {'recent': False, 'recent_days': None,
+                     'unlike': None, 'diverse': False, 'limit': None,
+                     'community': None, 'kind': None,
+                     'detect_communities': True}
+        results = cache.search(query, limit=2, mask=mask, modifiers=modifiers)
+        # Should still return results, just no _community
+        assert len(results) == 2
+        assert all('_community' not in r for r in results)
 
 
 # =============================================================================
