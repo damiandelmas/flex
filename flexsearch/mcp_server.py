@@ -332,6 +332,10 @@ def build_instructions() -> str:
 
     parts.extend([
         "",
+        "CELL SELECTION:",
+        "  Start with context cells (flexsearch-context, axpstack-context) for design docs,",
+        "  then thread for session provenance, claude for conversations, qmem for engine docs.",
+        "",
         "ORIENTATION:",
         "  SELECT value FROM _meta WHERE key='description'       # What is this cell?",
         "  SELECT name FROM sqlite_master WHERE type='view'       # What views exist?",
@@ -355,6 +359,12 @@ def build_instructions() -> str:
         "  No modifiers = raw cosine similarity.",
         "  vec_search('_raw_chunks', 'auth', 'recent:7 diverse')",
         "  vec_search('_raw_chunks', 'SOMA identity', 'kind:delegation community:17')",
+        "",
+        "  -- Filter to user prompts only (essential for mining human voice):",
+        "  vec_search('_raw_chunks', 'auth', 'kind:prompt diverse')",
+        "",
+        "  -- Discover themes in results (query-time Louvain, adds _community column):",
+        "  vec_search('_raw_chunks', 'error handling', 'detect_communities')",
         "",
         "HYBRID (FTS + semantic + graph):",
         "  vec_search('_raw_chunks', 'query')                    # Semantic candidates",
