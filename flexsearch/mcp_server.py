@@ -200,7 +200,14 @@ def _build_vec_state(name: str, db: sqlite3.Connection) -> dict | None:
 
 
 def warm_all(cell_names: list[str]):
-    """Pre-warm VectorCaches for all cells at startup."""
+    """Pre-warm VectorCaches and ONNX embedder at startup."""
+    # Load ONNX model first — lazy singleton, ~2-3s cold
+    embedder = _get_embedder()
+    if embedder:
+        # Force session init by encoding a dummy string
+        embedder.encode("warmup")
+        print("[flexsearch-mcp] ONNX embedder warmed", file=sys.stderr)
+
     for name in cell_names:
         with get_cell(name):
             pass  # just warming the cache, context manager closes connection
