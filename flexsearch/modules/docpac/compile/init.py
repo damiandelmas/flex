@@ -29,7 +29,7 @@ from pathlib import Path
 # scripts/ -> docpac/ -> modules/ -> flexsearch/ -> main/
 FLEX_ROOT = Path(__file__).resolve().parent.parent.parent.parent.parent
 
-from flexsearch.compile.docpac import parse_docpac
+from flexsearch.modules.docpac.compile.docpac import parse_docpac
 from flexsearch.compile.markdown import normalize_headers, extract_frontmatter, split_sections
 from flexsearch.core import open_cell, set_meta, run_sql, validate_cell
 from flexsearch.views import regenerate_views
@@ -404,8 +404,11 @@ def main():
              'community:N→community_id, kind:TYPE→kind, limit:N')
     set_meta(db, 'retrieval:phase2',
              'LANDSCAPE scoring (numpy on full N): '
-             'hubs→centrality, recent[:N]→timestamp, diverse, unlike:TEXT')
+             'recent[:N]→timestamp, diverse, unlike:TEXT')
     set_meta(db, 'retrieval:phase3',
+             'ENRICH (query-time topology on K candidates): '
+             'detect_communities→_community column (per-query Louvain)')
+    set_meta(db, 'retrieval:phase4',
              'SQL COMPOSITION (on K candidates): '
              'JOIN sections s ON v.id = s.id — kind, community_id, centrality, '
              'is_hub, temporal, doc_type, doc_title, section_title')
