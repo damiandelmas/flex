@@ -26,12 +26,15 @@ from mcp.server.stdio import stdio_server
 import mcp.types as types
 
 from flexsearch.core import open_cell, get_meta
+from flexsearch.registry import (
+    CELLS_ROOT,
+    resolve_cell as registry_resolve,
+    discover_cells as registry_discover,
+)
 
 # ============================================================
 # Configuration
 # ============================================================
-
-CELLS_ROOT = Path.home() / ".qmem/cells/projects"
 
 # ============================================================
 # Cell Management
@@ -47,17 +50,12 @@ _known_cells: set[str] = set()
 
 
 def discover_cells() -> list[str]:
-    """Scan CELLS_ROOT for directories containing main.db."""
-    if not CELLS_ROOT.exists():
-        return []
-    return sorted(
-        d.name for d in CELLS_ROOT.iterdir()
-        if d.is_dir() and (d / "main.db").exists()
-    )
+    """Discover cells from registry + filesystem fallback."""
+    return registry_discover()
 
 
 def _db_path(name: str) -> Path:
-    return CELLS_ROOT / name / "main.db"
+    return registry_resolve(name) or (CELLS_ROOT / name / "main.db")
 
 
 def _db_mtime(name: str) -> float:
@@ -402,7 +400,8 @@ server = Server("flexsearch")
 def _log_query(cell: str, query: str, result_json: str, elapsed_ms: float):
     """Append query to cell's history JSONL. Fire-and-forget."""
     try:
-        history_path = CELLS_ROOT / cell / "flexsearch-history.jsonl"
+        cell_path = _db_path(cell)
+        history_path = cell_path.parent / "flexsearch-history.jsonl"
         parsed = json.loads(result_json)
         if isinstance(parsed, list):
             result_count = len(parsed)

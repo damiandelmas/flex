@@ -19,15 +19,21 @@ import sqlite3
 import sys
 from pathlib import Path
 
-CELLS_ROOT = Path.home() / ".qmem/cells/projects"
+from flexsearch.registry import (
+    resolve_cell as _registry_resolve,
+    list_cells as _registry_list,
+    discover_cells as _registry_discover,
+    register_cell as _registry_register,
+    CELLS_ROOT,
+)
 
 
 def resolve_cell(name: str) -> Path:
-    db_path = CELLS_ROOT / name / "main.db"
-    if not db_path.exists():
-        print(f"Cell not found: {db_path}", file=sys.stderr)
+    result = _registry_resolve(name)
+    if result is None:
+        print(f"Cell not found: {name}", file=sys.stderr)
         sys.exit(1)
-    return db_path
+    return result
 
 
 def cmd_search(db: sqlite3.Connection, query: str, cell_dir: Path):
@@ -111,6 +117,47 @@ def cmd_index(db: sqlite3.Connection, args):
     print("The flex index command will integrate with registered compilers in Plan 5.")
 
 
+def cmd_cells():
+    """List all registered and discovered cells."""
+    registered = _registry_list()
+    all_names = set(_registry_discover())
+    registered_names = {c['name'] for c in registered}
+    unregistered = all_names - registered_names
+
+    if registered:
+        print(f"{'NAME':<25} {'TYPE':<12} {'DESCRIPTION'}")
+        print("-" * 70)
+        for c in registered:
+            desc = (c['description'] or '')[:40]
+            ctype = c['cell_type'] or ''
+            print(f"{c['name']:<25} {ctype:<12} {desc}")
+
+    if unregistered:
+        print(f"\nUnregistered (on disk at {CELLS_ROOT}):")
+        for name in sorted(unregistered):
+            print(f"  {name}")
+
+    if not registered and not unregistered:
+        print("No cells found.")
+
+
+def cmd_register(args):
+    """Register a cell in the registry."""
+    name = args.name
+    if args.path:
+        path = Path(args.path).resolve()
+    else:
+        path = CELLS_ROOT / name / "main.db"
+
+    if not path.exists():
+        print(f"Database not found: {path}", file=sys.stderr)
+        sys.exit(1)
+
+    _registry_register(name, path, cell_type=args.cell_type,
+                       description=args.description)
+    print(f"Registered: {name} -> {path}")
+
+
 def main():
     parser = argparse.ArgumentParser(
         prog='flex',
@@ -133,11 +180,29 @@ def main():
     idx_p = sub.add_parser('index', aliases=['i'], help='Ingest pipeline')
     idx_p.add_argument('path', nargs='?', help='Corpus path')
 
+    # cells
+    sub.add_parser('cells', aliases=['c'], help='List registered cells')
+
+    # register
+    reg_p = sub.add_parser('register', aliases=['r'], help='Register a cell')
+    reg_p.add_argument('name', help='Cell name')
+    reg_p.add_argument('path', nargs='?', help='Path to main.db (default: CELLS_ROOT/name/main.db)')
+    reg_p.add_argument('--type', dest='cell_type', default=None, help='Cell type (claude-code, docpac)')
+    reg_p.add_argument('--description', default=None, help='Cell description')
+
     args = parser.parse_args()
 
     if not args.command:
         parser.print_help()
         sys.exit(1)
+
+    # Commands that don't need a cell connection
+    if args.command in ('cells', 'c'):
+        cmd_cells()
+        return
+    if args.command in ('register', 'r'):
+        cmd_register(args)
+        return
 
     # Resolve cell
     cell_name = args.cell

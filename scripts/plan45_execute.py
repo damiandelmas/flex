@@ -25,7 +25,7 @@ from flexsearch.views import regenerate_views
 from flexsearch.manage.meditate import build_similarity_graph, compute_scores, persist
 from flexsearch.retrieve.presets import install_presets
 
-CELLS_ROOT = Path.home() / '.qmem' / 'cells' / 'projects'
+from flexsearch.registry import CELLS_ROOT
 PRESET_GENERAL = FLEX_ROOT / 'flexsearch' / 'retrieve' / 'presets' / 'general'
 PRESET_THREAD = FLEX_ROOT / 'flexsearch' / 'retrieve' / 'presets' / 'thread'
 

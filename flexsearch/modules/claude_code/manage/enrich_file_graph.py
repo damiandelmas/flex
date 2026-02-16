@@ -20,8 +20,8 @@ from flexsearch.modules.claude_code.manage.file_graph import (
     CREATE_TABLE, build_file_graph, analyze_file_graph,
 )
 
-CELLS_ROOT = Path.home() / '.qmem' / 'cells' / 'projects'
-THREAD_DB = CELLS_ROOT / 'thread' / 'main.db'
+from flexsearch.registry import CELLS_ROOT, resolve_cell
+THREAD_DB = resolve_cell('thread') or (CELLS_ROOT / 'thread' / 'main.db')
 
 
 def main():

@@ -23,7 +23,7 @@ MODULE_ROOT = Path(__file__).resolve().parent.parent / "modules"
 THREAD_DIR = MODULE_ROOT / "claude_code" / "presets"
 
 # Cell paths
-CELLS_ROOT = Path.home() / ".qmem/cells/projects"
+from flexsearch.registry import CELLS_ROOT, resolve_cell
 
 # Which cells get which presets
 CELL_CONFIG = {
@@ -47,9 +47,9 @@ def install_cell(cell_name: str, preset_dirs: list[Path] = None):
     if preset_dirs is None:
         preset_dirs = CELL_CONFIG.get(cell_name, [GENERAL_DIR])
 
-    db_path = CELLS_ROOT / cell_name / "main.db"
+    db_path = resolve_cell(cell_name) or (CELLS_ROOT / cell_name / "main.db")
     if not db_path.exists():
-        print(f"  {cell_name}: SKIP (not found at {db_path})")
+        print(f"  {cell_name}: SKIP (not found)")
         return
 
     try:

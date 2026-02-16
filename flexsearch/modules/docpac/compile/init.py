@@ -212,7 +212,7 @@ def make_chunk_id(source_id: str, position: int) -> str:
     return f"{source_id}:{position}"
 
 
-CELLS_ROOT = Path.home() / '.qmem' / 'cells' / 'projects'
+from flexsearch.registry import CELLS_ROOT, register_cell as _registry_register
 
 
 def derive_cell_name(corpus_path: str) -> str:
@@ -523,7 +523,15 @@ def main():
     print(f"Installed {preset_count} general presets.")
 
     # ═════════════════════════════════════════════════
-    # 12. DONE
+    # 12. REGISTER IN CELL REGISTRY
+    # ═════════════════════════════════════════════════
+    cell_name_final = os.path.basename(cell_dir)
+    _registry_register(cell_name_final, db_path, cell_type='docpac',
+                       description=desc)
+    print(f"Registered in cell registry: {cell_name_final}")
+
+    # ═════════════════════════════════════════════════
+    # 13. DONE
     # ═════════════════════════════════════════════════
     elapsed = time.time() - t0
     print(f"\n{'='*50}")

@@ -19,8 +19,8 @@ from flexsearch.modules.claude_code.manage.delegation_graph import (
     CREATE_TABLE, build_delegation_graph, compute_delegation_metrics,
 )
 
-CELLS_ROOT = Path.home() / '.qmem' / 'cells' / 'projects'
-THREAD_DB = CELLS_ROOT / 'thread' / 'main.db'
+from flexsearch.registry import CELLS_ROOT, resolve_cell
+THREAD_DB = resolve_cell('thread') or (CELLS_ROOT / 'thread' / 'main.db')
 
 
 def main():

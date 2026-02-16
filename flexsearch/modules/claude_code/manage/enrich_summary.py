@@ -34,8 +34,8 @@ from flexsearch.modules.claude_code.manage.summary import (
     HDBSCAN_METRIC, label_cluster, short_session_label,
 )
 
-CELLS_ROOT = Path.home() / '.qmem' / 'cells' / 'projects'
-THREAD_DB = CELLS_ROOT / 'thread' / 'main.db'
+from flexsearch.registry import CELLS_ROOT, resolve_cell
+THREAD_DB = resolve_cell('thread') or (CELLS_ROOT / 'thread' / 'main.db')
 
 CREATE_TABLE = """
 CREATE TABLE IF NOT EXISTS _enrich_session_summary (
