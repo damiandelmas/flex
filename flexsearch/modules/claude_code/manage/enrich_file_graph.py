@@ -20,8 +20,8 @@ from flexsearch.modules.claude_code.manage.file_graph import (
     CREATE_TABLE, build_file_graph, analyze_file_graph,
 )
 
-from flexsearch.registry import CELLS_ROOT, resolve_cell
-CLAUDE_CODE_DB = resolve_cell('claude_code') or (CELLS_ROOT / 'claude_code' / 'main.db')
+from flexsearch.registry import resolve_cell
+CLAUDE_CODE_DB = resolve_cell('claude_code')
 
 
 def main():

@@ -26,7 +26,7 @@ def tmp_registry(tmp_path, monkeypatch):
     reg_db = reg_home / "registry.db"
     monkeypatch.setattr("flexsearch.registry.FLEX_HOME", reg_home)
     monkeypatch.setattr("flexsearch.registry.REGISTRY_DB", reg_db)
-    monkeypatch.setattr("flexsearch.registry.CELLS_ROOT", tmp_path / "legacy")
+    monkeypatch.setattr("flexsearch.registry.CELLS_DIR", tmp_path / "cells")
     return tmp_path
 
 
@@ -127,21 +127,12 @@ class TestListAndDiscover:
         assert cells[0]['name'] == 'alpha'
         assert cells[1]['name'] == 'beta'
 
-    def test_discover_merges_registry_and_filesystem(self, tmp_registry):
-        # Registry cell
+    def test_discover_returns_registered(self, tmp_registry):
         db1 = _make_cell(tmp_registry, "registered")
         register_cell("registered", db1)
 
-        # Filesystem-only cell (legacy layout)
-        legacy_dir = tmp_registry / "legacy" / "unregistered"
-        legacy_dir.mkdir(parents=True)
-        _make_cell(legacy_dir.parent, "unregistered")
-        # Need main.db in the right place
-        (legacy_dir / "main.db").touch()
-
         names = discover_cells()
         assert "registered" in names
-        assert "unregistered" in names
 
 
 class TestUnregister:
@@ -159,12 +150,9 @@ class TestUnregister:
         assert result is False
 
 
-class TestFilesystemFallback:
+class TestRegistryOnly:
 
-    def test_legacy_layout_resolves(self, tmp_registry):
-        legacy_dir = tmp_registry / "legacy" / "old-cell"
-        legacy_dir.mkdir(parents=True)
-        db_path = legacy_dir / "main.db"
-        db_path.touch()
-        result = resolve_cell("old-cell")
-        assert result == db_path
+    def test_unregistered_returns_none(self, tmp_registry):
+        """No filesystem fallback — unregistered cells return None."""
+        result = resolve_cell("not-in-registry")
+        assert result is None

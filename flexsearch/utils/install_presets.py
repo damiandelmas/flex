@@ -23,7 +23,7 @@ MODULE_ROOT = Path(__file__).resolve().parent.parent / "modules"
 CLAUDE_CODE_DIR = MODULE_ROOT / "claude_code" / "presets"
 
 # Cell paths
-from flexsearch.registry import CELLS_ROOT, resolve_cell
+from flexsearch.registry import resolve_cell
 
 # Which cells get which presets
 CELL_CONFIG = {
@@ -47,7 +47,7 @@ def install_cell(cell_name: str, preset_dirs: list[Path] = None):
     if preset_dirs is None:
         preset_dirs = CELL_CONFIG.get(cell_name, [GENERAL_DIR])
 
-    db_path = resolve_cell(cell_name) or (CELLS_ROOT / cell_name / "main.db")
+    db_path = resolve_cell(cell_name)
     if not db_path.exists():
         print(f"  {cell_name}: SKIP (not found)")
         return

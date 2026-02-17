@@ -212,7 +212,8 @@ def make_chunk_id(source_id: str, position: int) -> str:
     return f"{source_id}:{position}"
 
 
-from flexsearch.registry import CELLS_ROOT, register_cell as _registry_register
+import uuid as _uuid
+from flexsearch.registry import CELLS_DIR, resolve_cell as _registry_resolve, register_cell as _registry_register
 
 
 def derive_cell_name(corpus_path: str) -> str:
@@ -243,24 +244,30 @@ def main():
         parser.error('corpus path is required')
 
     corpus_root = os.path.abspath(corpus_input)
+    cell_name = derive_cell_name(corpus_root)
+    print(f"Auto-derived cell name: {cell_name}")
+
     if args.cell:
-        cell_dir = os.path.expanduser(args.cell)
+        db_path = os.path.expanduser(args.cell)
     else:
-        cell_name = derive_cell_name(corpus_root)
-        cell_dir = str(CELLS_ROOT / cell_name)
-        print(f"Auto-derived cell name: {cell_name}")
-    db_path = os.path.join(cell_dir, 'main.db')
+        # Check if cell already exists in registry — reuse its path
+        existing = _registry_resolve(cell_name)
+        if existing:
+            db_path = str(existing)
+        else:
+            # New cell: assign UUID, land in ~/.flex/cells/
+            cell_uuid = str(_uuid.uuid4())
+            CELLS_DIR.mkdir(parents=True, exist_ok=True)
+            db_path = str(CELLS_DIR / f"{cell_uuid}.db")
 
     t0 = time.time()
 
     # ═════════════════════════════════════════════════
-    # 1. CREATE CELL DIRECTORY
+    # 1. REMOVE OLD CELL IF EXISTS
     # ═════════════════════════════════════════════════
-    if os.path.exists(cell_dir):
-        print(f"Removing existing cell at {cell_dir}...")
-        shutil.rmtree(cell_dir)
-    os.makedirs(cell_dir, exist_ok=True)
-    print(f"Cell directory: {cell_dir}")
+    if os.path.exists(db_path):
+        print(f"Removing existing cell at {db_path}...")
+        os.remove(db_path)
 
     # ═════════════════════════════════════════════════
     # 2. CREATE SCHEMA
@@ -529,10 +536,9 @@ def main():
     # ═════════════════════════════════════════════════
     # 12. REGISTER IN CELL REGISTRY
     # ═════════════════════════════════════════════════
-    cell_name_final = os.path.basename(cell_dir)
-    _registry_register(cell_name_final, db_path, cell_type='docpac',
+    _registry_register(cell_name, db_path, cell_type='docpac',
                        description=desc, corpus_path=corpus_root)
-    print(f"Registered in cell registry: {cell_name_final} (corpus={corpus_root})")
+    print(f"Registered in cell registry: {cell_name} (corpus={corpus_root})")
 
     # ═════════════════════════════════════════════════
     # 13. DONE

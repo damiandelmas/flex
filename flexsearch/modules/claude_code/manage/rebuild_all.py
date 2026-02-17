@@ -17,8 +17,8 @@ from flexsearch.views import regenerate_views
 from flexsearch.manage.meditate import build_similarity_graph, compute_scores, persist
 from flexsearch.modules.claude_code.manage.noise import graph_filter_sql
 
-from flexsearch.registry import CELLS_ROOT, resolve_cell
-CLAUDE_CODE_DB = resolve_cell('claude_code') or (CELLS_ROOT / 'claude_code' / 'main.db')
+from flexsearch.registry import resolve_cell
+CLAUDE_CODE_DB = resolve_cell('claude_code')
 
 # claude_code corpus: median pairwise similarity is 0.61 at threshold 0.5 -> 78% density.
 # 0.65 gives 39% density — meaningful topology without near-complete graph.

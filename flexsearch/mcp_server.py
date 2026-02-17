@@ -27,7 +27,6 @@ import mcp.types as types
 
 from flexsearch.core import open_cell, get_meta
 from flexsearch.registry import (
-    CELLS_ROOT,
     resolve_cell as registry_resolve,
     discover_cells as registry_discover,
 )
@@ -55,7 +54,10 @@ def discover_cells() -> list[str]:
 
 
 def _db_path(name: str) -> Path:
-    return registry_resolve(name) or (CELLS_ROOT / name / "main.db")
+    p = registry_resolve(name)
+    if p is None:
+        raise FileNotFoundError(f"Cell '{name}' not found in registry")
+    return p
 
 
 def _db_mtime(name: str) -> float:

@@ -34,8 +34,8 @@ from flexsearch.modules.claude_code.manage.summary import (
     HDBSCAN_METRIC, label_cluster, short_session_label,
 )
 
-from flexsearch.registry import CELLS_ROOT, resolve_cell
-CLAUDE_CODE_DB = resolve_cell('claude_code') or (CELLS_ROOT / 'claude_code' / 'main.db')
+from flexsearch.registry import resolve_cell
+CLAUDE_CODE_DB = resolve_cell('claude_code')
 
 CREATE_TABLE = """
 CREATE TABLE IF NOT EXISTS _enrich_session_summary (

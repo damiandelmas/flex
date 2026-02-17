@@ -24,7 +24,6 @@ from flexsearch.registry import (
     list_cells as _registry_list,
     discover_cells as _registry_discover,
     register_cell as _registry_register,
-    CELLS_ROOT,
 )
 
 
@@ -134,7 +133,7 @@ def cmd_cells():
             print(f"{c['name']:<25} {cid:<10} {ctype:<12} {desc}")
 
     if unregistered:
-        print(f"\nUnregistered (on disk at {CELLS_ROOT}):")
+        print(f"\nUnregistered:")
         for name in sorted(unregistered):
             print(f"  {name}")
 
@@ -148,7 +147,8 @@ def cmd_register(args):
     if args.path:
         path = Path(args.path).resolve()
     else:
-        path = CELLS_ROOT / name / "main.db"
+        print("Path is required: flex register NAME /path/to/cell.db", file=sys.stderr)
+        sys.exit(1)
 
     if not path.exists():
         print(f"Database not found: {path}", file=sys.stderr)
@@ -164,7 +164,7 @@ def main():
         prog='flex',
         description='Flexsearch CLI — sandboxed access to knowledge cells'
     )
-    parser.add_argument('--cell', default='thread', help='Cell name (default: thread)')
+    parser.add_argument('--cell', default='claude_code', help='Cell name (default: claude_code)')
 
     sub = parser.add_subparsers(dest='command')
 
@@ -187,7 +187,7 @@ def main():
     # register
     reg_p = sub.add_parser('register', aliases=['r'], help='Register a cell')
     reg_p.add_argument('name', help='Cell name')
-    reg_p.add_argument('path', nargs='?', help='Path to main.db (default: CELLS_ROOT/name/main.db)')
+    reg_p.add_argument('path', nargs='?', help='Path to cell .db file')
     reg_p.add_argument('--type', dest='cell_type', default=None, help='Cell type (claude-code, docpac)')
     reg_p.add_argument('--description', default=None, help='Cell description')
 

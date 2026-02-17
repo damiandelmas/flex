@@ -2,7 +2,7 @@
 FlexSearch Cell Registry — centralized cell catalog.
 
 Single source of truth for cell name → path resolution.
-All consumers import from here instead of defining CELLS_ROOT locally.
+All consumers import from here instead of defining paths locally.
 
 Registry location: ~/.flex/registry.db
 Cells live at ~/.flex/cells/{uuid}.db
@@ -14,11 +14,9 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Optional
 
-# Legacy default root — cells lived here before migration
-CELLS_ROOT = Path.home() / ".qmem/cells/projects"
-
-# Registry location
+# All cells live under ~/.flex/
 FLEX_HOME = Path.home() / ".flex"
+CELLS_DIR = FLEX_HOME / "cells"
 REGISTRY_DB = FLEX_HOME / "registry.db"
 
 _SCHEMA = """\
@@ -162,11 +160,6 @@ def resolve_cell(name: str) -> Optional[Path]:
     except Exception:
         pass
 
-    # 2. Filesystem fallback (legacy layout)
-    fallback = CELLS_ROOT / name / "main.db"
-    if fallback.exists():
-        return fallback
-
     return None
 
 
@@ -221,11 +214,5 @@ def discover_cells() -> list[str]:
         p = Path(cell['path'])
         if p.exists():
             names.add(cell['name'])
-
-    # Filesystem fallback for unregistered cells
-    if CELLS_ROOT.exists():
-        for d in CELLS_ROOT.iterdir():
-            if d.is_dir() and (d / "main.db").exists():
-                names.add(d.name)
 
     return sorted(names)
