@@ -493,11 +493,52 @@ async def handle_list_tools() -> list[types.Tool]:
     ]
 
 
+_QUERY_TIMEOUT_S = 30  # max seconds per query before cancellation
+
+
+def _execute_cell_query(cell: str, query: str) -> str:
+    """Synchronous cell query — runs in executor to avoid blocking event loop."""
+    with get_cell(cell) as db:
+        if db is None:
+            available = sorted(_known_cells)
+            on_disk = set(discover_cells()) - set(available)
+            msg = {"error": f"Unknown cell: {cell}", "available": available}
+            if on_disk:
+                msg["also_on_disk"] = sorted(on_disk)
+            return json.dumps(msg)
+
+        # SQLite progress handler — abort after timeout
+        deadline = time.monotonic() + _QUERY_TIMEOUT_S
+        def _check_timeout():
+            if time.monotonic() > deadline:
+                return 1  # non-zero = abort
+            return 0
+        db.set_progress_handler(_check_timeout, 10000)  # check every 10K opcodes
+
+        try:
+            start = time.monotonic()
+            result = execute_query(db, query)
+            elapsed_ms = (time.monotonic() - start) * 1000
+            _log_query(cell, query, result, elapsed_ms)
+            return result
+        except sqlite3.OperationalError as e:
+            if 'interrupt' in str(e).lower():
+                error_msg = json.dumps({"error": f"Query timed out after {_QUERY_TIMEOUT_S}s"})
+            else:
+                error_msg = json.dumps({"error": f"OperationalError: {e}"})
+            _log_query(cell, query, error_msg, (time.monotonic() - start) * 1000)
+            return error_msg
+        except Exception as e:
+            error_msg = json.dumps({"error": f"{type(e).__name__}: {e}"})
+            _log_query(cell, query, error_msg, (time.monotonic() - start) * 1000)
+            return error_msg
+
+
 @server.call_tool()
 async def handle_call_tool(
     name: str, arguments: dict | None
 ) -> list[types.TextContent]:
-    """Handle flexsearch tool calls."""
+    """Handle flexsearch tool calls. Runs DB work in executor to avoid blocking."""
     if name != "flexsearch":
         return [types.TextContent(type="text", text=json.dumps({"error": f"Unknown tool: {name}"}))]
 
@@ -507,25 +548,9 @@ async def handle_call_tool(
     query = arguments["query"]
     cell = arguments.get("cell", "claude_code")
 
-    with get_cell(cell) as db:
-        if db is None:
-            available = sorted(_known_cells)
-            on_disk = set(discover_cells()) - set(available)
-            msg = {"error": f"Unknown cell: {cell}", "available": available}
-            if on_disk:
-                msg["also_on_disk"] = sorted(on_disk)
-            return [types.TextContent(type="text", text=json.dumps(msg))]
-
-        try:
-            start = time.monotonic()
-            result = execute_query(db, query)
-            elapsed_ms = (time.monotonic() - start) * 1000
-            _log_query(cell, query, result, elapsed_ms)
-            return [types.TextContent(type="text", text=result)]
-        except Exception as e:
-            error_msg = json.dumps({"error": f"{type(e).__name__}: {e}"})
-            _log_query(cell, query, error_msg, (time.monotonic() - start) * 1000)
-            return [types.TextContent(type="text", text=error_msg)]
+    loop = asyncio.get_running_loop()
+    result = await loop.run_in_executor(None, _execute_cell_query, cell, query)
+    return [types.TextContent(type="text", text=result)]
 
 
 # ============================================================
@@ -569,7 +594,7 @@ def run_http_server(port: int = 8080):
     )
 
     print(f"[flexsearch-mcp] HTTP/SSE on port {port}", file=sys.stderr)
-    uvicorn.run(app, host="0.0.0.0", port=port)
+    uvicorn.run(app, host="127.0.0.1", port=port)
 
 
 # ============================================================
