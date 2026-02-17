@@ -28,7 +28,7 @@ from flexsearch.registry import resolve_cell
 # Which cells get which presets
 CELL_CONFIG = {
     'claude_code': [GENERAL_DIR, CLAUDE_CODE_DIR],
-    'claude': [GENERAL_DIR, CLAUDE_CODE_DIR],
+    'claude_chat': [GENERAL_DIR],
     'qmem': [GENERAL_DIR],
     'inventory': [GENERAL_DIR],
     'thread-codebase': [GENERAL_DIR],
