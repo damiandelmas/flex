@@ -11,6 +11,7 @@ Functions:
 View generation lives in views.py (same package).
 """
 
+import json
 import sqlite3
 from typing import Optional
 
@@ -57,6 +58,33 @@ def set_meta(db: sqlite3.Connection, key: str, value: str):
         (key, value)
     )
     db.commit()
+
+
+def ensure_ops_table(db: sqlite3.Connection):
+    """Create _ops table if it doesn't exist. Idempotent."""
+    db.execute("""CREATE TABLE IF NOT EXISTS _ops (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        timestamp INTEGER DEFAULT (strftime('%s','now')),
+        operation TEXT,
+        target TEXT,
+        sql TEXT,
+        params TEXT,
+        rows_affected INTEGER,
+        source TEXT
+    )""")
+
+
+def log_op(db: sqlite3.Connection, operation: str, target: str,
+           params: dict = None, rows_affected: int = None,
+           source: str = None, sql: str = None):
+    """Log a cell mutation to _ops. Self-logging — callers capture their own params."""
+    ensure_ops_table(db)
+    db.execute(
+        "INSERT INTO _ops (operation, target, sql, params, rows_affected, source) "
+        "VALUES (?, ?, ?, ?, ?, ?)",
+        (operation, target, sql,
+         json.dumps(params) if params else None,
+         rows_affected, source))
 
 
 def validate_cell(db: sqlite3.Connection):

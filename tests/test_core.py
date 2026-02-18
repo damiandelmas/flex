@@ -307,6 +307,111 @@ class TestCuratedPrecedence:
         assert 'documents' in names  # auto-generated
 
 
+# =============================================================================
+# _ops table + log_op (Plan 12)
+# =============================================================================
+
+class TestOpsTable:
+    """_ops table: cell mutation provenance."""
+
+    def test_ensure_ops_table_creates_table(self, empty_cell):
+        from flexsearch.core import ensure_ops_table
+        ensure_ops_table(empty_cell)
+        tables = empty_cell.execute(
+            "SELECT name FROM sqlite_master WHERE type='table' AND name='_ops'"
+        ).fetchall()
+        assert len(tables) == 1
+
+    def test_ensure_ops_table_idempotent(self, empty_cell):
+        from flexsearch.core import ensure_ops_table
+        ensure_ops_table(empty_cell)
+        ensure_ops_table(empty_cell)  # should not raise
+        count = empty_cell.execute(
+            "SELECT COUNT(*) FROM sqlite_master WHERE type='table' AND name='_ops'"
+        ).fetchone()[0]
+        assert count == 1
+
+    def test_log_op_basic(self, empty_cell):
+        from flexsearch.core import log_op
+        log_op(empty_cell, 'build_similarity_graph', '_enrich_source_graph',
+               rows_affected=100, source='meditate.py')
+        rows = empty_cell.execute("SELECT * FROM _ops").fetchall()
+        assert len(rows) == 1
+        row = dict(rows[0])
+        assert row['operation'] == 'build_similarity_graph'
+        assert row['target'] == '_enrich_source_graph'
+        assert row['rows_affected'] == 100
+        assert row['source'] == 'meditate.py'
+        assert row['timestamp'] is not None
+
+    def test_log_op_with_params(self, empty_cell):
+        import json
+        from flexsearch.core import log_op
+        log_op(empty_cell, 'build_similarity_graph', '_enrich_source_graph',
+               params={'threshold': 0.55, 'where': 'chunks>=20'},
+               rows_affected=1037, source='rebuild_all.py')
+        row = dict(empty_cell.execute("SELECT * FROM _ops").fetchone())
+        params = json.loads(row['params'])
+        assert params['threshold'] == 0.55
+        assert params['where'] == 'chunks>=20'
+
+    def test_log_op_with_sql(self, empty_cell):
+        from flexsearch.core import log_op
+        log_op(empty_cell, 'run_sandbox', '_enrich_*',
+               sql='result["test"] = 42', source='meditate.py')
+        row = dict(empty_cell.execute("SELECT * FROM _ops").fetchone())
+        assert row['sql'] == 'result["test"] = 42'
+
+    def test_log_op_params_none(self, empty_cell):
+        from flexsearch.core import log_op
+        log_op(empty_cell, 'install_views', '_views', source='views.py')
+        row = dict(empty_cell.execute("SELECT * FROM _ops").fetchone())
+        assert row['params'] is None
+
+    def test_multiple_ops_ordered(self, empty_cell):
+        from flexsearch.core import log_op
+        log_op(empty_cell, 'op1', 'target1', source='a.py')
+        log_op(empty_cell, 'op2', 'target2', source='b.py')
+        log_op(empty_cell, 'op3', 'target3', source='c.py')
+        rows = empty_cell.execute(
+            "SELECT operation FROM _ops ORDER BY id"
+        ).fetchall()
+        assert [r[0] for r in rows] == ['op1', 'op2', 'op3']
+
+    def test_ops_queryable_by_operation(self, empty_cell):
+        from flexsearch.core import log_op
+        log_op(empty_cell, 'build_similarity_graph', '_enrich_source_graph',
+               params={'threshold': 0.5}, source='test')
+        log_op(empty_cell, 'build_similarity_graph', '_enrich_source_graph',
+               params={'threshold': 0.55}, source='test')
+        log_op(empty_cell, 'install_views', '_views', source='test')
+        rows = empty_cell.execute(
+            "SELECT json_extract(params, '$.threshold') as threshold "
+            "FROM _ops WHERE operation = 'build_similarity_graph' "
+            "ORDER BY id"
+        ).fetchall()
+        assert len(rows) == 2
+        assert rows[0][0] == 0.5
+        assert rows[1][0] == 0.55
+
+    def test_ops_stays_small(self, empty_cell):
+        """_ops logs mutations, not queries — stays at tens of entries."""
+        from flexsearch.core import log_op
+        # Simulate a typical meditate run
+        log_op(empty_cell, 'rebuild_warmup_types', '_types_source_warmup',
+               rows_affected=1196, source='rebuild_all.py')
+        log_op(empty_cell, 'build_similarity_graph', '_enrich_source_graph',
+               rows_affected=1037, source='rebuild_all.py')
+        log_op(empty_cell, 'persist_graph_scores', '_enrich_source_graph',
+               rows_affected=1037, source='meditate.py')
+        log_op(empty_cell, 'build_file_graph', '_enrich_file_graph',
+               rows_affected=2409, source='rebuild_all.py')
+        log_op(empty_cell, 'build_delegation_graph', '_enrich_delegation_graph',
+               rows_affected=1732, source='rebuild_all.py')
+        count = empty_cell.execute("SELECT COUNT(*) FROM _ops").fetchone()[0]
+        assert count == 5
+
+
 class TestValidateView:
     """_validate_view checks 1:1 invariant."""
 
