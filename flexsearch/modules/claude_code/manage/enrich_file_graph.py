@@ -14,7 +14,7 @@ from pathlib import Path
 FLEX_ROOT = Path(__file__).resolve().parent.parent.parent.parent.parent
 sys.path.insert(0, str(FLEX_ROOT))
 
-from flexsearch.core import open_cell
+from flexsearch.core import open_cell, log_op
 from flexsearch.views import regenerate_views
 from flexsearch.modules.claude_code.manage.file_graph import (
     CREATE_TABLE, build_file_graph, analyze_file_graph,
@@ -69,7 +69,12 @@ def main():
         )
 
     db.commit()
-    print(f"  Persisted {G.number_of_nodes()} rows")
+    row_count = G.number_of_nodes()
+    log_op(db, 'build_file_graph', '_enrich_file_graph',
+           params={'nodes': row_count, 'communities': len(communities),
+                   'hubs': len(hubs)},
+           rows_affected=row_count, source='enrich_file_graph.py')
+    print(f"  Persisted {row_count} rows")
 
     # Regenerate views
     print("\nRegenerating views...")

@@ -12,7 +12,7 @@ from pathlib import Path
 FLEX_ROOT = Path(__file__).resolve().parent.parent.parent.parent.parent
 sys.path.insert(0, str(FLEX_ROOT))
 
-from flexsearch.core import open_cell
+from flexsearch.core import open_cell, log_op
 from flexsearch.views import regenerate_views
 from flexsearch.manage.meditate import build_similarity_graph, compute_scores, persist
 from flexsearch.modules.claude_code.manage.noise import graph_filter_sql
@@ -59,6 +59,9 @@ def rebuild_warmup_types(db):
     warmup_count = db.execute(
         "SELECT COUNT(*) FROM _types_source_warmup WHERE is_warmup_only = 1"
     ).fetchone()[0]
+    log_op(db, 'rebuild_warmup_types', '_types_source_warmup',
+           params={'rule': '<50 tool ops AND no Write/Edit/Task/MultiEdit'},
+           rows_affected=warmup_count, source='rebuild_all.py')
     print(f'  {warmup_count} warmup sessions detected in {time.time()-t0:.1f}s\n')
     sys.stdout.flush()
 
@@ -102,6 +105,14 @@ def rebuild_source_graph(db):
 
     persist(db, scores, table='_enrich_source_graph', id_col='source_id')
     t3 = time.time()
+    log_op(db, 'build_similarity_graph', '_enrich_source_graph',
+           params={'threshold': GRAPH_THRESHOLD, 'where': where,
+                   'nodes': G.number_of_nodes() if G else 0, 'edges': edges,
+                   'communities': len(scores['communities']),
+                   'hubs': len(scores['hubs']),
+                   'bridges': len(scores['bridges'])},
+           rows_affected=G.number_of_nodes() if G else 0,
+           source='rebuild_all.py')
     print(f'Persisted in {t3-t2:.1f}s')
 
     new_cnt = db.execute('SELECT COUNT(*) FROM _enrich_source_graph').fetchone()[0]
@@ -145,8 +156,13 @@ def rebuild_file_graph(db):
              1 if node in hubs else 0, len(session_files.get(node, set())))
         )
     db.commit()
+    row_count = G.number_of_nodes()
+    log_op(db, 'build_file_graph', '_enrich_file_graph',
+           params={'nodes': row_count, 'edges': G.number_of_edges(),
+                   'communities': len(communities), 'hubs': len(hubs)},
+           rows_affected=row_count, source='rebuild_all.py')
     t1 = time.time()
-    print(f'Done in {t1-t0:.1f}s — {G.number_of_nodes()} rows\n')
+    print(f'Done in {t1-t0:.1f}s — {row_count} rows\n')
     sys.stdout.flush()
 
 
@@ -180,8 +196,12 @@ def rebuild_delegation_graph(db):
              m['delegation_depth'], m['parent_session'])
         )
     db.commit()
+    row_count = len(metrics)
+    log_op(db, 'build_delegation_graph', '_enrich_delegation_graph',
+           params={'sessions': row_count, 'orchestrators': orchestrators},
+           rows_affected=row_count, source='rebuild_all.py')
     t1 = time.time()
-    print(f'Done in {t1-t0:.1f}s — {len(metrics)} rows\n')
+    print(f'Done in {t1-t0:.1f}s — {row_count} rows\n')
     sys.stdout.flush()
 
 

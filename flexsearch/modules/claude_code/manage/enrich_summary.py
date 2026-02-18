@@ -24,7 +24,7 @@ import numpy as np
 FLEX_ROOT = Path(__file__).resolve().parent.parent.parent.parent.parent
 sys.path.insert(0, str(FLEX_ROOT))
 
-from flexsearch.core import open_cell
+from flexsearch.core import open_cell, log_op
 from flexsearch.views import regenerate_views
 
 # Module imports — all claude-code-specific config lives here
@@ -306,6 +306,10 @@ def main():
         processed += 1
 
     db.commit()
+    log_op(db, 'build_session_summary', '_enrich_session_summary',
+           params={'processed': processed, 'hdbscan': hdbscan_count,
+                   'short': short_count, 'skipped': skipped},
+           rows_affected=processed, source='enrich_summary.py')
     print(f"\n  Processed: {processed} ({hdbscan_count} HDBSCAN, {short_count} short)")
     print(f"  Skipped (no chunks): {skipped}")
 

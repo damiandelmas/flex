@@ -341,6 +341,7 @@ def install_views(db: sqlite3.Connection, view_dir: Path):
         created_at INTEGER
     )""")
 
+    installed = []
     for sql_file in sorted(view_dir.glob('*.sql')):
         name, desc, sql = parse_view_file(sql_file)
         db.execute(f"DROP VIEW IF EXISTS [{name}]")
@@ -350,8 +351,15 @@ def install_views(db: sqlite3.Connection, view_dir: Path):
             "VALUES (?, ?, ?, ?)",
             (name, sql, desc, int(time.time()))
         )
+        installed.append(name)
 
     db.commit()
+
+    if installed:
+        from flexsearch.core import log_op
+        log_op(db, 'install_views', '_views',
+               params={'views': installed, 'source_dir': str(view_dir)},
+               rows_affected=len(installed), source='views.py')
 
 
 def _validate_view(db: sqlite3.Connection, view_name: str,

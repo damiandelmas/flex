@@ -13,7 +13,7 @@ from pathlib import Path
 FLEX_ROOT = Path(__file__).resolve().parent.parent.parent.parent.parent
 sys.path.insert(0, str(FLEX_ROOT))
 
-from flexsearch.core import open_cell
+from flexsearch.core import open_cell, log_op
 from flexsearch.views import regenerate_views
 from flexsearch.modules.claude_code.manage.delegation_graph import (
     CREATE_TABLE, build_delegation_graph, compute_delegation_metrics,
@@ -70,7 +70,11 @@ def main():
         )
 
     db.commit()
-    print(f"  Persisted {len(metrics)} rows")
+    row_count = len(metrics)
+    log_op(db, 'build_delegation_graph', '_enrich_delegation_graph',
+           params={'sessions': row_count, 'orchestrators': orchestrators},
+           rows_affected=row_count, source='enrich_delegation.py')
+    print(f"  Persisted {row_count} rows")
 
     # Regenerate views
     print("\nRegenerating views...")

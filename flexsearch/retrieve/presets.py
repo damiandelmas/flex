@@ -190,6 +190,7 @@ def install_presets(db: sqlite3.Connection, preset_dir: Path):
     if not preset_dir.exists():
         return
 
+    installed = []
     for f in sorted(preset_dir.glob('*.sql')):
         text = f.read_text()
         # Extract name, description, and params from annotations
@@ -198,4 +199,11 @@ def install_presets(db: sqlite3.Connection, preset_dir: Path):
             "INSERT OR REPLACE INTO _presets (name, description, params, sql) VALUES (?, ?, ?, ?)",
             (parsed['name'], parsed['description'], parsed.get('params', ''), text)
         )
+        installed.append(parsed['name'])
     db.commit()
+
+    if installed:
+        from flexsearch.core import log_op
+        log_op(db, 'install_presets', '_presets',
+               params={'presets': installed, 'source_dir': str(preset_dir)},
+               rows_affected=len(installed), source='presets.py')

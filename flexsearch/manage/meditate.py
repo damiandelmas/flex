@@ -230,6 +230,11 @@ def persist(db: sqlite3.Connection, scores: dict,
     db.commit()
     print(f"Persisted {len(all_ids)} graph scores to {table}")
 
+    # Log mutation
+    from flexsearch.core import log_op
+    log_op(db, 'persist_graph_scores', table,
+           rows_affected=len(all_ids), source='meditate.py')
+
     # Regenerate views to pick up new/changed enrichment
     from flexsearch.core import regenerate_views
     regenerate_views(db)
@@ -280,10 +285,20 @@ def run_sandbox(db: sqlite3.Connection, G, script: str) -> dict:
     try:
         exec(compile(script, '<meditate>', 'exec'), safe_globals)
         result = safe_globals.get('result', {})
-        return json.loads(json.dumps(
+        parsed = json.loads(json.dumps(
             result,
             default=lambda x: int(x) if hasattr(x, 'item') else str(x)
         ))
+
+        # Log sandbox execution
+        from flexsearch.core import log_op
+        log_op(db, 'run_sandbox', '_enrich_*',
+               params={'script_len': len(script),
+                       'result_keys': list(parsed.keys()) if isinstance(parsed, dict) else None},
+               sql=script[:500] if script else None,
+               source='meditate.py')
+
+        return parsed
     except (SyntaxError, NameError, TypeError, ValueError, KeyError,
             AttributeError, IndexError, ZeroDivisionError, RuntimeError,
             ArithmeticError, LookupError, StopIteration, ImportError) as e:
