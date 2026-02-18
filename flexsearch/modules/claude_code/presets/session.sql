@@ -9,5 +9,5 @@ SELECT
     datetime(timestamp, 'unixepoch', 'localtime') as ts
 FROM messages
 WHERE source_id LIKE '%' || :session || '%'
-ORDER BY position
+ORDER BY message_number
 LIMIT :limit

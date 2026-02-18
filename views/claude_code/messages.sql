@@ -9,7 +9,7 @@ SELECT
     r.content,
     r.timestamp,
     s.source_id,
-    s.position,
+    s.position AS message_number,
     src.project,
     src.title,
     src.message_count,

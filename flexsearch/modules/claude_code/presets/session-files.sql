@@ -6,8 +6,8 @@ SELECT
     target_file,
     tool_name,
     COUNT(*) as ops,
-    MIN(position) as first_touch,
-    MAX(position) as last_touch
+    MIN(message_number) as first_touch,
+    MAX(message_number) as last_touch
 FROM messages
 WHERE source_id LIKE '%' || :session || '%'
   AND target_file IS NOT NULL
