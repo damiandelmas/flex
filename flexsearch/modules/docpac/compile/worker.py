@@ -8,7 +8,7 @@ Pipeline per file:
   resolve_cell_for_path → parse_docpac_file → frontmatter → normalize →
   split_sections → embed → upsert (delete old + re-insert) → mean-pool source
 
-No graph rebuild — that stays expensive and explicit.
+Auto graph refresh when staleness threshold (20 sources) exceeded.
 """
 
 import hashlib
@@ -20,10 +20,12 @@ import numpy as np
 from pathlib import Path
 
 from flexsearch.registry import resolve_cell_for_path, FLEX_HOME
+from flexsearch.core import log_op
 from flexsearch.modules.docpac.compile.docpac import parse_docpac_file
 from flexsearch.compile.markdown import normalize_headers, extract_frontmatter, split_sections
 
 QUEUE_DB = FLEX_HOME / "queue.db"
+GRAPH_REFRESH_THRESHOLD = 20
 
 
 def make_source_id(path: str) -> str:
@@ -169,7 +171,68 @@ def index_file(conn: sqlite3.Connection, file_path: str, embed_fn) -> bool:
             "UPDATE _raw_sources SET embedding = ? WHERE source_id = ?",
             (mean_vec.tobytes(), source_id))
 
+    # --- Log to _ops ---
+    log_op(conn, 'docpac_incremental_index', '_raw_chunks',
+           params={'file': str(p.name), 'sections': len(sections)},
+           rows_affected=len(sections),
+           source='docpac/compile/worker.py')
+
     return True
+
+
+def _graph_stale(conn) -> bool:
+    """True if enough new sources indexed since last graph build."""
+    try:
+        last_graph = conn.execute("""
+            SELECT MAX(timestamp) FROM _ops
+            WHERE operation = 'build_similarity_graph'
+        """).fetchone()[0]
+    except sqlite3.OperationalError:
+        return False  # no _ops table yet
+
+    if last_graph is None:
+        return True  # never built
+
+    try:
+        new_sources = conn.execute("""
+            SELECT COUNT(*) FROM _ops
+            WHERE operation = 'docpac_incremental_index'
+              AND timestamp > ?
+        """, (last_graph,)).fetchone()[0]
+    except sqlite3.OperationalError:
+        return False
+
+    return new_sources >= GRAPH_REFRESH_THRESHOLD
+
+
+def _refresh_graph(conn, cell_name: str):
+    """Rebuild similarity graph on a docpac cell."""
+    from flexsearch.manage.meditate import build_similarity_graph, compute_scores, persist
+    from flexsearch.views import regenerate_views
+
+    print(f"[docpac] graph refresh on {cell_name}...", file=sys.stderr)
+    t0 = time.time()
+
+    G, edge_count = build_similarity_graph(
+        conn, table='_raw_sources', id_col='source_id',
+        threshold=0.55, center=True)
+
+    if G is not None and G.number_of_nodes() > 0:
+        scores = compute_scores(G)
+        persist(conn, scores, table='_enrich_source_graph', id_col='source_id')
+        log_op(conn, 'build_similarity_graph', '_enrich_source_graph',
+               params={'threshold': 0.55, 'center': True,
+                       'nodes': G.number_of_nodes(), 'edges': edge_count,
+                       'communities': len(set(scores.get('communities', {}).values())),
+                       'hubs': len(scores.get('hubs', [])),
+                       'trigger': 'auto_refresh'},
+               rows_affected=G.number_of_nodes(),
+               source='docpac/compile/worker.py')
+        regenerate_views(conn)
+        conn.commit()
+        elapsed = time.time() - t0
+        print(f"[docpac] graph refresh done: {G.number_of_nodes()} nodes, "
+              f"{edge_count} edges, {elapsed:.1f}s", file=sys.stderr)
 
 
 def process_queue(embed_fn) -> dict:
@@ -215,10 +278,12 @@ def process_queue(embed_fn) -> dict:
         conn.execute("PRAGMA journal_mode=WAL")
         conn.execute("PRAGMA busy_timeout=30000")
 
+        cell_indexed = 0
         for file_path in data['files']:
             try:
                 if index_file(conn, file_path, embed_fn):
                     stats['indexed'] += 1
+                    cell_indexed += 1
                 else:
                     stats['skipped'] += 1
             except Exception as e:
@@ -228,6 +293,23 @@ def process_queue(embed_fn) -> dict:
             processed_paths.append(file_path)
 
         conn.commit()
+
+        # Batch summary log per cell
+        if cell_indexed > 0:
+            log_op(conn, 'docpac_queue_drain', 'pending',
+                   params={'cell': cell_name, 'files': cell_indexed},
+                   rows_affected=cell_indexed,
+                   source='docpac/compile/worker.py')
+            conn.commit()
+
+        # Auto graph refresh if stale
+        if cell_indexed > 0 and _graph_stale(conn):
+            try:
+                _refresh_graph(conn, cell_name)
+            except Exception as e:
+                print(f"[docpac] graph refresh error on {cell_name}: {e}",
+                      file=sys.stderr)
+
         conn.close()
         stats['processed'] += len(data['files'])
 
