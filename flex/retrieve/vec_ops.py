@@ -179,7 +179,7 @@ class VectorCache:
 
         self.loaded_at = time.time()
         elapsed = (self.loaded_at - start) * 1000
-        print(f"VectorCache: {len(self.ids)} vectors ({self.dims}d) in {elapsed:.1f}ms")
+        self._load_msg = f"VectorCache: {len(self.ids)} vectors ({self.dims}d) in {elapsed:.1f}ms"
 
         return self
 
