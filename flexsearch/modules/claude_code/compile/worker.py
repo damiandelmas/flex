@@ -547,6 +547,9 @@ def daemon_loop(interval=2):
 
     print("  Docpac: incremental indexing enabled", file=sys.stderr)
 
+    BACKFILL_INTERVAL = 24 * 3600  # 24 hours
+    last_backfill = time.time()
+
     while True:
         try:
             stats = process_queue(conn)
@@ -564,6 +567,15 @@ def daemon_loop(interval=2):
                       file=sys.stderr)
         except Exception as e:
             print(f"[docpac] Error: {e}", file=sys.stderr)
+
+        # Periodic backfill — catch anything hooks missed (24h cycle)
+        if time.time() - last_backfill > BACKFILL_INTERVAL:
+            try:
+                print("[worker] Periodic backfill (24h cycle)...", file=sys.stderr)
+                startup_backfill(conn)
+                last_backfill = time.time()
+            except Exception as e:
+                print(f"[worker] Backfill error: {e}", file=sys.stderr)
 
         # Queue depth check
         try:
