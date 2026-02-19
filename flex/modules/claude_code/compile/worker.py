@@ -171,9 +171,9 @@ def insert_chunk_atom(conn: sqlite3.Connection, chunk: dict):
 
     # _types_message
     cur.execute("""
-        INSERT OR IGNORE INTO _types_message (chunk_id, type, role, chunk_number)
-        VALUES (?, ?, ?, ?)
-    """, (chunk_id, chunk['type'], chunk['role'], chunk['chunk_number']))
+        INSERT OR IGNORE INTO _types_message (chunk_id, type, role, chunk_number, parent_uuid)
+        VALUES (?, ?, ?, ?, ?)
+    """, (chunk_id, chunk['type'], chunk['role'], chunk['chunk_number'], chunk.get('parent_uuid')))
 
     # _edges_tool_ops (only for tool calls)
     if chunk.get('tool_name'):
