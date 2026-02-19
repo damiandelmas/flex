@@ -224,6 +224,7 @@ def execute_preset(db: sqlite3.Connection, query: str) -> str:
     if preset_name in ('help', 'info', 'about', 'introspect', 'orientation'):
         preset_name = 'orient'
     params = {}
+    positional = []
     for p in parts[1:]:
         if '=' in p:
             k, v = p.split('=', 1)
@@ -231,12 +232,28 @@ def execute_preset(db: sqlite3.Connection, query: str) -> str:
                 params[k] = int(v)
             except ValueError:
                 params[k] = v
+        else:
+            positional.append(p)
 
     loader = PresetLoader(db)
     if preset_name not in loader.list_presets():
         available = loader.list_presets()
         return json.dumps({"error": f"Preset not found: {preset_name}",
                             "available": available})
+
+    # Bind positional args to required params (in declaration order)
+    if positional:
+        preset = loader.load(preset_name)
+        param_str = preset.get('params', '')
+        if param_str:
+            declared = [p.strip().split()[0] for p in param_str.split(',')]
+            for name, value in zip(declared, positional):
+                if name not in params:
+                    try:
+                        params[name] = int(value)
+                    except ValueError:
+                        params[name] = value
+
     results = loader.execute(db, preset_name, params)
     return json.dumps(results, indent=2, default=str)
 
