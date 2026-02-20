@@ -517,6 +517,14 @@ async def handle_list_tools() -> list[types.Tool]:
 
 _QUERY_TIMEOUT_S = 30  # max seconds per query before cancellation
 
+# Response gate — prevent large results from eating context window
+_CHARS_PER_TOKEN = 3.5
+_GATE_TOKEN_LIMIT = 10_000  # gate results over ~10K tokens
+_GATE_CHAR_LIMIT = int(_GATE_TOKEN_LIMIT * _CHARS_PER_TOKEN)
+_PREVIEW_ROWS = 10  # max rows in preview (actual count limited by char budget)
+_PREVIEW_FIELD_LIMIT = 200  # max chars per string field in preview
+_PREVIEW_CHAR_BUDGET = 2000  # max total chars for preview (~500 tokens)
+
 
 def _execute_cell_query(cell: str, query: str) -> str:
     """Synchronous cell query — runs in executor to avoid blocking event loop."""
@@ -556,6 +564,79 @@ def _execute_cell_query(cell: str, query: str) -> str:
             return error_msg
 
 
+def _token_header(result_json: str) -> tuple[int, int, str]:
+    """Parse result and build token estimate header.
+
+    Returns (row_count, est_tokens, header_line).
+    """
+    n_chars = len(result_json)
+    est_tokens = int(n_chars / _CHARS_PER_TOKEN)
+
+    try:
+        parsed = json.loads(result_json)
+    except (json.JSONDecodeError, ValueError):
+        parsed = None
+
+    if isinstance(parsed, list):
+        row_count = len(parsed)
+    else:
+        row_count = 0
+
+    if est_tokens >= 1000:
+        tok_str = f"~{est_tokens / 1000:.1f}K tok"
+    else:
+        tok_str = f"~{est_tokens} tok"
+
+    header = f"[{row_count} rows, {tok_str}]"
+    return row_count, est_tokens, header
+
+
+def _truncate_row(row: dict) -> dict:
+    """Truncate string fields in a row for preview."""
+    out = {}
+    for k, v in row.items():
+        if isinstance(v, str) and len(v) > _PREVIEW_FIELD_LIMIT:
+            out[k] = v[:_PREVIEW_FIELD_LIMIT] + '...'
+        else:
+            out[k] = v
+    return out
+
+
+def _gate_response(result_json: str, header: str, row_count: int, est_tokens: int) -> str:
+    """Build gated preview response for large results.
+
+    Truncates string fields per row and caps total preview size.
+    Shows as many rows as fit within the char budget.
+    """
+    try:
+        parsed = json.loads(result_json)
+    except (json.JSONDecodeError, ValueError):
+        return result_json
+
+    if not isinstance(parsed, list) or row_count == 0:
+        return result_json
+
+    # Build preview: truncate fields, accumulate rows up to char budget
+    preview_rows = []
+    total_chars = 0
+    for row in parsed[:_PREVIEW_ROWS]:
+        truncated = _truncate_row(row)
+        row_json = json.dumps(truncated, indent=2, default=str)
+        if total_chars + len(row_json) > _PREVIEW_CHAR_BUDGET and preview_rows:
+            break  # budget exceeded, but always show at least 1 row
+        preview_rows.append(truncated)
+        total_chars += len(row_json)
+
+    preview = json.dumps(preview_rows, indent=2, default=str)
+    shown = len(preview_rows)
+    return (
+        f"[{row_count} rows, ~{est_tokens / 1000:.1f}K tok — gated]\n"
+        f"Preview ({shown} of {row_count} rows, fields truncated to {_PREVIEW_FIELD_LIMIT} chars):\n"
+        f"{preview}\n\n"
+        f"Add LIMIT to your query, or prefix with ! to bypass the gate."
+    )
+
+
 @server.call_tool()
 async def handle_call_tool(
     name: str, arguments: dict | None
@@ -570,9 +651,26 @@ async def handle_call_tool(
     query = arguments["query"]
     cell = arguments.get("cell", "claude_code")
 
+    # ! prefix = force bypass gate
+    force = False
+    if query.startswith('!'):
+        force = True
+        query = query[1:].lstrip()
+
+    # Presets are exempt from gate (multi-query results, expected to be large)
+    is_preset = query.lstrip().startswith('@')
+
     loop = asyncio.get_running_loop()
     result = await loop.run_in_executor(None, _execute_cell_query, cell, query)
-    return [types.TextContent(type="text", text=result)]
+
+    # Token estimate header + gate
+    row_count, est_tokens, header = _token_header(result)
+
+    if not force and not is_preset and est_tokens > _GATE_TOKEN_LIMIT:
+        gated = _gate_response(result, header, row_count, est_tokens)
+        return [types.TextContent(type="text", text=gated)]
+
+    return [types.TextContent(type="text", text=f"{header}\n{result}")]
 
 
 # ============================================================
