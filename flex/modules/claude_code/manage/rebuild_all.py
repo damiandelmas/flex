@@ -275,6 +275,38 @@ def rebuild_delegation_graph(db):
     sys.stdout.flush()
 
 
+def rebuild_fingerprints(db):
+    """Rebuild session fingerprints (incremental — only missing sessions)."""
+    from flex.modules.claude_code.manage.enrich_summary import run as run_fingerprints
+
+    print("=" * 60)
+    print("Step 3.5: Session Fingerprints (incremental, zero ONNX)")
+    print("=" * 60)
+    sys.stdout.flush()
+
+    t0 = time.time()
+    processed = run_fingerprints(db)
+    elapsed = time.time() - t0
+    print(f'  {processed} sessions fingerprinted in {elapsed:.1f}s\n')
+    sys.stdout.flush()
+
+
+def rebuild_repo_project(db):
+    """Rebuild repo project attribution (incremental — NULL project only)."""
+    from flex.modules.claude_code.manage.enrich_repo_project import run as run_repo_project
+
+    print("=" * 60)
+    print("Step 4: Repo Project Attribution (SOMA-first)")
+    print("=" * 60)
+    sys.stdout.flush()
+
+    t0 = time.time()
+    updated = run_repo_project(db)
+    elapsed = time.time() - t0
+    print(f'  {updated} sources attributed in {elapsed:.1f}s\n')
+    sys.stdout.flush()
+
+
 def main():
     t_total = time.time()
     db = open_cell(str(CLAUDE_CODE_DB))
@@ -286,6 +318,8 @@ def main():
     rebuild_source_graph(db)
     rebuild_file_graph(db)
     rebuild_delegation_graph(db)
+    rebuild_fingerprints(db)
+    rebuild_repo_project(db)
 
     print("Regenerating views...")
     regenerate_views(db, views={'messages': 'chunk', 'sessions': 'source'})

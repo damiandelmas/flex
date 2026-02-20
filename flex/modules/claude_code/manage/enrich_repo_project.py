@@ -320,7 +320,55 @@ def backfill_from_delegations(db) -> int:
 
 
 # ─────────────────────────────────────────────────────────────────────────────
-# Entry point
+# Incremental — worker-callable
+# ─────────────────────────────────────────────────────────────────────────────
+
+def run(db):
+    """Incremental repo project enrichment — only sources with NULL project.
+
+    Called by the worker's 30min enrichment cycle. Returns count of updated sources.
+    """
+    tables = {r[0] for r in db.execute(
+        "SELECT name FROM sqlite_master WHERE type='table'"
+    ).fetchall()}
+
+    if '_edges_repo_identity' not in tables:
+        return 0
+
+    # Check if there's anything to do
+    null_count = db.execute(
+        "SELECT COUNT(*) FROM _raw_sources WHERE project IS NULL"
+    ).fetchone()[0]
+    if null_count == 0:
+        return 0
+
+    # Build SOMA lookup table
+    repo_map = build_repo_map(db)
+    if not repo_map:
+        return 0
+
+    persist_lookup(db, repo_map)
+    db.commit()
+
+    soma_map = {info['repo_path']: info['project'] for info in repo_map.values()}
+
+    total = 0
+    total += backfill_from_soma_hash(db)
+    db.commit()
+    total += backfill_from_primary_cwd(db, soma_map)
+    db.commit()
+    total += backfill_from_target_files(db, soma_map)
+    db.commit()
+    total += upgrade_from_git_root(db)
+    db.commit()
+    total += backfill_from_delegations(db)
+    db.commit()
+
+    return total
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Full entry point — manual use
 # ─────────────────────────────────────────────────────────────────────────────
 
 def main():

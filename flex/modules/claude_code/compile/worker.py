@@ -40,6 +40,26 @@ except ImportError:
     soma_ensure_tables = None
     soma_heal = None
 
+# Enrichment modules — optional, graceful degradation when absent
+try:
+    from flex.modules.claude_code.manage.enrich_summary import run as run_fingerprints
+except ImportError:
+    run_fingerprints = None
+
+try:
+    from flex.modules.claude_code.manage.enrich_repo_project import run as run_repo_project
+except ImportError:
+    run_repo_project = None
+
+try:
+    from flex.modules.claude_code.manage.rebuild_all import (
+        rebuild_source_graph, rebuild_warmup_types, reembed_sources,
+    )
+except ImportError:
+    rebuild_source_graph = None
+    rebuild_warmup_types = None
+    reembed_sources = None
+
 QUEUE_DB = FLEX_HOME / "queue.db"
 CLAUDE_PROJECTS = Path.home() / ".claude/projects"
 
@@ -730,6 +750,70 @@ def startup_backfill(conn: sqlite3.Connection):
         print("[worker] No backfill needed", file=sys.stderr)
 
 
+def _cc_graph_stale(conn, threshold=50):
+    """True if enough new sessions synced since last graph build."""
+    try:
+        last_graph = conn.execute("""
+            SELECT MAX(timestamp) FROM _ops
+            WHERE operation = 'build_similarity_graph'
+        """).fetchone()[0]
+    except sqlite3.OperationalError:
+        return False  # no _ops table yet
+
+    if last_graph is None:
+        return True  # never built
+
+    try:
+        new_sessions = conn.execute("""
+            SELECT COUNT(DISTINCT source_id) FROM _raw_sources
+            WHERE end_time > ?
+        """, (last_graph,)).fetchone()[0]
+    except sqlite3.OperationalError:
+        return False
+
+    return new_sessions >= threshold
+
+
+def _run_enrichment_cycle(conn, graph_threshold=50):
+    """Run the enrichment cycle: graph (if stale), fingerprints, repo_project."""
+    t0 = time.time()
+
+    # 1. Graph rebuild if stale
+    if rebuild_source_graph and _cc_graph_stale(conn, graph_threshold):
+        print("[enrich] Graph stale — rebuilding...", file=sys.stderr)
+        try:
+            if rebuild_warmup_types:
+                rebuild_warmup_types(conn)
+            if reembed_sources:
+                reembed_sources(conn)
+            rebuild_source_graph(conn)
+            print(f"[enrich] Graph rebuilt in {time.time()-t0:.1f}s", file=sys.stderr)
+        except Exception as e:
+            print(f"[enrich] Graph error: {e}", file=sys.stderr)
+
+    # 2. Incremental fingerprints
+    if run_fingerprints:
+        try:
+            n = run_fingerprints(conn)
+            if n > 0:
+                print(f"[enrich] {n} sessions fingerprinted", file=sys.stderr)
+        except Exception as e:
+            print(f"[enrich] Fingerprint error: {e}", file=sys.stderr)
+
+    # 3. Incremental repo_project
+    if run_repo_project:
+        try:
+            n = run_repo_project(conn)
+            if n > 0:
+                print(f"[enrich] {n} sources attributed", file=sys.stderr)
+        except Exception as e:
+            print(f"[enrich] Repo project error: {e}", file=sys.stderr)
+
+    elapsed = time.time() - t0
+    if elapsed > 1.0:
+        print(f"[enrich] Cycle done in {elapsed:.1f}s", file=sys.stderr)
+
+
 def daemon_loop(interval=2):
     """Main daemon loop."""
     # Resolve cell
@@ -764,8 +848,12 @@ def daemon_loop(interval=2):
 
     print("  Docpac: incremental indexing enabled", file=sys.stderr)
 
-    BACKFILL_INTERVAL = 24 * 3600  # 24 hours
+    BACKFILL_INTERVAL = 24 * 3600   # 24 hours — expensive JSONL scan
+    ENRICHMENT_INTERVAL = 30 * 60   # 30 minutes — graph, fingerprints, repo_project
+    GRAPH_STALENESS_THRESHOLD = 50  # sessions since last graph build
+
     last_backfill = time.time()
+    last_enrichment = 0  # run enrichment immediately after first startup
 
     while True:
         try:
@@ -795,6 +883,15 @@ def daemon_loop(interval=2):
                 last_backfill = time.time()
             except Exception as e:
                 print(f"[worker] Backfill error: {e}", file=sys.stderr)
+
+        # Enrichment cycle — graph, fingerprints, repo_project (30min)
+        if time.time() - last_enrichment > ENRICHMENT_INTERVAL:
+            try:
+                _run_enrichment_cycle(conn, GRAPH_STALENESS_THRESHOLD)
+                last_enrichment = time.time()
+            except Exception as e:
+                print(f"[worker] Enrichment error: {e}", file=sys.stderr)
+                last_enrichment = time.time()  # don't retry immediately
 
         # Queue depth check
         try:

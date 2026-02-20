@@ -170,40 +170,40 @@ class TestFormatToolLine:
 
     def test_read(self):
         ch = _chunk(tool_name='Read', target_file='/home/user/project/file.py')
-        assert format_tool_line(ch) == 'tool(Read) `file.py`'
+        assert format_tool_line(ch) == 'op:Read `file.py`'
 
     def test_write(self):
         ch = _chunk(tool_name='Write', target_file='/home/user/project/out.md')
-        assert format_tool_line(ch) == 'tool(Write) `out.md`'
+        assert format_tool_line(ch) == 'op:Write `out.md`'
 
     def test_edit(self):
         ch = _chunk(tool_name='Edit', target_file='/foo/bar.py')
-        assert format_tool_line(ch) == 'tool(Edit) `bar.py`'
+        assert format_tool_line(ch) == 'op:Edit `bar.py`'
 
     def test_bash_with_command(self):
         ch = _chunk(content='pytest tests/test_vec_ops.py -v', tool_name='Bash')
         result = format_tool_line(ch)
-        assert result.startswith('tool(Bash) `')
+        assert result.startswith('op:Bash `')
         assert 'pytest' in result
 
     def test_bash_empty(self):
         ch = _chunk(content='', tool_name='Bash')
-        assert format_tool_line(ch) == 'tool(Bash)'
+        assert format_tool_line(ch) == 'op:Bash'
 
     def test_task_with_desc(self):
         ch = _chunk(content='Read soma architecture and codebase', tool_name='Task')
         result = format_tool_line(ch)
-        assert result.startswith('tool(Task) "')
+        assert result.startswith('op:Task "')
         assert 'soma' in result
 
     def test_websearch(self):
         ch = _chunk(content='flexmem npm availability', tool_name='WebSearch')
-        assert format_tool_line(ch) == 'tool(WebSearch) `flexmem npm availability`'
+        assert format_tool_line(ch) == 'op:WebSearch `flexmem npm availability`'
 
     def test_mcp_tool(self):
         ch = _chunk(tool_name='mcp__flexsearch__flex')
         result = format_tool_line(ch)
-        assert result == 'tool(flex)'
+        assert result == 'op:flex'
 
     def test_skip_tools(self):
         for tool in SKIP_TOOLS:
@@ -260,7 +260,7 @@ class TestBuildShortFingerprint:
         lines = result.split('\n')
         assert len(lines) == 1
         assert '[8]' in lines[0]
-        assert '3x tool(Read)' in lines[0]
+        assert '3x op:Read' in lines[0]
         assert lines[0].startswith('>')
 
 
@@ -274,10 +274,10 @@ class TestCollapseToolLines:
         assert _collapse_tool_lines([]) == []
 
     def test_single_keeps_detail(self):
-        tools = [{'message_number': 8, 'tool_name': 'Read', 'content': 'tool(Read) `file.py`'}]
+        tools = [{'message_number': 8, 'tool_name': 'Read', 'content': 'op:Read `file.py`'}]
         result = _collapse_tool_lines(tools)
         assert len(result) == 1
-        assert result[0]['line'] == '> [8] tool(Read) `file.py`'
+        assert result[0]['line'] == '> [8] op:Read `file.py`'
 
     def test_same_msg_collapses(self):
         tools = [
@@ -288,7 +288,7 @@ class TestCollapseToolLines:
         ]
         result = _collapse_tool_lines(tools)
         assert len(result) == 1
-        assert '4x tool(Read)' in result[0]['line']
+        assert '4x op:Read' in result[0]['line']
         assert '[8]' in result[0]['line']
 
     def test_mixed_tools_same_msg(self):
@@ -299,8 +299,8 @@ class TestCollapseToolLines:
         ]
         result = _collapse_tool_lines(tools)
         assert len(result) == 1
-        assert '2x tool(Read)' in result[0]['line']
-        assert '1x tool(Write)' in result[0]['line']
+        assert '2x op:Read' in result[0]['line']
+        assert '1x op:Write' in result[0]['line']
 
     def test_consecutive_merge_no_fence(self):
         """Consecutive tool groups with no content between them merge into one run."""
@@ -313,8 +313,8 @@ class TestCollapseToolLines:
         result = _collapse_tool_lines(tools)
         assert len(result) == 1
         assert '[2-8]' in result[0]['line']
-        assert '3x tool(Read)' in result[0]['line']
-        assert '1x tool(Bash)' in result[0]['line']
+        assert '3x op:Read' in result[0]['line']
+        assert '1x op:Bash' in result[0]['line']
 
     def test_fence_breaks_run(self):
         """Content rep between tool groups splits them into separate runs."""
@@ -328,7 +328,7 @@ class TestCollapseToolLines:
         result = _collapse_tool_lines(tools, content_positions={5})
         assert len(result) == 2
         assert '[2-4]' in result[0]['line']
-        assert '2x tool(Read)' in result[0]['line']
+        assert '2x op:Read' in result[0]['line']
         assert '[8-10]' in result[1]['line']
 
     def test_fence_at_exact_boundary_no_split(self):

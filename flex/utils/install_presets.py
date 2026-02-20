@@ -78,6 +78,9 @@ def install_cell(cell_name: str, preset_dirs: list[Path] = None):
         except sqlite3.OperationalError:
             pass
 
+        # Wipe existing presets — ensures orphans from cell_type changes are removed
+        conn.execute("DELETE FROM _presets")
+
         for pd in preset_dirs:
             if pd.exists():
                 install_presets(conn, pd)

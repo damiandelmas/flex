@@ -42,7 +42,102 @@ COMMIT_INTERVAL = 100
 
 
 # ---------------------------------------------------------------------------
-# Main — single query, zero ONNX
+# Incremental — worker-callable, processes only missing sessions
+# ---------------------------------------------------------------------------
+
+def run(db):
+    """Incremental fingerprinting — only sessions missing from _enrich_session_summary.
+
+    Called by the worker's 30min enrichment cycle. Returns count of new fingerprints.
+    """
+    db.execute(CREATE_TABLE)
+
+    # Find eligible sessions not yet fingerprinted
+    eligible = db.execute(session_filter_sql()).fetchall()
+    eligible_ids = [r[0] for r in eligible]
+
+    existing = {r[0] for r in db.execute(
+        "SELECT source_id FROM _enrich_session_summary"
+    ).fetchall()}
+
+    missing_ids = [sid for sid in eligible_ids if sid not in existing]
+    if not missing_ids:
+        return 0
+
+    # Bulk load chunks for missing sessions only
+    db.execute("CREATE TEMP TABLE _fp_incr (source_id TEXT PRIMARY KEY)")
+    db.executemany("INSERT INTO _fp_incr VALUES (?)",
+                   [(sid,) for sid in missing_ids])
+
+    rows = db.execute("""
+        SELECT e.source_id, c.id, c.embedding, c.content,
+               e.position as message_number,
+               t.tool_name, t.target_file
+        FROM _fp_incr el
+        JOIN _edges_source e ON el.source_id = e.source_id
+        JOIN _raw_chunks c ON e.chunk_id = c.id
+        LEFT JOIN _edges_tool_ops t ON c.id = t.chunk_id
+        WHERE c.embedding IS NOT NULL
+        ORDER BY e.source_id, e.position
+    """).fetchall()
+
+    db.execute("DROP TABLE IF EXISTS _fp_incr")
+
+    # Group by source_id (use index-based access — caller may not have row_factory)
+    session_chunks = {}
+    for r in rows:
+        sid = r[0]  # source_id
+        if sid not in session_chunks:
+            session_chunks[sid] = []
+        session_chunks[sid].append({
+            'id': r[1],
+            'embedding': np.frombuffer(r[2], dtype=np.float32),
+            'content': r[3] or '',
+            'tool_name': r[5],
+            'target_file': r[6],
+            'message_number': r[4] or 0,
+        })
+
+    del rows
+
+    processed = 0
+    hdbscan_count = 0
+    short_count = 0
+
+    for sid, chunks in session_chunks.items():
+        n_content = sum(1 for ch in chunks
+                        if _is_content_chunk(ch) and ch.get('content', '').strip()
+                        and ch.get('embedding') is not None)
+
+        if n_content >= HDBSCAN_MIN_CHUNKS:
+            fingerprint = build_fingerprint(chunks)
+            hdbscan_count += 1
+        else:
+            fingerprint = build_short_fingerprint(chunks)
+            short_count += 1
+
+        db.execute("""
+            INSERT OR REPLACE INTO _enrich_session_summary
+            (source_id, fingerprint_index) VALUES (?, ?)
+        """, (sid, fingerprint))
+        processed += 1
+
+        if processed % COMMIT_INTERVAL == 0:
+            db.commit()
+
+    db.commit()
+
+    if processed > 0:
+        log_op(db, 'build_session_fingerprint', '_enrich_session_summary',
+               params={'processed': processed, 'hdbscan': hdbscan_count,
+                       'short': short_count, 'mode': 'incremental'},
+               rows_affected=processed, source='enrich_summary.py')
+
+    return processed
+
+
+# ---------------------------------------------------------------------------
+# Full rebuild — manual use (DROP + recreate)
 # ---------------------------------------------------------------------------
 
 def main():

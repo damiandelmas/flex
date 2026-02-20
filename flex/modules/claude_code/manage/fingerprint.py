@@ -5,7 +5,7 @@ strange attractor sentences (from chunk-level HDBSCAN on pre-computed embeddings
 interleaved with collapsed tool runs. Target: ~30-50 lines per session, max 70.
 
 Content lines: [N] "quoted text" — what was said/decided.
-Tool lines:    > [N-M] 5x Read, 2x Bash — what was done.
+Tool lines:    > [N-M] 5x op:Read, 2x op:Bash — what was done.
 
 Compression: tool runs merge between content fence posts, content truncated
 to 3 sentences / 200 chars, max 3 reps per message_number, max 70 total lines.
@@ -236,30 +236,30 @@ def format_tool_line(chunk):
 
     if tool in ('Read', 'Write', 'Edit', 'MultiEdit'):
         basename = os.path.basename(target) if target else ''
-        return f"tool({tool}) `{basename}`" if basename else f"tool({tool})"
+        return f"op:{tool} `{basename}`" if basename else f"op:{tool}"
 
     if tool == 'Bash':
         cmd = content.strip()
         if cmd.startswith('Bash:'):
             cmd = cmd[5:].strip()
         if cmd and cmd != 'Bash' and len(cmd) > 3:
-            return f"tool(Bash) `{cmd[:60]}`"
-        return "tool(Bash)"
+            return f"op:Bash `{cmd[:60]}`"
+        return "op:Bash"
 
     if tool == 'Task':
         desc = content[:60].strip()
-        return f'tool(Task) "{desc}"' if desc else "tool(Task)"
+        return f'op:Task "{desc}"' if desc else "op:Task"
 
     if tool in ('WebSearch', 'WebFetch'):
         query = content[:60].strip()
-        return f"tool({tool}) `{query}`" if query else f"tool({tool})"
+        return f"op:{tool} `{query}`" if query else f"op:{tool}"
 
     if tool.startswith('mcp__'):
         parts = tool.split('__')
         short = parts[-1] if len(parts) > 2 else 'MCP tool'
-        return f"tool({short})"
+        return f"op:{short}"
 
-    return f"tool({tool})"
+    return f"op:{tool}"
 
 
 # ---------------------------------------------------------------------------
@@ -307,7 +307,7 @@ def _collapse_tool_lines(tool_lines, content_positions=None):
             line = f'> [{run_start}] {run_tools[0]["content"]}'
         else:
             counts = Counter(t['tool_name'] for t in run_tools)
-            parts = [f'{c}x tool({name})' for name, c in counts.most_common()]
+            parts = [f'{c}x op:{name}' for name, c in counts.most_common()]
             tag = ', '.join(parts)
             prefix = f'[{run_start}]' if run_start == run_end else f'[{run_start}-{run_end}]'
             line = f'> {prefix} {tag}'
@@ -384,8 +384,8 @@ def build_fingerprint(chunks, labels_unused=None, embed_fn=None, span_embeddings
     for ch in chunks:
         formatted = format_tool_line(ch)
         if formatted:
-            # Extract tool name: "tool(Read) `file.py`" → "Read"
-            m = re.match(r'tool\((\w+)\)', formatted)
+            # Extract tool name: "op:Read `file.py`" → "Read"
+            m = re.match(r'op:(\w+)', formatted)
             tool_name = m.group(1) if m else formatted.split()[0]
             tool_lines.append({
                 'message_number': ch.get('message_number', 0),
@@ -444,8 +444,8 @@ def build_short_fingerprint(chunks):
         else:
             formatted = format_tool_line(ch)
             if formatted:
-                # Extract tool name: "tool(Read) `file.py`" → "Read"
-                m = re.match(r'tool\((\w+)\)', formatted)
+                # Extract tool name: "op:Read `file.py`" → "Read"
+                m = re.match(r'op:(\w+)', formatted)
                 tool_name = m.group(1) if m else formatted.split()[0]
                 tool_lines.append({
                     'message_number': msg_num,
