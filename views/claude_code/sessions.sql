@@ -1,5 +1,5 @@
 -- @name: sessions
--- @description: Source-level surface for claude_code cells. Session metadata with graph intelligence.
+-- @description: Source-level surface for claude_code cells. Session metadata with graph intelligence and navigational fingerprint.
 -- is_warmup_only: COALESCE to 0 — NULL means unclassified (rebuild_all not yet run), treated as non-warmup.
 
 DROP VIEW IF EXISTS sessions;
@@ -16,8 +16,7 @@ SELECT
     src.duration_minutes,
     COUNT(DISTINCT s.chunk_id) as chunk_count,
     COALESCE(w.is_warmup_only, 0) AS is_warmup_only,
-    ess.topic_summary,
-    ess.community_label,
+    ess.fingerprint_index,
     g.centrality,
     g.is_hub,
     g.is_bridge,

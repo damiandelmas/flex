@@ -1,7 +1,7 @@
 -- @name: orient
 -- @description: Full cell orientation — shape, schema, graph intelligence, presets, samples
 -- @multi: true
--- NOTE: claude_code override — enhances hubs with topic_summary from _enrich_session_summary
+-- NOTE: claude_code override — enhances hubs with terse fingerprint_index from _enrich_session_summary
 
 -- @query: about
 SELECT value as description FROM _meta WHERE key = 'description';
@@ -37,7 +37,7 @@ ORDER BY m.name;
 
 -- @query: hubs
 SELECT g.source_id,
-    COALESCE(ess.topic_summary, src.title) as label,
+    COALESCE(substr(ess.fingerprint_index, 1, 120), src.title) as label,
     ROUND(g.centrality, 4) as centrality, g.community_id
 FROM _enrich_source_graph g
 JOIN _raw_sources src ON g.source_id = src.source_id

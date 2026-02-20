@@ -331,7 +331,7 @@ _ENRICHMENT_STUBS = {
         """CREATE TABLE IF NOT EXISTS _types_source_warmup (
             source_id TEXT PRIMARY KEY, is_warmup_only INTEGER DEFAULT 0)""",
         """CREATE TABLE IF NOT EXISTS _enrich_session_summary (
-            source_id TEXT PRIMARY KEY, topic_summary TEXT, community_label TEXT)""",
+            source_id TEXT PRIMARY KEY, fingerprint_index TEXT)""",
     ],
 }
 
