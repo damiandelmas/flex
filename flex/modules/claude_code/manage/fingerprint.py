@@ -51,7 +51,8 @@ HDBSCAN_METRIC = 'euclidean'
 # ---------------------------------------------------------------------------
 
 SKIP_TOOLS = {'UserPrompt', 'TaskOutput', 'BashOutput'}
-SPAN_MIN_LEN = 20
+SPAN_MIN_LEN = 50
+MAX_NOISE_REPS = 5
 
 
 # ---------------------------------------------------------------------------
@@ -164,17 +165,24 @@ def select_representatives(content_items, embeddings, labels):
                 'source': f'cluster_{lbl}',
             })
 
-    # Noise chunks — first-class
+    # Noise chunks — capped by entropy, not dumped raw
+    noise_candidates = []
     for i, l in enumerate(labels):
         if l == -1:
             _, chunk = content_items[i]
             span = _best_span_from_chunk(chunk)
             if span:
-                reps.append({
+                noise_candidates.append({
                     'message_number': span['message_number'],
                     'text': span['text'],
                     'source': 'noise',
+                    '_entropy': _text_entropy(span['text']),
                 })
+
+    # Keep top N by entropy — the most informationally dense noise
+    noise_candidates.sort(key=lambda x: x['_entropy'], reverse=True)
+    for nc in noise_candidates[:MAX_NOISE_REPS]:
+        reps.append({k: v for k, v in nc.items() if not k.startswith('_')})
 
     return reps
 

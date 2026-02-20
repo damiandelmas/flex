@@ -21,6 +21,7 @@ sys.path.insert(0, str(FLEX_ROOT))
 
 from flex.modules.claude_code.manage.fingerprint import (
     HDBSCAN_MIN_CHUNKS,
+    MAX_NOISE_REPS,
     SKIP_TOOLS,
     SPAN_MIN_LEN,
     _is_content_chunk,
@@ -67,15 +68,15 @@ class TestShatterSpans:
 
     def test_basic_sentence_split(self):
         chunks = [
-            _chunk("First sentence is here now. Second sentence is here now. Third one.", msg_num=5),
+            _chunk("First sentence is here now and long enough to pass the filter easily. Second sentence is also here and long enough to pass. Third one.", msg_num=5),
         ]
         spans = shatter_spans(chunks)
-        assert len(spans) == 2  # "Third one." is < SPAN_MIN_LEN, others > 20
+        assert len(spans) == 2  # "Third one." is < SPAN_MIN_LEN, others > 50
         assert all(s['message_number'] == 5 for s in spans)
 
     def test_tool_chunks_excluded(self):
         chunks = [
-            _chunk("Some user text here definitely long enough.", tool_name=None, msg_num=1),
+            _chunk("Some user text here that is definitely long enough to pass the fifty char filter.", tool_name=None, msg_num=1),
             _chunk("Read /path/to/file.py", tool_name='Read', target_file='/path/to/file.py', msg_num=2),
         ]
         spans = shatter_spans(chunks)
@@ -87,16 +88,17 @@ class TestShatterSpans:
         assert shatter_spans(chunks) == []
 
     def test_short_fragments_filtered(self):
-        chunks = [_chunk("Hi. Yes. No. Maybe longer sentence here to actually pass.", msg_num=1)]
+        chunks = [_chunk("Hi. Yes. No. This sentence is long enough to survive the fifty character minimum filter.", msg_num=1)]
         spans = shatter_spans(chunks)
         # Only spans > SPAN_MIN_LEN survive
+        assert len(spans) == 1
         for s in spans:
             assert len(s['text']) > SPAN_MIN_LEN
 
     def test_inherits_message_number(self):
         chunks = [
-            _chunk("First sentence long enough to pass filter.", msg_num=42),
-            _chunk("Second sentence also long enough to pass.", msg_num=99),
+            _chunk("First sentence that is absolutely long enough to pass the fifty char filter.", msg_num=42),
+            _chunk("Second sentence that is also absolutely long enough to pass the filter.", msg_num=99),
         ]
         spans = shatter_spans(chunks)
         msg_nums = {s['message_number'] for s in spans}
@@ -113,7 +115,7 @@ class TestSelectRepresentatives:
     def test_one_rep_per_cluster(self):
         # content_items: list of (original_index, chunk_dict)
         content_items = [
-            (i, _chunk(f'Sentence number {i} which is long enough to pass filter.', msg_num=i))
+            (i, _chunk(f'Sentence number {i} which is definitely long enough to pass the fifty char filter easily.', msg_num=i))
             for i in range(15)
         ]
         embeddings = np.random.randn(15, 384).astype(np.float32)
@@ -125,11 +127,11 @@ class TestSelectRepresentatives:
         noise_reps = [r for r in reps if r['source'] == 'noise']
 
         assert len(cluster_reps) == 2  # clusters 0 and 1
-        assert len(noise_reps) == 5    # all noise chunks
+        assert len(noise_reps) == MAX_NOISE_REPS  # capped
 
     def test_all_noise_returns_empty_clusters(self):
         content_items = [
-            (i, _chunk(f'Noise span {i} long enough text here.', msg_num=i))
+            (i, _chunk(f'Noise span {i} that is long enough text to survive the fifty char filter easily.', msg_num=i))
             for i in range(5)
         ]
         embeddings = np.random.randn(5, 384).astype(np.float32)
@@ -138,7 +140,19 @@ class TestSelectRepresentatives:
         reps = select_representatives(content_items, embeddings, labels)
         cluster_reps = [r for r in reps if r['source'].startswith('cluster_')]
         assert len(cluster_reps) == 0
-        assert len(reps) == 5  # all noise
+        assert len(reps) == 5  # all noise (5 <= MAX_NOISE_REPS)
+
+    def test_noise_capped_at_max(self):
+        """More than MAX_NOISE_REPS noise chunks → only top N by entropy kept."""
+        content_items = [
+            (i, _chunk(f'Noise chunk number {i} with enough diverse vocabulary words to pass the entropy filter and length check.', msg_num=i))
+            for i in range(MAX_NOISE_REPS + 10)
+        ]
+        embeddings = np.random.randn(MAX_NOISE_REPS + 10, 384).astype(np.float32)
+        labels = np.array([-1] * (MAX_NOISE_REPS + 10))
+
+        reps = select_representatives(content_items, embeddings, labels)
+        assert len(reps) == MAX_NOISE_REPS
 
 
 # ---------------------------------------------------------------------------
@@ -202,9 +216,9 @@ class TestBuildShortFingerprint:
 
     def test_basic(self):
         chunks = [
-            _chunk("User asked a question that is definitely long enough.", msg_num=2),
+            _chunk("User asked a question that is definitely long enough to pass the fifty character minimum.", msg_num=2),
             _chunk(tool_name='Read', target_file='/path/file.py', msg_num=3),
-            _chunk("Agent responded with a detailed explanation here.", msg_num=4),
+            _chunk("Agent responded with a detailed explanation here that also passes the fifty char minimum.", msg_num=4),
         ]
         result = build_short_fingerprint(chunks)
         assert result is not None
@@ -220,8 +234,8 @@ class TestBuildShortFingerprint:
 
     def test_chronological_order(self):
         chunks = [
-            _chunk("Later message that is long enough to pass filter.", msg_num=50),
-            _chunk("Earlier message that is also long enough here.", msg_num=10),
+            _chunk("Later message that is long enough to pass the fifty character filter easily.", msg_num=50),
+            _chunk("Earlier message that is also long enough to pass the fifty character filter.", msg_num=10),
         ]
         result = build_short_fingerprint(chunks)
         lines = result.split('\n')
@@ -250,7 +264,7 @@ class TestBuildFingerprint:
     def test_falls_back_to_short_when_few_spans(self):
         """Sessions with < HDBSCAN_MIN_CHUNKS spans use short fingerprint."""
         chunks = [
-            _chunk("A short session with just a few chunks here.", msg_num=1),
+            _chunk("A short session with just a few chunks here but long enough to pass the minimum.", msg_num=1),
             _chunk(tool_name='Read', target_file='/file.py', msg_num=2),
         ]
         result = build_fingerprint(chunks, None, _embed_fn)
@@ -263,7 +277,7 @@ class TestBuildFingerprint:
         chunks = []
         for i in range(30):
             chunks.append(_chunk(
-                f"This is sentence number {i} with enough words to be a real span in the session.",
+                f"This is sentence number {i} with enough words to be a real span in the session and pass the minimum.",
                 msg_num=i * 2
             ))
         # Add some tool calls
@@ -278,9 +292,9 @@ class TestBuildFingerprint:
     def test_tool_calls_and_quotes_mixed(self):
         """Output contains both quoted text and unquoted tool calls."""
         chunks = [
-            _chunk("User said something meaningful and long enough to keep.", msg_num=1),
+            _chunk("User said something meaningful and long enough to keep past the fifty char minimum.", msg_num=1),
             _chunk(tool_name='Read', target_file='/foo.py', msg_num=2),
-            _chunk("Agent explained the architecture in detail here now.", msg_num=3),
+            _chunk("Agent explained the architecture in detail here now and this is long enough too.", msg_num=3),
         ]
         result = build_fingerprint(chunks, None, _embed_fn)
         assert result is not None
