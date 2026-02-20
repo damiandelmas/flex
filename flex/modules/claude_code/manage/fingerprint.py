@@ -1,17 +1,16 @@
 """Claude Code session fingerprint — HDBSCAN config and fingerprint builder.
 
-Builds a flat chronological navigational index for each session:
+Builds a compact chronological navigational index for each session:
 strange attractor sentences (from chunk-level HDBSCAN on pre-computed embeddings)
-interleaved with every tool call. No collapsing. No truncation. No dedup. Raw output.
+interleaved with collapsed tool runs. Target: ~30-50 lines per session, max 70.
 
-Selection ethic: extremes, not centroids. The chunk farthest from each cluster's
-centroid — where thinking deviated, pivoted, or crystallized. Within that chunk,
-the highest-entropy sentence surfaces. Noise chunks are first-class.
+Content lines: [N] "quoted text" — what was said/decided.
+Tool lines:    > [N-M] 5x Read, 2x Bash — what was done.
+
+Compression: tool runs merge between content fence posts, content truncated
+to 3 sentences / 200 chars, max 3 reps per message_number, max 70 total lines.
 
 Zero ONNX at enrichment time — uses _raw_chunks.embedding (already in DB).
-
-Structure: chronological index with [N] message_number prefixes. Tool calls
-interleaved. Gaps between numbers reveal rhythm.
 """
 
 import math
@@ -53,6 +52,10 @@ HDBSCAN_METRIC = 'euclidean'
 SKIP_TOOLS = {'UserPrompt', 'TaskOutput', 'BashOutput'}
 SPAN_MIN_LEN = 50
 MAX_NOISE_REPS = 5
+MAX_REPS_PER_POSITION = 3   # dedup when >3 reps share a message_number
+MAX_CONTENT_CHARS = 200      # truncate content reps
+MAX_CONTENT_SENTS = 3        # max sentences per content rep
+MAX_LINES = 70               # safety net — trim lowest-entropy lines
 
 
 # ---------------------------------------------------------------------------
@@ -75,6 +78,37 @@ def _text_entropy(text):
     counts = Counter(words)
     total = len(words)
     return -sum((c / total) * math.log2(c / total) for c in counts.values())
+
+
+def _truncate_content(text):
+    """Truncate to MAX_CONTENT_SENTS sentences / MAX_CONTENT_CHARS chars."""
+    sents = re.split(r'(?<=[.!?])\s+', text.strip())
+    sents = sents[:MAX_CONTENT_SENTS]
+    result = ' '.join(sents)
+    if len(result) > MAX_CONTENT_CHARS:
+        result = result[:MAX_CONTENT_CHARS - 3] + '...'
+    return result
+
+
+def _dedup_reps(reps):
+    """Cap reps per message_number at MAX_REPS_PER_POSITION, keep highest entropy."""
+    by_pos = {}
+    for r in reps:
+        pos = r['message_number']
+        if pos not in by_pos:
+            by_pos[pos] = []
+        by_pos[pos].append(r)
+
+    deduped = []
+    for pos in sorted(by_pos):
+        group = by_pos[pos]
+        if len(group) <= MAX_REPS_PER_POSITION:
+            deduped.extend(group)
+        else:
+            # Keep top N by entropy
+            scored = sorted(group, key=lambda r: _text_entropy(r['text']), reverse=True)
+            deduped.extend(scored[:MAX_REPS_PER_POSITION])
+    return deduped
 
 
 # ---------------------------------------------------------------------------
@@ -188,7 +222,7 @@ def select_representatives(content_items, embeddings, labels):
 
 
 # ---------------------------------------------------------------------------
-# Tool call formatting — one line per call, no collapsing
+# Tool call formatting — one line per call
 # ---------------------------------------------------------------------------
 
 def format_tool_line(chunk):
@@ -202,30 +236,100 @@ def format_tool_line(chunk):
 
     if tool in ('Read', 'Write', 'Edit', 'MultiEdit'):
         basename = os.path.basename(target) if target else ''
-        return f"{tool} {basename}" if basename else tool
+        return f"tool({tool}) `{basename}`" if basename else f"tool({tool})"
 
     if tool == 'Bash':
         cmd = content.strip()
         if cmd.startswith('Bash:'):
             cmd = cmd[5:].strip()
         if cmd and cmd != 'Bash' and len(cmd) > 3:
-            return f"Bash: {cmd[:60]}"
-        return "Bash"
+            return f"tool(Bash) `{cmd[:60]}`"
+        return "tool(Bash)"
 
     if tool == 'Task':
         desc = content[:60].strip()
-        return f'Task: "{desc}"' if desc else "Task"
+        return f'tool(Task) "{desc}"' if desc else "tool(Task)"
 
     if tool in ('WebSearch', 'WebFetch'):
         query = content[:60].strip()
-        return f"{tool}: {query}" if query else tool
+        return f"tool({tool}) `{query}`" if query else f"tool({tool})"
 
     if tool.startswith('mcp__'):
         parts = tool.split('__')
         short = parts[-1] if len(parts) > 2 else 'MCP tool'
-        return f"{short} query"
+        return f"tool({short})"
 
-    return tool
+    return f"tool({tool})"
+
+
+# ---------------------------------------------------------------------------
+# Tool call collapsing — group by message_number, then merge consecutive runs
+# ---------------------------------------------------------------------------
+
+def _collapse_tool_lines(tool_lines, content_positions=None):
+    """Collapse tool calls — group by message_number, merge consecutive runs.
+
+    Phase 1: Group by message_number → "[8] 4x Read"
+    Phase 2: Merge consecutive tool groups into runs → "[8-60] 15x Read, 3x Bash"
+             Content rep positions act as fence posts that break runs.
+
+    Single tool call keeps detail: "[50] Bash: pytest tests/"
+
+    Returns list of {sort_key, line}.
+    """
+    if not tool_lines:
+        return []
+    if content_positions is None:
+        content_positions = set()
+
+    # Phase 1: group by message_number
+    groups = {}
+    for t in tool_lines:
+        msg = t['message_number']
+        if msg not in groups:
+            groups[msg] = []
+        groups[msg].append(t)
+
+    sorted_msgs = sorted(groups)
+
+    # Phase 2: merge consecutive groups into runs
+    # A content rep between two tool groups breaks the run.
+    runs = []
+    run_start = None
+    run_end = None
+    run_tools = []
+
+    def _flush():
+        nonlocal run_start, run_end, run_tools
+        if not run_tools:
+            return
+        if len(run_tools) == 1:
+            line = f'> [{run_start}] {run_tools[0]["content"]}'
+        else:
+            counts = Counter(t['tool_name'] for t in run_tools)
+            parts = [f'{c}x tool({name})' for name, c in counts.most_common()]
+            tag = ', '.join(parts)
+            prefix = f'[{run_start}]' if run_start == run_end else f'[{run_start}-{run_end}]'
+            line = f'> {prefix} {tag}'
+        runs.append({'sort_key': run_start, 'line': line})
+        run_start = None
+        run_end = None
+        run_tools = []
+
+    for msg_num in sorted_msgs:
+        # Check if a content rep sits between current run and this group
+        if run_start is not None:
+            fence = any(p for p in content_positions if run_end < p < msg_num)
+            if fence:
+                _flush()
+
+        if run_start is None:
+            run_start = msg_num
+        run_end = msg_num
+        run_tools.extend(groups[msg_num])
+
+    _flush()
+    return runs
 
 
 # ---------------------------------------------------------------------------
@@ -270,27 +374,54 @@ def build_fingerprint(chunks, labels_unused=None, embed_fn=None, span_embeddings
     # Select representative spans via chunk-level geometry + entropy
     reps = select_representatives(content_items, embeddings, chunk_labels)
 
-    # Tool calls — one line each
+    # Dedup: cap reps per message_number, truncate content
+    reps = _dedup_reps(reps)
+    for r in reps:
+        r['text'] = _truncate_content(r['text'])
+
+    # Tool calls — collect raw, collapse later
     tool_lines = []
     for ch in chunks:
         formatted = format_tool_line(ch)
         if formatted:
+            # Extract tool name: "tool(Read) `file.py`" → "Read"
+            m = re.match(r'tool\((\w+)\)', formatted)
+            tool_name = m.group(1) if m else formatted.split()[0]
             tool_lines.append({
                 'message_number': ch.get('message_number', 0),
+                'tool_name': tool_name,
                 'content': formatted,
             })
 
-    # Merge + sort + format — no dedup, ship raw
+    # Collapse tool calls — content rep positions are fence posts
+    content_positions = {r['message_number'] for r in reps}
+    collapsed_tools = _collapse_tool_lines(tool_lines, content_positions)
+
+    # Merge content reps + collapsed tools, sort chronologically
     lines = []
     for r in reps:
         lines.append((r['message_number'], f'[{r["message_number"]}] "{r["text"]}"'))
-    for t in tool_lines:
-        lines.append((t['message_number'], f'[{t["message_number"]}] {t["content"]}'))
+    for t in collapsed_tools:
+        lines.append((t['sort_key'], t['line']))
 
     lines.sort(key=lambda x: x[0])
 
     if not lines:
         return None
+
+    # Safety net — trim to MAX_LINES, keeping tool lines (structural)
+    # and highest-entropy content lines
+    if len(lines) > MAX_LINES:
+        tool = [(pos, line) for pos, line in lines if line.startswith('>')]
+        content = [(pos, line) for pos, line in lines if not line.startswith('>')]
+        # Keep all tool lines, trim content by entropy
+        content_scored = sorted(content,
+            key=lambda x: _text_entropy(x[1]), reverse=True)
+        budget = MAX_LINES - len(tool)
+        if budget < 1:
+            budget = 1
+        content = content_scored[:budget]
+        lines = sorted(tool + content, key=lambda x: x[0])
 
     return '\n'.join(line for _, line in lines)
 
@@ -298,23 +429,36 @@ def build_fingerprint(chunks, labels_unused=None, embed_fn=None, span_embeddings
 def build_short_fingerprint(chunks):
     """Fingerprint for sessions too small for HDBSCAN.
 
-    Lists all content spans + all tool calls chronologically. No dedup.
+    Lists all content spans + collapsed tool calls chronologically.
     No embedding needed — just sentence-split and list.
     """
-    lines = []
+    content_lines = []
+    tool_lines = []
 
     for ch in chunks:
         msg_num = ch.get('message_number', 0)
         if _is_content_chunk(ch) and ch.get('content', '').strip():
-            sents = re.split(r'(?<=[.!?])\s+', ch['content'].strip())
-            for sent in sents:
-                sent = sent.strip()
-                if len(sent) > SPAN_MIN_LEN:
-                    lines.append((msg_num, f'[{msg_num}] "{sent}"'))
+            truncated = _truncate_content(ch['content'].strip())
+            if len(truncated) > SPAN_MIN_LEN:
+                content_lines.append((msg_num, f'[{msg_num}] "{truncated}"'))
         else:
             formatted = format_tool_line(ch)
             if formatted:
-                lines.append((msg_num, f'[{msg_num}] {formatted}'))
+                # Extract tool name: "tool(Read) `file.py`" → "Read"
+                m = re.match(r'tool\((\w+)\)', formatted)
+                tool_name = m.group(1) if m else formatted.split()[0]
+                tool_lines.append({
+                    'message_number': msg_num,
+                    'tool_name': tool_name,
+                    'content': formatted,
+                })
+
+    content_positions = {pos for pos, _ in content_lines}
+    collapsed = _collapse_tool_lines(tool_lines, content_positions)
+
+    lines = list(content_lines)
+    for t in collapsed:
+        lines.append((t['sort_key'], t['line']))
 
     lines.sort(key=lambda x: x[0])
 

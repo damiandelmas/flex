@@ -21,11 +21,18 @@ sys.path.insert(0, str(FLEX_ROOT))
 
 from flex.modules.claude_code.manage.fingerprint import (
     HDBSCAN_MIN_CHUNKS,
+    MAX_CONTENT_CHARS,
+    MAX_CONTENT_SENTS,
+    MAX_LINES,
     MAX_NOISE_REPS,
+    MAX_REPS_PER_POSITION,
     SKIP_TOOLS,
     SPAN_MIN_LEN,
+    _collapse_tool_lines,
+    _dedup_reps,
     _is_content_chunk,
     _text_entropy,
+    _truncate_content,
     build_fingerprint,
     build_short_fingerprint,
     format_tool_line,
@@ -163,40 +170,40 @@ class TestFormatToolLine:
 
     def test_read(self):
         ch = _chunk(tool_name='Read', target_file='/home/user/project/file.py')
-        assert format_tool_line(ch) == 'Read file.py'
+        assert format_tool_line(ch) == 'tool(Read) `file.py`'
 
     def test_write(self):
         ch = _chunk(tool_name='Write', target_file='/home/user/project/out.md')
-        assert format_tool_line(ch) == 'Write out.md'
+        assert format_tool_line(ch) == 'tool(Write) `out.md`'
 
     def test_edit(self):
         ch = _chunk(tool_name='Edit', target_file='/foo/bar.py')
-        assert format_tool_line(ch) == 'Edit bar.py'
+        assert format_tool_line(ch) == 'tool(Edit) `bar.py`'
 
     def test_bash_with_command(self):
         ch = _chunk(content='pytest tests/test_vec_ops.py -v', tool_name='Bash')
         result = format_tool_line(ch)
-        assert result.startswith('Bash: ')
+        assert result.startswith('tool(Bash) `')
         assert 'pytest' in result
 
     def test_bash_empty(self):
         ch = _chunk(content='', tool_name='Bash')
-        assert format_tool_line(ch) == 'Bash'
+        assert format_tool_line(ch) == 'tool(Bash)'
 
     def test_task_with_desc(self):
         ch = _chunk(content='Read soma architecture and codebase', tool_name='Task')
         result = format_tool_line(ch)
-        assert result.startswith('Task: "')
+        assert result.startswith('tool(Task) "')
         assert 'soma' in result
 
     def test_websearch(self):
         ch = _chunk(content='flexmem npm availability', tool_name='WebSearch')
-        assert format_tool_line(ch) == 'WebSearch: flexmem npm availability'
+        assert format_tool_line(ch) == 'tool(WebSearch) `flexmem npm availability`'
 
     def test_mcp_tool(self):
         ch = _chunk(tool_name='mcp__flexsearch__flex')
         result = format_tool_line(ch)
-        assert result == 'flex query'
+        assert result == 'tool(flex)'
 
     def test_skip_tools(self):
         for tool in SKIP_TOOLS:
@@ -225,9 +232,9 @@ class TestBuildShortFingerprint:
         lines = result.split('\n')
         assert len(lines) >= 2
 
-        # Check [N] prefix format
+        # Check prefix format: content starts with [, tools start with >
         for line in lines:
-            assert line.startswith('[')
+            assert line.startswith('[') or line.startswith('>')
 
     def test_empty_session(self):
         assert build_short_fingerprint([]) is None
@@ -242,8 +249,8 @@ class TestBuildShortFingerprint:
         assert '[10]' in lines[0]
         assert '[50]' in lines[1]
 
-    def test_no_dedup(self):
-        """Multiple tool calls at same message_number all appear."""
+    def test_tool_collapse(self):
+        """Multiple tool calls at same message_number collapse into one line."""
         chunks = [
             _chunk(tool_name='Read', target_file='/a.py', msg_num=8),
             _chunk(tool_name='Read', target_file='/b.py', msg_num=8),
@@ -251,8 +258,108 @@ class TestBuildShortFingerprint:
         ]
         result = build_short_fingerprint(chunks)
         lines = result.split('\n')
-        assert len(lines) == 3
-        assert all('[8]' in line for line in lines)
+        assert len(lines) == 1
+        assert '[8]' in lines[0]
+        assert '3x tool(Read)' in lines[0]
+        assert lines[0].startswith('>')
+
+
+# ---------------------------------------------------------------------------
+# _collapse_tool_lines
+# ---------------------------------------------------------------------------
+
+class TestCollapseToolLines:
+
+    def test_empty(self):
+        assert _collapse_tool_lines([]) == []
+
+    def test_single_keeps_detail(self):
+        tools = [{'message_number': 8, 'tool_name': 'Read', 'content': 'tool(Read) `file.py`'}]
+        result = _collapse_tool_lines(tools)
+        assert len(result) == 1
+        assert result[0]['line'] == '> [8] tool(Read) `file.py`'
+
+    def test_same_msg_collapses(self):
+        tools = [
+            {'message_number': 8, 'tool_name': 'Read', 'content': 'Read a.py'},
+            {'message_number': 8, 'tool_name': 'Read', 'content': 'Read b.py'},
+            {'message_number': 8, 'tool_name': 'Read', 'content': 'Read c.py'},
+            {'message_number': 8, 'tool_name': 'Read', 'content': 'Read d.py'},
+        ]
+        result = _collapse_tool_lines(tools)
+        assert len(result) == 1
+        assert '4x tool(Read)' in result[0]['line']
+        assert '[8]' in result[0]['line']
+
+    def test_mixed_tools_same_msg(self):
+        tools = [
+            {'message_number': 5, 'tool_name': 'Read', 'content': 'Read a.py'},
+            {'message_number': 5, 'tool_name': 'Read', 'content': 'Read b.py'},
+            {'message_number': 5, 'tool_name': 'Write', 'content': 'Write c.py'},
+        ]
+        result = _collapse_tool_lines(tools)
+        assert len(result) == 1
+        assert '2x tool(Read)' in result[0]['line']
+        assert '1x tool(Write)' in result[0]['line']
+
+    def test_consecutive_merge_no_fence(self):
+        """Consecutive tool groups with no content between them merge into one run."""
+        tools = [
+            {'message_number': 2, 'tool_name': 'Read', 'content': 'Read a.py'},
+            {'message_number': 4, 'tool_name': 'Read', 'content': 'Read b.py'},
+            {'message_number': 6, 'tool_name': 'Read', 'content': 'Read c.py'},
+            {'message_number': 8, 'tool_name': 'Bash', 'content': 'Bash: ls'},
+        ]
+        result = _collapse_tool_lines(tools)
+        assert len(result) == 1
+        assert '[2-8]' in result[0]['line']
+        assert '3x tool(Read)' in result[0]['line']
+        assert '1x tool(Bash)' in result[0]['line']
+
+    def test_fence_breaks_run(self):
+        """Content rep between tool groups splits them into separate runs."""
+        tools = [
+            {'message_number': 2, 'tool_name': 'Read', 'content': 'Read a.py'},
+            {'message_number': 4, 'tool_name': 'Read', 'content': 'Read b.py'},
+            # content rep at position 5 acts as fence
+            {'message_number': 8, 'tool_name': 'Write', 'content': 'Write c.py'},
+            {'message_number': 10, 'tool_name': 'Bash', 'content': 'Bash: ls'},
+        ]
+        result = _collapse_tool_lines(tools, content_positions={5})
+        assert len(result) == 2
+        assert '[2-4]' in result[0]['line']
+        assert '2x tool(Read)' in result[0]['line']
+        assert '[8-10]' in result[1]['line']
+
+    def test_fence_at_exact_boundary_no_split(self):
+        """Fence must be strictly between run_end and next msg — at boundary doesn't split."""
+        tools = [
+            {'message_number': 2, 'tool_name': 'Read', 'content': 'Read a.py'},
+            {'message_number': 4, 'tool_name': 'Read', 'content': 'Read b.py'},
+        ]
+        # Fence at position 2 or 4 — not strictly between, no split
+        result = _collapse_tool_lines(tools, content_positions={2})
+        assert len(result) == 1
+
+    def test_no_fence_merges_all(self):
+        """Without content fences, all tool groups merge into one run."""
+        tools = [
+            {'message_number': 99, 'tool_name': 'Bash', 'content': 'Bash: ls'},
+            {'message_number': 3, 'tool_name': 'Read', 'content': 'Read x.py'},
+        ]
+        result = _collapse_tool_lines(tools)
+        assert len(result) == 1
+        assert '[3-99]' in result[0]['line']
+        assert result[0]['line'].startswith('>')
+
+    def test_fence_produces_sorted_runs(self):
+        tools = [
+            {'message_number': 99, 'tool_name': 'Bash', 'content': 'Bash: ls'},
+            {'message_number': 3, 'tool_name': 'Read', 'content': 'Read x.py'},
+        ]
+        result = _collapse_tool_lines(tools, content_positions={50})
+        assert len(result) == 2
+        assert result[0]['sort_key'] < result[1]['sort_key']
 
 
 # ---------------------------------------------------------------------------
@@ -272,7 +379,7 @@ class TestBuildFingerprint:
         assert '[1]' in result or '[2]' in result
 
     def test_output_has_message_numbers(self):
-        """All output lines have [N] prefix."""
+        """All output lines have [N] or > prefix."""
         # Build enough content chunks to potentially trigger HDBSCAN
         chunks = []
         for i in range(30):
@@ -287,7 +394,7 @@ class TestBuildFingerprint:
         result = build_fingerprint(chunks, None, _embed_fn)
         assert result is not None
         for line in result.split('\n'):
-            assert line.startswith('[')
+            assert line.startswith('[') or line.startswith('>')
 
     def test_tool_calls_and_quotes_mixed(self):
         """Output contains both quoted text and unquoted tool calls."""
@@ -303,6 +410,62 @@ class TestBuildFingerprint:
         has_tool = any('Read' in line for line in result.split('\n'))
         assert has_quoted
         assert has_tool
+
+
+# ---------------------------------------------------------------------------
+# _truncate_content
+# ---------------------------------------------------------------------------
+
+class TestTruncateContent:
+
+    def test_short_passes_through(self):
+        text = "A short sentence that fits easily."
+        assert _truncate_content(text) == text
+
+    def test_caps_at_3_sentences(self):
+        text = "First sentence here. Second sentence here. Third sentence here. Fourth sentence here. Fifth sentence here."
+        result = _truncate_content(text)
+        # Should have at most 3 sentences
+        assert 'Fourth' not in result
+        assert 'Fifth' not in result
+
+    def test_caps_at_200_chars(self):
+        text = "A " * 150  # 300 chars
+        result = _truncate_content(text)
+        assert len(result) <= MAX_CONTENT_CHARS
+        assert result.endswith('...')
+
+
+# ---------------------------------------------------------------------------
+# _dedup_reps
+# ---------------------------------------------------------------------------
+
+class TestDedupReps:
+
+    def test_under_threshold_passes(self):
+        reps = [
+            {'message_number': 10, 'text': 'First rep here.', 'source': 'cluster_0'},
+            {'message_number': 10, 'text': 'Second rep here.', 'source': 'cluster_1'},
+            {'message_number': 10, 'text': 'Third rep here.', 'source': 'noise'},
+        ]
+        result = _dedup_reps(reps)
+        assert len(result) == 3  # <= MAX_REPS_PER_POSITION
+
+    def test_over_threshold_trims(self):
+        reps = [
+            {'message_number': 10, 'text': f'Rep number {i} with enough words for entropy calculation.', 'source': f'cluster_{i}'}
+            for i in range(10)
+        ]
+        result = _dedup_reps(reps)
+        assert len(result) == MAX_REPS_PER_POSITION
+
+    def test_different_positions_independent(self):
+        reps = [
+            {'message_number': 10, 'text': 'At position ten here.', 'source': 'cluster_0'},
+            {'message_number': 20, 'text': 'At position twenty here.', 'source': 'cluster_1'},
+        ]
+        result = _dedup_reps(reps)
+        assert len(result) == 2
 
 
 # ---------------------------------------------------------------------------
