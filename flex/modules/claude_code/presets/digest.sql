@@ -11,7 +11,7 @@ WHERE timestamp > strftime('%s', 'now', '-' || :days || ' days');
 -- @query: active_projects
 SELECT project, COUNT(DISTINCT session_id) as sessions
 FROM sessions s
-WHERE s.start_time > strftime('%s', 'now', '-' || :days || ' days')
+WHERE s.started_at > datetime('now', '-' || :days || ' days', 'localtime')
 GROUP BY project
 ORDER BY sessions DESC LIMIT 10;
 

@@ -9,6 +9,7 @@ CREATE VIEW messages AS
 SELECT
     r.id,
     r.content,
+    r.timestamp,
     datetime(r.timestamp, 'unixepoch', 'localtime') AS created_at,
     s.source_id AS session_id,
     s.position AS position,

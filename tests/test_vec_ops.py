@@ -881,6 +881,67 @@ class TestLocalCommunities:
 
 
 # =============================================================================
+# Materialize vec_ops (temp table rewrite + error surfacing)
+# =============================================================================
+
+class TestMaterializeVecOps:
+    """materialize_vec_ops rewrites vec_ops() calls into temp tables."""
+
+    @pytest.fixture
+    def mat_db(self):
+        """Self-contained db with vec_ops registered for materialize tests."""
+        from flex.retrieve.vec_ops import VectorCache, register_vec_ops
+        conn = sqlite3.connect(':memory:')
+        conn.row_factory = sqlite3.Row
+        conn.execute("CREATE TABLE _raw_chunks (id TEXT PRIMARY KEY, content TEXT, embedding BLOB)")
+        vectors = {'a': [1, 0, 0], 'b': [0.9, 0.1, 0], 'c': [0, 1, 0]}
+        for id_, vals in vectors.items():
+            conn.execute("INSERT INTO _raw_chunks VALUES (?,?,?)",
+                         (id_, f"content {id_}", _make_blob(vals)))
+        conn.commit()
+        vc = VectorCache()
+        vc.load_from_db(conn, '_raw_chunks', 'embedding', 'id')
+        embed_fn = lambda text: _make_vec([0.5, 0.5, 0.5])
+        register_vec_ops(conn, {'_raw_chunks': vc}, embed_fn)
+        return conn
+
+    def test_bad_prefilter_surfaces_real_error(self, mat_db):
+        """Bad pre-filter table should return error JSON, not 'no such table'."""
+        from flex.retrieve.vec_ops import materialize_vec_ops
+        sql = "SELECT v.id FROM vec_ops('_raw_chunks', 'test', '', " \
+              "'SELECT id FROM nonexistent_table') v LIMIT 3"
+        result = materialize_vec_ops(mat_db, sql)
+        assert '"error"' in result
+        assert 'no such table: vec_ops' not in result
+        assert 'nonexistent_table' in result
+
+    def test_bad_prefilter_column_surfaces_error(self, mat_db):
+        """Pre-filter referencing bad column returns error, not 'no such table'."""
+        from flex.retrieve.vec_ops import materialize_vec_ops
+        sql = "SELECT v.id FROM vec_ops('_raw_chunks', 'test', '', " \
+              "'SELECT fake_col FROM _raw_chunks') v LIMIT 3"
+        result = materialize_vec_ops(mat_db, sql)
+        assert '"error"' in result
+        assert 'fake_col' in result
+
+    def test_valid_prefilter_materializes(self, mat_db):
+        """Valid pre-filter produces a temp table, not the original SQL."""
+        from flex.retrieve.vec_ops import materialize_vec_ops
+        sql = "SELECT v.id, v.score FROM vec_ops('_raw_chunks', 'test', '', " \
+              "'SELECT id FROM _raw_chunks WHERE id = ''a''') v LIMIT 3"
+        result = materialize_vec_ops(mat_db, sql)
+        assert 'vec_ops' not in result
+        assert '_vec_results_' in result
+
+    def test_no_vec_ops_passthrough(self, mat_db):
+        """SQL without vec_ops passes through unchanged."""
+        from flex.retrieve.vec_ops import materialize_vec_ops
+        sql = "SELECT * FROM _raw_chunks LIMIT 5"
+        result = materialize_vec_ops(mat_db, sql)
+        assert result == sql
+
+
+# =============================================================================
 # Helpers
 # =============================================================================
 

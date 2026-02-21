@@ -7,9 +7,8 @@
 SELECT
     session_id as session,
     title,
-    datetime(start_time, 'unixepoch', 'localtime') as started,
-    message_count as ops,
-    primary_cwd as cwd
+    started_at as started,
+    message_count as ops
 FROM sessions
 WHERE session_id LIKE '%' || :session || '%';
 
@@ -17,7 +16,7 @@ WHERE session_id LIKE '%' || :session || '%';
 SELECT
     tool_name,
     COALESCE(target_file, substr(content, 1, 60)) as target,
-    datetime(timestamp, 'unixepoch', 'localtime') as ts
+    created_at as ts
 FROM messages
 WHERE session_id LIKE '%' || :session || '%'
 ORDER BY position

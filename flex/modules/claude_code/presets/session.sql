@@ -6,7 +6,7 @@ SELECT
     tool_name,
     target_file,
     substr(content, 1, 80) as preview,
-    datetime(timestamp, 'unixepoch', 'localtime') as ts
+    created_at as ts
 FROM messages
 WHERE session_id LIKE '%' || :session || '%'
 ORDER BY position

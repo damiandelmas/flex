@@ -530,6 +530,8 @@ def materialize_vec_ops(db, sql: str) -> str:
     AI writes:  FROM vec_ops('_raw_chunks', 'query') v
     Becomes:    FROM _vec_results v  (temp table with id TEXT, score REAL)
 
+    Returns original SQL unchanged if no vec_ops table source found.
+    Returns JSON error string if vec_ops returns an error (bad pre-filter, etc).
     Skips if wrapped in json_each() (backward compat).
     Only triggers when vec_ops appears as a table source (after FROM/JOIN).
     """
@@ -588,9 +590,11 @@ def materialize_vec_ops(db, sql: str) -> str:
     except Exception:
         return sql  # let original SQL fail naturally
 
-    # Handle error JSON or empty results from vec_ops
+    # Handle error JSON from vec_ops — surface it directly
     if not isinstance(results, list):
-        return sql  # vec_ops returned {"error": "..."}, let original SQL show it
+        if isinstance(results, dict) and 'error' in results:
+            return json.dumps(results)
+        return sql
     if not results:
         return sql
 
