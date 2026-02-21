@@ -505,10 +505,10 @@ def _log_query(cell: str, query: str, result_json: str, elapsed_ms: float):
 
 @server.list_tools()
 async def handle_list_tools() -> list[types.Tool]:
-    """Return the flex tool with dynamic description and schema."""
+    """Return the search tool with dynamic description and schema."""
     return [
         types.Tool(
-            name="flex",
+            name="search",
             description=_build_tool_description(),
             inputSchema=_build_tool_schema(),
         )
@@ -642,7 +642,7 @@ async def handle_call_tool(
     name: str, arguments: dict | None
 ) -> list[types.TextContent]:
     """Handle flex tool calls. Runs DB work in executor to avoid blocking."""
-    if name != "flex":
+    if name != "search":
         return [types.TextContent(type="text", text=json.dumps({"error": f"Unknown tool: {name}"}))]
 
     if not arguments or "query" not in arguments:
