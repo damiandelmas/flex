@@ -76,6 +76,13 @@ class PresetLoader:
             results = []
             for query in preset['queries']:
                 sql = self._interpolate(query['sql'], params)
+                sql = self._materialize_vec_ops(db, sql)
+                if sql.startswith('{"error"'):
+                    results.append({
+                        'query': query['name'],
+                        'error': sql
+                    })
+                    continue
                 try:
                     rows = db.execute(sql).fetchall()
                     results.append({
@@ -90,8 +97,22 @@ class PresetLoader:
             return results
         else:
             sql = self._interpolate(preset['queries'][0]['sql'], params)
+            sql = self._materialize_vec_ops(db, sql)
+            if sql.startswith('{"error"'):
+                return [{"error": sql}]
             rows = db.execute(sql).fetchall()
             return [dict(r) for r in rows]
+
+    @staticmethod
+    def _materialize_vec_ops(db: sqlite3.Connection, sql: str) -> str:
+        """Materialize vec_ops() calls in SQL if present."""
+        if 'vec_ops(' not in sql:
+            return sql
+        try:
+            from flex.retrieve.vec_ops import materialize_vec_ops
+            return materialize_vec_ops(db, sql)
+        except ImportError:
+            return sql
 
     @staticmethod
     def _parse(text: str, name: str) -> dict:
