@@ -12,6 +12,7 @@ UNION ALL
 SELECT 'sources', COUNT(*) FROM _raw_sources;
 
 -- @query: schema
+-- Internal tables. Query VIEWS (messages, sessions) instead — they compose these into a clean surface.
 SELECT name,
     CASE
         WHEN name LIKE '_raw_%' THEN 'raw (immutable, COMPILE)'
@@ -36,15 +37,21 @@ GROUP BY m.name
 ORDER BY m.name;
 
 -- @query: hints
--- Key patterns for querying this cell. vec_ops returns (id, score) — id maps to chunk_id.
-SELECT 'vec_ops → messages' as pattern,
-    'FROM vec_ops(''_raw_chunks'', ''your query'') v JOIN messages m ON v.id = m.id' as sql
+-- Key patterns for querying this cell. Query VIEWS (messages, sessions), not raw _ tables.
+SELECT 'query surface' as pattern,
+    'Use messages and sessions views. Tables starting with _ are internal.' as sql
+UNION ALL
+SELECT 'vec_ops → messages',
+    'FROM vec_ops(''_raw_chunks'', ''your query'') v JOIN messages m ON v.id = m.id'
 UNION ALL
 SELECT 'filter by session',
     'WHERE m.session_id = ''d332a1a0-...'' OR WHERE m.session_id LIKE ''d332a1a0%'''
 UNION ALL
-SELECT 'filter user prompts only (vec_ops pre-filter)',
-    'vec_ops(''_raw_chunks'', ''query'', ''diverse'', ''SELECT chunk_id FROM _types_message WHERE type = ''''user_prompt'''''')'
+SELECT 'vec_ops pre-filter (user prompts only)',
+    'vec_ops(''_raw_chunks'', ''query'', ''diverse'', ''SELECT id FROM messages WHERE type = ''''user_prompt'''''')'
+UNION ALL
+SELECT 'file dedup (SOMA)',
+    'GROUP BY COALESCE(json_extract(m.file_uuids, ''$[0]''), m.target_file)'
 UNION ALL
 SELECT 'session drill-down',
     '@session session=d332a1a0 OR @story session=d332a1a0';

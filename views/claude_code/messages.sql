@@ -3,6 +3,7 @@
 -- id: unique per message. Format: {session_id}_{line_num}. vec_ops JOIN: JOIN messages m ON v.id = m.id
 -- session_id: the Claude Code session UUID. Same as sessions.session_id.
 -- child_session_id: non-NULL on Task chunks — follow to sessions for the spawned agent.
+-- file_uuids: JSON array of SOMA file UUIDs. COALESCE(json_extract(file_uuids, '$[0]'), target_file) for rename-safe dedup.
 
 DROP VIEW IF EXISTS messages;
 CREATE VIEW messages AS
@@ -22,10 +23,12 @@ SELECT
     t.cwd,
     tp.type,
     d.child_session_id,
-    d.agent_type
+    d.agent_type,
+    fi.file_uuids
 FROM _raw_chunks r
 LEFT JOIN _edges_source s ON r.id = s.chunk_id
 LEFT JOIN _raw_sources src ON s.source_id = src.source_id
 LEFT JOIN _edges_tool_ops t ON r.id = t.chunk_id
 LEFT JOIN _types_message tp ON r.id = tp.chunk_id
-LEFT JOIN (SELECT chunk_id, child_session_id, agent_type FROM _edges_delegations GROUP BY chunk_id) d ON r.id = d.chunk_id;
+LEFT JOIN (SELECT chunk_id, child_session_id, agent_type FROM _edges_delegations GROUP BY chunk_id) d ON r.id = d.chunk_id
+LEFT JOIN (SELECT chunk_id, json_group_array(file_uuid) AS file_uuids FROM _edges_file_identity GROUP BY chunk_id) fi ON r.id = fi.chunk_id;
