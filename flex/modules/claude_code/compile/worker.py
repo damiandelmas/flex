@@ -68,6 +68,34 @@ except ImportError:
 QUEUE_DB = FLEX_HOME / "queue.db"
 CLAUDE_PROJECTS = Path.home() / ".claude/projects"
 
+# Session index cache: {project_dir_str: {session_id: {"summary": ..., "firstPrompt": ...}}}
+_index_cache: dict[str, dict] = {}
+
+
+def _load_session_index(project_dir: Path) -> dict:
+    """Load sessions-index.json from a Claude project directory. Cached."""
+    key = str(project_dir)
+    if key in _index_cache:
+        return _index_cache[key]
+
+    index_path = project_dir / "sessions-index.json"
+    result = {}
+    try:
+        with open(index_path, 'r') as f:
+            data = json.load(f)
+        for entry in data.get('entries', []):
+            sid = entry.get('sessionId')
+            if sid:
+                result[sid] = {
+                    'summary': entry.get('summary'),
+                    'firstPrompt': entry.get('firstPrompt'),
+                }
+    except Exception:
+        pass
+
+    _index_cache[key] = result
+    return result
+
 # Tool input key → target_file extraction
 _TARGET_FILE_KEYS = {
     'Read': 'file_path', 'Write': 'file_path', 'Edit': 'file_path',
@@ -112,11 +140,17 @@ def _git_root(cwd: str) -> str | None:
     return _git_root_from_path(cwd)
 
 
-def ensure_source_exists(conn: sqlite3.Connection, session_id: str, cwd: str = None):
+def ensure_source_exists(conn: sqlite3.Connection, session_id: str, cwd: str = None, title: str = None):
     """Ensure a source (session) exists in _raw_sources."""
     cur = conn.cursor()
     cur.execute("SELECT source_id FROM _raw_sources WHERE source_id = ?", (session_id,))
     if cur.fetchone():
+        # If title provided and row exists, update if title is still NULL or bad
+        if title:
+            cur.execute("""
+                UPDATE _raw_sources SET title = ?
+                WHERE source_id = ? AND (title IS NULL OR title LIKE 'Read %' OR title LIKE 'Warmup%')
+            """, (title, session_id))
         return
 
     git_root = _git_root(cwd)
@@ -124,9 +158,9 @@ def ensure_source_exists(conn: sqlite3.Connection, session_id: str, cwd: str = N
 
     cur.execute("""
         INSERT INTO _raw_sources
-        (source_id, source, project, git_root, start_time, primary_cwd, message_count, episode_count)
-        VALUES (?, ?, ?, ?, NULL, ?, 0, 0)
-    """, (session_id, f"claude_code:{session_id}", project, git_root, cwd))
+        (source_id, source, project, git_root, start_time, primary_cwd, message_count, episode_count, title)
+        VALUES (?, ?, ?, ?, NULL, ?, 0, 0, ?)
+    """, (session_id, f"claude_code:{session_id}", project, git_root, cwd, title))
 
 
 def update_source_stats(conn: sqlite3.Connection, session_id: str, chunk: dict):
@@ -151,13 +185,18 @@ def update_source_stats(conn: sqlite3.Connection, session_id: str, chunk: dict):
         WHERE source_id = ?
     """, (ts, ts, ts, ts, ts, ts, session_id))
 
-    # Set title from first meaningful content (only if title is NULL)
-    if chunk.get('content') and chunk.get('tool_name') != 'Read':
-        cur.execute("""
-            UPDATE _raw_sources
-            SET title = ?
-            WHERE source_id = ? AND title IS NULL
-        """, (chunk['content'][:200], session_id))
+    # Set title from first user prompt (only if title is still NULL)
+    if chunk.get('type') == 'user_prompt':
+        content = chunk.get('content', '')
+        if content:
+            # Strip XML tags (system-reminder, local-command-caveat, command-name/message)
+            clean = re.sub(r'<[^>]+>.*?</[^>]+>', '', content, flags=re.DOTALL).strip()
+            if clean:
+                cur.execute("""
+                    UPDATE _raw_sources
+                    SET title = ?
+                    WHERE source_id = ? AND title IS NULL
+                """, (clean[:250], session_id))
 
 
 def _ensure_core_tables(conn: sqlite3.Connection):
@@ -396,8 +435,13 @@ def sync_session_messages(session_id: str, conn: sqlite3.Connection) -> int:
     if not jsonl_path or not jsonl_path.exists():
         return 0
 
+    # Load session title from sessions-index.json (matches VS Code sidebar)
+    index = _load_session_index(jsonl_path.parent)
+    index_entry = index.get(session_id, {})
+    title = index_entry.get('summary') or None
+
     # Ensure source row exists
-    ensure_source_exists(conn, session_id)
+    ensure_source_exists(conn, session_id, title=title)
 
     cur = conn.cursor()
 
@@ -474,6 +518,16 @@ def sync_session_messages(session_id: str, conn: sqlite3.Connection) -> int:
             # Still store snapshot JSON in _raw_content for provenance
             if snapshot and isinstance(snapshot, dict):
                 _store_content_raw(conn, chunk_id, json.dumps(snapshot), '_file_snapshot', ts_int)
+            continue
+
+        # --- custom-title from /rename → override title ---
+        if entry_type == 'custom-title':
+            custom_title = entry.get('customTitle')
+            if custom_title:
+                cur.execute("""
+                    UPDATE _raw_sources SET title = ?
+                    WHERE source_id = ?
+                """, (custom_title[:250], session_id))
             continue
 
         # --- progress / system → skip ---

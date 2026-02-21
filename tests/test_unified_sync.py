@@ -47,7 +47,8 @@ def _make_cell(tmp_path):
             source_id TEXT PRIMARY KEY, source TEXT, project TEXT,
             git_root TEXT, start_time INTEGER, primary_cwd TEXT,
             message_count INTEGER DEFAULT 0, episode_count INTEGER DEFAULT 0,
-            end_time INTEGER, title TEXT, embedding BLOB
+            end_time INTEGER, duration_minutes INTEGER,
+            title TEXT, embedding BLOB
         );
         CREATE TABLE _edges_source (
             chunk_id TEXT NOT NULL, source_id TEXT NOT NULL,
