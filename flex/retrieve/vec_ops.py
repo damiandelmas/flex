@@ -587,8 +587,8 @@ def materialize_vec_ops(db, sql: str) -> str:
         if not row or not row[0]:
             return sql
         results = json.loads(row[0])
-    except Exception:
-        return sql  # let original SQL fail naturally
+    except Exception as e:
+        return json.dumps({"error": f"vec_ops execution failed: {e}"})
 
     # Handle error JSON from vec_ops — surface it directly
     if not isinstance(results, list):
@@ -638,6 +638,12 @@ def register_vec_ops(conn, caches: dict, embed_fn, cell_config: dict = None):
         if len(args) < 2:
             return json.dumps({"error": "vec_ops requires at least 2 args: table, query_text"})
 
+        try:
+            return _vec_ops_inner(*args)
+        except Exception as e:
+            return json.dumps({"error": f"vec_ops failed: {e}"})
+
+    def _vec_ops_inner(*args):
         table = args[0]
         query_text = args[1]
         modifier_str = args[2] if len(args) > 2 else None

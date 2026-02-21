@@ -940,6 +940,20 @@ class TestMaterializeVecOps:
         result = materialize_vec_ops(mat_db, sql)
         assert result == sql
 
+    def test_vec_ops_fn_exception_surfaces_error(self):
+        """If vec_ops_fn raises (not returns error dict), error surfaces, not 'no such table'."""
+        from flex.retrieve.vec_ops import materialize_vec_ops
+        conn = sqlite3.connect(':memory:')
+        conn.row_factory = sqlite3.Row
+        # Register a vec_ops that raises instead of returning error JSON
+        def bad_vec_ops(*args):
+            raise RuntimeError("embedding model crashed")
+        conn.create_function("vec_ops", -1, bad_vec_ops)
+        sql = "SELECT v.id FROM vec_ops('_raw_chunks', 'test') v LIMIT 3"
+        result = materialize_vec_ops(conn, sql)
+        assert '"error"' in result
+        assert 'no such table' not in result
+
 
 # =============================================================================
 # Helpers

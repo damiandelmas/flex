@@ -47,7 +47,7 @@ SELECT 'filter user prompts only (vec_ops pre-filter)',
     'vec_ops(''_raw_chunks'', ''query'', ''diverse'', ''SELECT chunk_id FROM _types_message WHERE type = ''''user_prompt'''''')'
 UNION ALL
 SELECT 'session drill-down',
-    '@session session=d332a1a0 OR @doc-chunks source_id=d332a1a0';
+    '@session session=d332a1a0 OR @story session=d332a1a0';
 
 -- @query: hubs
 SELECT g.source_id AS session_id,
