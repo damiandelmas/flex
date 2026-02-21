@@ -37,6 +37,7 @@ CREATE TABLE IF NOT EXISTS cells (
 _MIGRATIONS = [
     "ALTER TABLE cells ADD COLUMN id TEXT",
     "ALTER TABLE cells ADD COLUMN corpus_path TEXT",
+    "ALTER TABLE cells ADD COLUMN unlisted INTEGER DEFAULT 0",
 ]
 
 
@@ -195,7 +196,8 @@ def list_cells() -> list[dict]:
         db = _open_registry()
         rows = db.execute(
             "SELECT id, name, path, corpus_path, cell_type, description, "
-            "created_at, updated_at FROM cells ORDER BY name"
+            "created_at, updated_at, COALESCE(unlisted, 0) as unlisted "
+            "FROM cells ORDER BY name"
         ).fetchall()
         db.close()
         return [dict(r) for r in rows]
@@ -204,14 +206,16 @@ def list_cells() -> list[dict]:
 
 
 def discover_cells() -> list[str]:
-    """Unified discovery: registry cells + filesystem scan for unregistered.
+    """Discover listed cells from registry.
 
-    Returns sorted list of cell names. Merges both sources.
+    Returns sorted list of cell names. Skips unlisted cells.
     """
     names = set()
 
-    # From registry
+    # From registry (skip unlisted)
     for cell in list_cells():
+        if cell.get('unlisted'):
+            continue
         p = Path(cell['path'])
         if p.exists():
             names.add(cell['name'])
