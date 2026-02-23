@@ -321,7 +321,22 @@ def main():
     rebuild_fingerprints(db)
     rebuild_repo_project(db)
 
-    print("Regenerating views...")
+    # Install curated views + presets before regenerating auto-generated views.
+    # Ensures schema changes in .sql source files are always applied — whether
+    # this script is run directly or via `flex sync --full`.
+    from pathlib import Path
+    from flex.views import install_views
+    from flex.utils.install_presets import install_cell as install_presets_cell
+
+    view_dir = Path(__file__).resolve().parent.parent.parent / 'views' / 'claude_code'
+    if view_dir.exists():
+        print("Installing curated views...")
+        install_views(db, view_dir)
+
+    print("Installing presets...")
+    install_presets_cell('claude_code')
+
+    print("Regenerating auto-generated views...")
     regenerate_views(db, views={'messages': 'chunk', 'sessions': 'source'})
 
     # Final stats
