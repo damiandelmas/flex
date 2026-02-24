@@ -10,7 +10,7 @@ Run with: pytest tests/test_schema_contract.py -v
 import sqlite3
 import struct
 
-EMBED_DIM = 768
+EMBED_DIM = 128
 
 
 # =============================================================================

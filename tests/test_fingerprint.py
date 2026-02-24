@@ -19,7 +19,7 @@ import pytest
 FLEX_ROOT = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(FLEX_ROOT))
 
-EMBED_DIM = 768
+EMBED_DIM = 128
 
 from flex.modules.claude_code.manage.fingerprint import (
     HDBSCAN_MIN_CHUNKS,

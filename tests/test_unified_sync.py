@@ -25,7 +25,7 @@ def _can_import():
 
 pytestmark = pytest.mark.skipif(not _can_import(), reason="flex not importable")
 
-EMBED_DIM = 768
+EMBED_DIM = 128
 
 
 # ─────────────────────────────────────────────────────────────────────────────

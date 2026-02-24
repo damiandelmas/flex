@@ -32,7 +32,7 @@ pytestmark = pytest.mark.skipif(
 # Fixtures
 # =============================================================================
 
-EMBED_DIM = 768
+EMBED_DIM = 128
 
 def _make_vec(values, dim=EMBED_DIM):
     """Create a float32 vector of given dimension, padded with zeros."""

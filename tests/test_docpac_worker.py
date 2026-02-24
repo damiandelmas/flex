@@ -23,7 +23,7 @@ except ImportError:
 
 pytestmark = pytest.mark.skipif(not HAS_WORKER, reason="docpac worker not importable")
 
-EMBED_DIM = 768
+EMBED_DIM = 128
 
 
 # ---------------------------------------------------------------------------

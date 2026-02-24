@@ -196,7 +196,7 @@ CREATE INDEX IF NOT EXISTS idx_eui_uuid ON _edges_url_identity(url_uuid);
 """
 
 
-EMBED_DIM = 768
+EMBED_DIM = 128
 
 def _make_embedding(dim=EMBED_DIM):
     """Create a fake float32 embedding BLOB."""

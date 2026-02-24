@@ -26,7 +26,7 @@ pytestmark = pytest.mark.skipif(
     reason="flex.manage.meditate not yet implemented"
 )
 
-EMBED_DIM = 768
+EMBED_DIM = 128
 
 
 # =============================================================================
