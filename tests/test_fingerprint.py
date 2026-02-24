@@ -521,7 +521,7 @@ class TestSessionsViewColumns:
         assert 'topic_summary' not in content
 
     def test_orient_sql_uses_substr_fingerprint(self):
-        sql_path = FLEX_ROOT / 'flex' / 'modules' / 'claude_code' / 'library' / 'presets' / 'orient.sql'
+        sql_path = FLEX_ROOT / 'flex' / 'modules' / 'claude_code' / 'stock' / 'presets' / 'orient.sql'
         content = sql_path.read_text()
         assert 'substr(ess.fingerprint_index' in content
         assert 'topic_summary' not in content

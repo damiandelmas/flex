@@ -569,10 +569,10 @@ def cmd_search(args):
 
 # Map cell_type/name → module library/views/ path (stock views ship with module)
 _MODULE_VIEWS = {
-    'claude-code':  PKG_ROOT / 'modules' / 'claude_code' / 'library' / 'views',
-    'claude_code':  PKG_ROOT / 'modules' / 'claude_code' / 'library' / 'views',
-    'claude_chat':  PKG_ROOT / 'modules' / 'claude_chat' / 'library' / 'views',
-    'docpac':       PKG_ROOT / 'modules' / 'docpac'      / 'library' / 'views',
+    'claude-code':  PKG_ROOT / 'modules' / 'claude_code' / 'stock' / 'views',
+    'claude_code':  PKG_ROOT / 'modules' / 'claude_code' / 'stock' / 'views',
+    'claude_chat':  PKG_ROOT / 'modules' / 'claude_chat' / 'stock' / 'views',
+    'docpac':       PKG_ROOT / 'modules' / 'docpac'      / 'stock' / 'views',
 }
 # User-owned view subdirectory names (relative to ~/.flex/views/)
 _USER_VIEW_DIRS = {

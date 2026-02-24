@@ -542,7 +542,7 @@ def main():
     # User library takes precedence; stock library ships with module
     view_dir = Path.home() / '.flex' / 'views' / 'claude_code'
     if not view_dir.exists():
-        view_dir = Path(__file__).resolve().parent.parent / 'library' / 'views'
+        view_dir = Path(__file__).resolve().parent.parent / 'stock' / 'views'
     if view_dir.exists():
         print("Installing curated views...")
         install_views(db, view_dir)
