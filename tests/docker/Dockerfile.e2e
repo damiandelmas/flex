@@ -16,8 +16,10 @@ FROM ubuntu:24.04
 # ── System deps ──────────────────────────────────────────────────────────────
 RUN apt-get update && apt-get install -y --no-install-recommends \
     python3.12 \
+    python3.12-dev \
     python3.12-venv \
     python3-pip \
+    build-essential \
     git \
     && rm -rf /var/lib/apt/lists/*
 
@@ -27,7 +29,6 @@ WORKDIR /flex
 # ── Install package (editable from local source, no venv) ─────────────────────
 COPY pyproject.toml ./
 COPY flex/ ./flex/
-COPY views/ ./views/
 
 RUN pip3 install --break-system-packages -e ".[mcp,cluster]"
 
