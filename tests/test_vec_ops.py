@@ -320,7 +320,7 @@ class TestGetVector:
 
 class TestDimensionValidation:
     def test_wrong_dimension_raises(self, cache):
-        wrong = np.random.randn(128).astype(np.float32)
+        wrong = np.random.randn(384).astype(np.float32)  # 384d != 128d
         with pytest.raises(ValueError, match="dimension"):
             cache.search(wrong)
 
