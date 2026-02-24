@@ -5,8 +5,8 @@ Infrastructure utility — not a domain operation. Bakes filesystem presets
 (the authoring format) into cell databases (the runtime source).
 
 Usage:
-    python -m flex.utils.install_presets           # all cells
-    python -m flex.utils.install_presets claude_code  # specific cell
+    python -m flex.manage.install_presets           # all cells
+    python -m flex.manage.install_presets claude_code  # specific cell
 """
 import sqlite3
 import sys

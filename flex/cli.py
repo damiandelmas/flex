@@ -187,7 +187,7 @@ def _run_enrichment(conn):
         from flex.modules.claude_code.manage.enrich_summary import run as run_fingerprints
         from flex.modules.claude_code.manage.enrich_repo_project import run as run_repo_project
         from flex.views import regenerate_views, install_views
-        from flex.utils.install_presets import install_cell as install_presets_cell
+        from flex.manage.install_presets import install_cell as install_presets_cell
     except ImportError as e:
         print(f"  [skip] enrichment unavailable: {e}")
         return
@@ -592,7 +592,7 @@ def cmd_sync(args):
 
     from flex.registry import list_cells, resolve_cell
     from flex.views import regenerate_views, install_views
-    from flex.utils.install_presets import install_cell as install_presets_cell
+    from flex.manage.install_presets import install_cell as install_presets_cell
 
     cells = list_cells()
     if not cells:
