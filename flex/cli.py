@@ -118,8 +118,6 @@ def _patch_settings_json():
 def _install_systemd():
     """Generate and install systemd user units. Returns True if installed."""
     if sys.platform != "linux":
-        print("  [skip] systemd not available (not Linux)")
-        print("         macOS launchd support coming in v0.1")
         return False
 
     # Check systemctl is available and functional before writing unit files
@@ -132,8 +130,6 @@ def _install_systemd():
         if result.returncode > 3:
             raise subprocess.CalledProcessError(result.returncode, "systemctl")
     except (FileNotFoundError, subprocess.TimeoutExpired, subprocess.CalledProcessError):
-        print("  [skip] systemd not available (container or non-systemd Linux)")
-        print("         Start worker manually: python -m flex.modules.claude_code.compile.worker --daemon")
         return False
 
     SYSTEMD_DIR.mkdir(parents=True, exist_ok=True)
@@ -263,146 +259,248 @@ def _run_enrichment(conn):
     print(f"  [ok] enrichment done in {_time.time()-t0:.0f}s")
 
 
+def _run_enrichment_quiet(conn) -> tuple[int, list[str]]:
+    """Run enrichment silently. Returns (cluster_count, failed_step_names)."""
+    import io
+    import contextlib
+
+    try:
+        from flex.modules.claude_code.manage.rebuild_all import (
+            rebuild_warmup_types, reembed_sources, rebuild_source_graph,
+        )
+        from flex.modules.claude_code.manage.enrich_summary import run as run_fingerprints
+        from flex.modules.claude_code.manage.enrich_soma_repos import run as _register_soma_repos
+        from flex.modules.claude_code.manage.enrich_repo_project import run as run_repo_project
+        from flex.views import regenerate_views, install_views
+        from flex.manage.install_presets import install_cell as install_presets_cell
+    except ImportError:
+        return 0, []
+
+    failures: list[str] = []
+    buf = io.StringIO()
+    with contextlib.redirect_stdout(buf), contextlib.redirect_stderr(buf):
+        for step, fn in [
+            ("warmup types",     lambda: rebuild_warmup_types(conn)),
+            ("source pooling",   lambda: reembed_sources(conn)),
+            ("source graph",     lambda: rebuild_source_graph(conn)),
+            ("fingerprints",     lambda: run_fingerprints(conn)),
+            ("repo registry",    lambda: _register_soma_repos(conn)),
+            ("repo attribution", lambda: run_repo_project(conn)),
+        ]:
+            try:
+                fn()
+            except Exception:
+                failures.append(step)
+
+        try:
+            install_presets_cell('claude_code')
+        except Exception:
+            failures.append("presets")
+
+        try:
+            view_dir = _find_view_dir('claude_code', 'claude-code')
+            if view_dir:
+                install_views(conn, view_dir)
+            regenerate_views(conn)
+            conn.commit()
+        except Exception:
+            failures.append("views")
+
+    try:
+        row = conn.execute(
+            "SELECT COUNT(DISTINCT community_id) FROM _enrich_source_graph"
+            " WHERE community_id IS NOT NULL"
+        ).fetchone()
+        return (row[0] if row else 0), failures
+    except Exception:
+        return 0, failures
+
+
 def cmd_init(args):
     """Wire hooks, daemon, and MCP for Claude Code capture."""
-    print("flex init")
-    print()
+    import io
+    import contextlib
+    from rich.console import Console
+    from rich.progress import (
+        Progress, TextColumn, BarColumn, TimeElapsedColumn, SpinnerColumn,
+    )
+    from rich.panel import Panel
+    from rich.text import Text
+    import sqlite3 as _sqlite3
 
-    # 1. Create ~/.flex/
+    console = Console()
+
+    console.print()
+    console.print("  [bold]Setting up flex...[/bold]")
+    console.print()
+
+    # 1. Storage
     FLEX_HOME.mkdir(parents=True, exist_ok=True)
     (FLEX_HOME / "cells").mkdir(exist_ok=True)
-    print("  [ok] ~/.flex/ created")
 
-    # 1b. Initialize SOMA identity (~/.soma/)
-    try:
-        from flex.modules.soma.lib.identity.file_identity import FileIdentity
-        from flex.modules.soma.lib.identity.repo_identity import RepoIdentity
-        from flex.modules.soma.lib.identity.url_identity import URLIdentity
-        from flex.modules.soma.lib.identity.content_identity import ContentIdentity
-        FileIdentity()
-        RepoIdentity()
-        URLIdentity()
-        ContentIdentity()
-        print("  [ok] ~/.soma/ ready (file, repo, url, content identity)")
-        from flex.modules.soma.lib.eternity.eternity import Eternity
-        Eternity()  # creates ~/.soma/backups/
-        print("  [ok] eternity ready (backup, git versioning, cloud sync)")
-    except ImportError:
-        print("  [warn] soma identity unavailable — file tracking disabled")
+    # Generate machine_id once — stable UUID for relay subdomain
+    import uuid as _uuid
+    machine_id_path = FLEX_HOME / "machine_id"
+    if not machine_id_path.exists():
+        machine_id_path.write_text(_uuid.uuid4().hex[:8])
+    machine_id = machine_id_path.read_text().strip()
 
-    # 2. Install model (copy from bundled package, or download from GitHub)
+    buf = io.StringIO()
+    with contextlib.redirect_stdout(buf), contextlib.redirect_stderr(buf):
+        try:
+            from flex.modules.soma.lib.identity.file_identity import FileIdentity
+            from flex.modules.soma.lib.identity.repo_identity import RepoIdentity
+            from flex.modules.soma.lib.identity.url_identity import URLIdentity
+            from flex.modules.soma.lib.identity.content_identity import ContentIdentity
+            FileIdentity(); RepoIdentity(); URLIdentity(); ContentIdentity()
+            from flex.modules.soma.lib.eternity.eternity import Eternity
+            Eternity()
+        except ImportError:
+            pass
+
+    console.print("  [dim]storage[/dim]             [green]ok[/green]")
+
+    # 2. Model
     from flex.onnx.fetch import download_model, model_ready
-    if model_ready():
-        print("  [ok] model ready")
-    else:
-        print("  Installing embedding model...")
+    if not model_ready():
+        console.print("  [dim]model[/dim]               [yellow]downloading...[/yellow]")
         try:
             download_model()
-            print("  [ok] model installed")
         except RuntimeError as e:
-            print(f"  [FAIL] {e}")
-            print("  Continuing without model — backfill will be skipped.")
-            print()
-            # Fall through to hooks/services without backfill
-            _install_hooks()
-            print("  [ok] hooks installed")
-            _patch_settings_json()
-            print("  [ok] settings.json patched")
-            if _install_systemd():
-                print("  [ok] services started")
-            _patch_claude_json()
-            print()
-            print("Done (partial — model download failed).")
+            console.print(f"  [red]model download failed: {e}[/red]")
             return
+    console.print("  [dim]model[/dim]               [green]ok[/green]")
 
-    # 3. Install hooks
-    installed = _install_hooks()
-    print(f"  [ok] hooks installed: {', '.join(installed)}")
-
-    # 4. Patch settings.json
+    # 3. Hooks + settings
+    _install_hooks()
     _patch_settings_json()
-    print("  [ok] ~/.claude/settings.json patched")
+    console.print("  [dim]capture[/dim]             [green]ok[/green]")
+    console.print()
 
-    # 5. Detect sessions + bootstrap cell
+    # 4. Sessions
     from flex.modules.claude_code.compile.worker import (
         bootstrap_claude_code_cell, initial_backfill, CLAUDE_PROJECTS,
     )
-    import sqlite3
 
     jsonls = list(CLAUDE_PROJECTS.rglob("*.jsonl"))
-    if jsonls:
-        print(f"  Found {len(jsonls)} Claude Code sessions.")
-        cell_path = bootstrap_claude_code_cell()
-        print(f"  [ok] cell ready ({cell_path.name})")
+    _enrich_failures: list[str] = []
 
-        # 6. Backfill
-        conn = sqlite3.connect(str(cell_path), timeout=30.0)
+    if not jsonls:
+        console.print("  [dim]No Claude Code sessions found.[/dim]")
+        console.print("  [dim]Sessions index automatically as you use Claude Code.[/dim]")
+        console.print()
+    else:
+        console.print(f"  Indexing [bold]{len(jsonls):,}[/bold] sessions")
+        console.print()
+
+        cell_path = bootstrap_claude_code_cell()
+        conn = _sqlite3.connect(str(cell_path), timeout=30.0)
         conn.execute("PRAGMA journal_mode=WAL")
         conn.execute("PRAGMA synchronous=NORMAL")
         conn.execute("PRAGMA busy_timeout=30000")
 
-        # Live progress display — background thread repaints every 250ms so
-        # the elapsed counter and spinner keep moving during slow embeds.
-        import threading
+        # Install enrichment stubs — ensures tables exist even if enrichment fails
+        for ddl in _ENRICHMENT_STUBS.get('claude-code', []):
+            conn.execute(ddl)
+        conn.commit()
 
-        _state = {"i": 0, "sessions": 0, "chunks": 0, "done": False}
-        _t0 = time.time()
-        _spinner = "|/-\\"
+        # Seed from existing cell for resume display
+        _already = conn.execute("SELECT COUNT(*) FROM _raw_sources").fetchone()[0]
+        _existing_chunks = conn.execute("SELECT COUNT(*) FROM _raw_chunks").fetchone()[0]
+        _already_embedded = conn.execute(
+            "SELECT COUNT(*) FROM _raw_chunks WHERE embedding IS NOT NULL"
+        ).fetchone()[0]
+        _phase = {"sessions": _already, "chunks": _existing_chunks}
 
-        def _ticker():
-            tick = 0
-            while not _state["done"]:
-                elapsed = time.time() - _t0
-                i, total_ = _state["i"], len(jsonls)
-                pct = i / total_ * 100 if total_ else 0
-                spin = _spinner[tick % 4]
-                sys.stdout.write(
-                    f"\r  {spin} {i}/{total_} ({pct:.0f}%)  "
-                    f"{_state['sessions']:,} sessions  "
-                    f"{_state['chunks']:,} chunks  "
-                    f"{elapsed:.0f}s      "
-                )
-                sys.stdout.flush()
-                tick += 1
-                time.sleep(0.25)
+        with Progress(
+            TextColumn("  [dim]{task.description:<20}[/dim]"),
+            SpinnerColumn(spinner_name="dots", finished_text="[green]✓[/green]"),
+            BarColumn(bar_width=20, complete_style="green", finished_style="green"),
+            TextColumn("[dim]{task.fields[info]}[/dim]"),
+            TimeElapsedColumn(),
+            console=console,
+            transient=False,
+        ) as progress:
+            t_read  = progress.add_task("Scanning sessions", total=len(jsonls), info="",
+                                        completed=_already)
+            t_index = progress.add_task("Building vectors",  total=None,        info="", visible=False)
+            t_graph = progress.add_task("Building graph",    total=None,        info="", visible=False)
 
-        _thread = threading.Thread(target=_ticker, daemon=True)
-        _thread.start()
+            def _progress(i, total, sessions, chunks, elapsed):
+                progress.update(t_read, completed=_already + i,
+                                info=f"{sessions:,} sessions · {chunks:,} chunks")
+                _phase["sessions"] = sessions
+                _phase["chunks"]   = chunks
 
-        def _progress(i, total, sessions, chunks, elapsed):
-            _state["i"] = i
-            _state["sessions"] = sessions
-            _state["chunks"] = chunks
+            def _phase2(sessions, chunks, elapsed):
+                progress.update(t_read, completed=len(jsonls))
+                _phase["sessions"] = sessions
+                _phase["chunks"]   = chunks
+                progress.update(t_index, visible=True,
+                                completed=_already_embedded, total=_existing_chunks,
+                                info=f"{_already_embedded:,} / {_existing_chunks:,} chunks")
 
-        stats = initial_backfill(conn, progress_cb=_progress)
-        _state["done"] = True
-        _thread.join()
-        sys.stdout.write("\r" + " " * 72 + "\r")  # clear line
-        sys.stdout.flush()
-        print(
-            f"  [ok] indexed {stats['sessions']} sessions, "
-            f"{stats['chunks']:,} chunks in {stats['elapsed']:.0f}s"
+            def _embed_progress(done, total):
+                # done/total are relative to this run; offset by already-embedded for display
+                abs_done = _already_embedded + done
+                abs_total = _already_embedded + total
+                progress.update(t_index, completed=abs_done, total=abs_total,
+                                info=f"{abs_done:,} / {abs_total:,} chunks")
+
+            buf2 = io.StringIO()
+            with contextlib.redirect_stderr(buf2):
+                stats = initial_backfill(conn, progress_cb=_progress, phase2_cb=_phase2,
+                                         quiet_embed=True, embed_progress_cb=_embed_progress)
+
+            progress.update(t_index, completed=stats['chunks'], total=stats['chunks'])
+
+            # Graph + enrichment (spinner, fully silent)
+            progress.update(t_graph, visible=True, info="")
+            n_clusters, _enrich_failures = _run_enrichment_quiet(conn)
+            progress.update(t_graph, total=1, completed=1)
+
+        cluster_str = f" · {n_clusters} topic clusters" if n_clusters else ""
+        console.print()
+        console.print(
+            f"  [bold]{stats['sessions']:,} sessions[/bold] · "
+            f"[bold]{stats['chunks']:,} chunks[/bold]"
+            f"[dim]{cluster_str}[/dim]"
         )
-
-        # 7. Enrichment
-        _run_enrichment(conn)
+        console.print()
+        try:
+            from flex.core import log_op
+            log_op(conn, 'init_complete', 'claude_code', rows_affected=stats['chunks'])
+        except Exception:
+            pass
         conn.close()
+
+    # 5. Services
+    systemd_ok = _install_systemd()
+    if systemd_ok:
+        console.print("  [dim]worker[/dim]             [green]running[/green]")
+        console.print("  [dim]MCP[/dim]                [green]running[/green]")
     else:
-        print("  No Claude Code sessions found. Cell will be created on first use.")
+        console.print("  [dim]worker + MCP[/dim]       [yellow]run 'flex-serve' to start[/yellow]")
 
-    # 8. Install systemd services (AFTER cell exists)
-    if _install_systemd():
-        print("  [ok] flex-worker + flex-mcp services started")
+    # 6. Claude Code wiring (localhost — direct, no relay)
+    _patch_claude_json()
+    console.print()
 
-    # 9. Patch .claude.json
-    if _patch_claude_json():
-        print("  [ok] MCP server wired (localhost:8081)")
-    else:
-        print("  [ok] MCP server already wired")
+    # Final box
+    relay_url = f"https://{machine_id}.getflex.dev/sse"
+    panel_content = Text()
+    panel_content.append("Claude Code    ", style="dim")
+    panel_content.append("ready  ", style="bold green")
+    panel_content.append("(reopen to activate)\n", style="dim")
+    panel_content.append("MCP Server     ", style="dim")
+    panel_content.append(relay_url, style="bold cyan")
+    panel_content.append("  ← add in Settings → MCP", style="dim")
+    console.print(Panel(panel_content, padding=(0, 2)))
+    console.print()
 
-    print()
-    print("Done. Your sessions are searchable.")
-    print("Use 'flex search \"your query\"' or ask Claude directly.")
+    if _enrich_failures:
+        console.print(f"  [dim]enrichment warnings: {', '.join(_enrich_failures)} skipped[/dim]")
+        console.print()
 
 
 # ============================================================
@@ -614,6 +712,23 @@ _ENRICHMENT_STUBS = {
             source_id TEXT PRIMARY KEY, is_warmup_only INTEGER DEFAULT 0)""",
         """CREATE TABLE IF NOT EXISTS _enrich_session_summary (
             source_id TEXT PRIMARY KEY, fingerprint_index TEXT)""",
+        """CREATE TABLE IF NOT EXISTS _enrich_repo_identity (
+            repo_root TEXT PRIMARY KEY, repo_path TEXT, project TEXT, git_remote TEXT)""",
+        """CREATE TABLE IF NOT EXISTS _enrich_file_graph (
+            source_id TEXT PRIMARY KEY, file_community_id INTEGER, file_centrality REAL,
+            file_is_hub INTEGER DEFAULT 0, shared_file_count INTEGER)""",
+        """CREATE TABLE IF NOT EXISTS _enrich_delegation_graph (
+            source_id TEXT PRIMARY KEY, agents_spawned INTEGER,
+            is_orchestrator INTEGER DEFAULT 0, delegation_depth INTEGER,
+            parent_session TEXT)""",
+        """CREATE TABLE IF NOT EXISTS _ops (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            timestamp INTEGER DEFAULT (strftime('%s','now')),
+            operation TEXT, target TEXT, sql TEXT, params TEXT,
+            rows_affected INTEGER, source TEXT)""",
+        """CREATE TABLE IF NOT EXISTS _views (
+            name TEXT PRIMARY KEY, sql TEXT NOT NULL,
+            description TEXT, created_at INTEGER)""",
     ],
 }
 
