@@ -26,8 +26,8 @@ SYSTEMD_DIR = Path.home() / ".config" / "systemd" / "user"
 # Package data locations (relative to this file)
 PKG_ROOT = Path(__file__).parent
 CAPTURE_HOOKS_DIR = PKG_ROOT / "modules" / "claude_code" / "compile" / "hooks"
-DATA_HOOKS_DIR = PKG_ROOT / "data" / "hooks"
-SYSTEMD_TMPL_DIR = PKG_ROOT / "data" / "systemd"
+DOCPAC_HOOKS_DIR  = PKG_ROOT / "modules" / "docpac" / "compile" / "hooks"
+SYSTEMD_TMPL_DIR  = PKG_ROOT / "data" / "systemd"
 
 # PostToolUse matcher — all tool types that produce indexable events
 POST_TOOL_MATCHER = (
@@ -39,7 +39,7 @@ POST_TOOL_MATCHER = (
 HOOKS = {
     "PostToolUse": [
         {"src": CAPTURE_HOOKS_DIR / "claude-code-capture.sh", "name": "claude-code-capture.sh"},
-        {"src": DATA_HOOKS_DIR / "flex-index.sh", "name": "flex-index.sh"},
+        {"src": DOCPAC_HOOKS_DIR / "flex-index.sh", "name": "flex-index.sh"},
     ],
     "UserPromptSubmit": [
         {"src": CAPTURE_HOOKS_DIR / "user-prompt-capture.sh", "name": "user-prompt-capture.sh"},
