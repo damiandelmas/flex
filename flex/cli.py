@@ -464,7 +464,8 @@ def _open_cell_for_search(cell_name: str):
             except Exception:
                 pass
             embed_query = lambda text: embedder.encode(text, prefix='search_query: ')
-            register_vec_ops(db, caches, embed_query, config)
+            embed_doc   = lambda text: embedder.encode(text, prefix='search_document: ')
+            register_vec_ops(db, caches, embed_query, config, embed_doc_fn=embed_doc)
     except ImportError:
         pass  # vec_ops won't work but plain SQL is fine
 
