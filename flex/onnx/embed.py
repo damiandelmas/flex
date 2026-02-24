@@ -74,24 +74,6 @@ def _safe_batch_size(seq_len: int) -> int:
     return max(1, min(max_bs, MAX_BATCH))
 
 
-def _resolve_model_path() -> Path:
-    """Bundled first, then $FLEX_HOME/models/ (FLEX_HOME-aware)."""
-    import os
-    bundled = ONNX_DIR / "model.onnx"
-    if bundled.exists():
-        return bundled
-    flex_home = Path(os.environ.get("FLEX_HOME", Path.home() / ".flex"))
-    user = flex_home / "models" / "model.onnx"
-    if user.exists():
-        return user
-    raise RuntimeError(
-        "Embedding model not found.\n"
-        f"  Checked: {bundled}\n"
-        f"  Checked: {user}\n"
-        "  Run 'flex init' to download it."
-    )
-
-
 def _get_onnxruntime():
     global _ort
     if _ort is None:
