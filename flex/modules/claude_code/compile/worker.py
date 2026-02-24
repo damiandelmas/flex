@@ -456,12 +456,16 @@ def insert_chunk_atom(conn: sqlite3.Connection, chunk: dict):
 
 
 
-def sync_session_messages(session_id: str, conn: sqlite3.Connection) -> int:
+def sync_session_messages(session_id: str, conn: sqlite3.Connection,
+                          skip_embed: bool = False) -> int:
     """Sync ALL chunk types from JSONL to chunk-atom tables.
 
     Single write path. One JSONL pass produces: text chunks, tool_call chunks,
     tool_ops edges, SOMA identity edges, delegations, soft_ops, thinking blocks,
     and file-history-snapshots. Content is stored without truncation.
+
+    Args:
+        skip_embed: If True, insert chunks with embedding=NULL (for batch embed pass).
     """
     jsonl_path = find_jsonl(session_id)
     if not jsonl_path or not jsonl_path.exists():
@@ -722,18 +726,28 @@ def sync_session_messages(session_id: str, conn: sqlite3.Connection) -> int:
     # --- Embed and insert chunks ---
     inserted = 0
     if new_chunks:
-        embedder = get_embedder()
-        texts = [c['content'] for c in new_chunks]
-        embeddings = encode(texts)
+        if skip_embed:
+            # Phase 1 of decoupled backfill: insert without embeddings
+            for chunk in new_chunks:
+                try:
+                    insert_chunk_atom(conn, chunk)
+                    update_source_stats(conn, chunk['doc_id'], chunk)
+                    inserted += 1
+                except Exception as e:
+                    print(f"[worker] Chunk insert error: {e}", file=sys.stderr)
+        else:
+            embedder = get_embedder()
+            texts = [c['content'] for c in new_chunks]
+            embeddings = encode(texts)
 
-        for chunk, emb in zip(new_chunks, embeddings):
-            try:
-                chunk['embedding'] = serialize_f32(emb)
-                insert_chunk_atom(conn, chunk)
-                update_source_stats(conn, chunk['doc_id'], chunk)
-                inserted += 1
-            except Exception as e:
-                print(f"[worker] Chunk insert error: {e}", file=sys.stderr)
+            for chunk, emb in zip(new_chunks, embeddings):
+                try:
+                    chunk['embedding'] = serialize_f32(emb)
+                    insert_chunk_atom(conn, chunk)
+                    update_source_stats(conn, chunk['doc_id'], chunk)
+                    inserted += 1
+                except Exception as e:
+                    print(f"[worker] Chunk insert error: {e}", file=sys.stderr)
 
     # --- Write tool_ops edges ---
     for chunk_id, tool_name, target_file, cwd, git_branch, success in tool_ops_items:
@@ -901,8 +915,52 @@ def bootstrap_claude_code_cell() -> Path:
     return db_path
 
 
+def _batch_embed_chunks(conn, batch_size: int = 500) -> int:
+    """Phase 2 of decoupled backfill: batch embed all NULL-embedding chunks.
+
+    SELECT content WHERE embedding IS NULL → encode(batch=500) → UPDATE.
+    Same pattern as reembed_nomic.py but uses the worker's embedder/encode.
+    Commits after each batch. Returns total embedded count.
+    """
+    embedder = get_embedder()
+    done = 0
+    t0 = time.time()
+
+    while True:
+        rows = conn.execute("""
+            SELECT id, content FROM _raw_chunks
+            WHERE embedding IS NULL AND content IS NOT NULL
+            ORDER BY id
+            LIMIT ?
+        """, (batch_size,)).fetchall()
+
+        if not rows:
+            break
+
+        texts = [r[1] for r in rows]
+        embeddings = encode(texts)
+
+        conn.executemany(
+            "UPDATE _raw_chunks SET embedding = ? WHERE id = ?",
+            [(serialize_f32(emb), r[0]) for emb, r in zip(embeddings, rows)]
+        )
+        conn.commit()
+        done += len(rows)
+
+    elapsed = time.time() - t0
+    if done > 0:
+        rate = done / elapsed if elapsed > 0 else 0
+        print(f"[worker] Batch embed: {done:,} chunks in {elapsed:.1f}s "
+              f"({rate:.0f} chunks/s)", file=sys.stderr)
+    return done
+
+
 def initial_backfill(conn, progress_cb=None) -> dict:
     """Backfill all sessions with per-session commits and progress.
+
+    Decoupled two-phase approach:
+      Phase 1 — parse all sessions, insert chunks with embedding=NULL (I/O bound)
+      Phase 2 — batch embed all NULL chunks in one pass (CPU bound, 258 chunks/s)
 
     Args:
         conn: Open SQLite connection to the cell.
@@ -917,10 +975,11 @@ def initial_backfill(conn, progress_cb=None) -> dict:
     chunks = 0
     t0 = time.time()
 
+    # Phase 1: parse all sessions without embedding
     for i, jsonl in enumerate(jsonls, 1):
         session_id = jsonl.stem
         try:
-            count = sync_session_messages(session_id, conn)
+            count = sync_session_messages(session_id, conn, skip_embed=True)
             conn.commit()
             if count > 0:
                 chunks += count
@@ -930,6 +989,11 @@ def initial_backfill(conn, progress_cb=None) -> dict:
 
         if progress_cb:
             progress_cb(i, total, sessions, chunks, time.time() - t0)
+
+    # Phase 2: batch embed all NULL-embedding chunks
+    print(f"[init] Phase 1 done: {sessions} sessions, {chunks} chunks. "
+          "Starting batch embed...", file=sys.stderr)
+    _batch_embed_chunks(conn)
 
     return {'sessions': sessions, 'chunks': chunks, 'elapsed': time.time() - t0}
 
