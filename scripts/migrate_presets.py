@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
-"""Moved to flex.utils.install_presets. This is a thin redirect."""
-from flex.utils.install_presets import install_all
+"""Thin redirect — install_presets lives at flex.manage.install_presets."""
+from flex.manage.install_presets import install_all
 
 if __name__ == "__main__":
     install_all()
