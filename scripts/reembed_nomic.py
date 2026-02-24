@@ -25,6 +25,7 @@ import time
 from pathlib import Path
 
 import numpy as np
+import psutil
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
@@ -32,6 +33,22 @@ from flex.registry import list_cells, resolve_cell
 
 TARGET_DIM = 128
 EMBED_BYTES = TARGET_DIM * 4  # float32
+
+
+def _throttle(max_cpu: int):
+    """Sleep until system CPU usage drops below max_cpu percent.
+
+    Samples at 0.5s intervals. A value of 70 means: if the machine is busier
+    than 70%, pause before the next batch. Effectively yields to the rest of
+    the system without stopping work entirely.
+    """
+    if max_cpu <= 0 or max_cpu >= 100:
+        return
+    while True:
+        usage = psutil.cpu_percent(interval=0.5)
+        if usage <= max_cpu:
+            break
+        time.sleep(0.5)
 
 
 def count_remaining(db: sqlite3.Connection, table: str, id_col: str) -> int:
@@ -58,7 +75,7 @@ def _fetch_stale_ids(db_path: str) -> list:
 
 def _worker_fn(args: tuple):
     """Worker process: embed a shard of chunk IDs."""
-    db_path, chunk_ids, batch_size, worker_id, num_workers = args
+    db_path, chunk_ids, batch_size, worker_id, num_workers, max_cpu = args
 
     # Each worker gets its own ONNX session
     # Limit threads per worker to avoid oversubscription
@@ -96,6 +113,7 @@ def _worker_fn(args: tuple):
              for emb, r in zip(embeddings, rows)]
         )
         db.commit()
+        _throttle(max_cpu)
 
         done += len(rows)
         elapsed = time.time() - t0
@@ -107,7 +125,7 @@ def _worker_fn(args: tuple):
     return done
 
 
-def reembed_chunks_parallel(db_path: str, num_workers: int, batch_size: int, cell_name: str):
+def reembed_chunks_parallel(db_path: str, num_workers: int, batch_size: int, cell_name: str, max_cpu: int = 0):
     """Re-embed chunks using multiple worker processes."""
     all_ids = _fetch_stale_ids(db_path)
     total = len(all_ids)
@@ -123,7 +141,7 @@ def reembed_chunks_parallel(db_path: str, num_workers: int, batch_size: int, cel
     shards = [all_ids[i:i + shard_size] for i in range(0, total, shard_size)]
 
     worker_args = [
-        (db_path, shard, batch_size, i, num_workers)
+        (db_path, shard, batch_size, i, num_workers, max_cpu)
         for i, shard in enumerate(shards)
     ]
 
@@ -137,7 +155,7 @@ def reembed_chunks_parallel(db_path: str, num_workers: int, batch_size: int, cel
           f"({done/elapsed:.0f} chunks/s)")
 
 
-def reembed_chunks(db: sqlite3.Connection, embedder, batch_size: int, cell_name: str):
+def reembed_chunks(db: sqlite3.Connection, embedder, batch_size: int, cell_name: str, max_cpu: int = 0):
     """Re-embed _raw_chunks incrementally (single-process). Commits after each batch."""
     total = count_remaining(db, '_raw_chunks', 'id')
     if total == 0:
@@ -169,6 +187,7 @@ def reembed_chunks(db: sqlite3.Connection, embedder, batch_size: int, cell_name:
              for emb, r in zip(embeddings, rows)]
         )
         db.commit()
+        _throttle(max_cpu)
 
         done += len(rows)
         elapsed = time.time() - t0
@@ -216,21 +235,21 @@ def reembed_sources(db: sqlite3.Connection, cell_name: str):
     print(f"  [{cell_name}] sources: pooled {pooled:,}")
 
 
-def reembed_cell(cell_name: str, cell_path: str, num_workers: int, batch_size: int):
+def reembed_cell(cell_name: str, cell_path: str, num_workers: int, batch_size: int, max_cpu: int = 0):
     """Re-embed a single cell (chunks + sources)."""
     print(f"\n{'='*60}")
     print(f"Cell: {cell_name} ({Path(cell_path).name})")
     print(f"{'='*60}")
 
     if num_workers > 1:
-        reembed_chunks_parallel(cell_path, num_workers, batch_size, cell_name)
+        reembed_chunks_parallel(cell_path, num_workers, batch_size, cell_name, max_cpu=max_cpu)
     else:
         from flex.onnx import get_model
         embedder = get_model()
         db = sqlite3.connect(cell_path, timeout=30)
         db.execute("PRAGMA journal_mode=WAL")
         db.execute("PRAGMA busy_timeout=30000")
-        reembed_chunks(db, embedder, batch_size, cell_name)
+        reembed_chunks(db, embedder, batch_size, cell_name, max_cpu=max_cpu)
         db.close()
 
     # Source re-pooling is fast — single process
@@ -251,12 +270,15 @@ def reembed_cell(cell_name: str, cell_path: str, num_workers: int, batch_size: i
 
 
 def main():
-    parser = argparse.ArgumentParser(description="Re-embed cells 384→768")
+    parser = argparse.ArgumentParser(description="Re-embed cells 384→128d (Nomic Matryoshka)")
     parser.add_argument('cell', nargs='?', help="Cell name (default: all)")
     parser.add_argument('--batch', type=int, default=500,
                         help="Batch size for chunk re-embed (default: 500)")
     parser.add_argument('--workers', '-w', type=int, default=1,
                         help="Parallel workers (default: 1, try 4 for ~4x speedup)")
+    parser.add_argument('--max-cpu', type=int, default=0, metavar='PCT',
+                        help="Throttle: pause between batches if system CPU%% exceeds this "
+                             "(0 = no throttle, e.g. 70 = yield when machine is busy)")
     args = parser.parse_args()
 
     if args.workers <= 1:
@@ -264,15 +286,16 @@ def main():
         from flex.onnx import get_model
         embedder = get_model()
         embedder.encode("warmup")
-        print(f"Embedder warm. Target: {TARGET_DIM}d. Batch: {args.batch}")
+        print(f"Embedder warm. Target: {TARGET_DIM}d. Batch: {args.batch}"
+              + (f". CPU cap: {args.max_cpu}%" if args.max_cpu else ""))
     else:
-        # Multi-process: each worker warms its own embedder
         print(f"Parallel mode: {args.workers} workers. "
-              f"Target: {TARGET_DIM}d. Batch: {args.batch}")
+              f"Target: {TARGET_DIM}d. Batch: {args.batch}"
+              + (f". CPU cap: {args.max_cpu}%" if args.max_cpu else ""))
 
     if args.cell:
         path = str(resolve_cell(args.cell))
-        reembed_cell(args.cell, path, args.workers, args.batch)
+        reembed_cell(args.cell, path, args.workers, args.batch, max_cpu=args.max_cpu)
     else:
         cells = list_cells()
         cells.sort(key=lambda c: {
@@ -280,7 +303,7 @@ def main():
         }.get(c.get('cell_type', ''), 9))
 
         for cell in cells:
-            reembed_cell(cell['name'], cell['path'], args.workers, args.batch)
+            reembed_cell(cell['name'], cell['path'], args.workers, args.batch, max_cpu=args.max_cpu)
 
     print("\nDone.")
 
