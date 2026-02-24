@@ -26,7 +26,7 @@ Or just ask Claude directly — the MCP server is wired automatically.
 ## How it works
 
 - **Hooks** capture every tool use and user prompt
-- **Worker daemon** indexes them into a local SQLite cell with 384-dim embeddings
+- **Worker daemon** indexes them into a local SQLite cell with 128-dim embeddings (Matryoshka-truncated from Nomic embed-text-v1.5 768d)
 - **MCP server** exposes the cell to Claude as a SQL endpoint
 - **vec_ops** enables semantic search: `diverse`, `recent`, `unlike`, `like`, `from/to` trajectory
 
