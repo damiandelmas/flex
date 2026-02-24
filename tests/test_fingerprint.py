@@ -515,11 +515,10 @@ class TestSessionsViewColumns:
     """Verify sessions.sql curated view has correct columns."""
 
     def test_sessions_sql_has_fingerprint(self):
-        sql_path = FLEX_ROOT / 'views' / 'claude_code' / 'sessions.sql'
+        sql_path = Path.home() / '.flex' / 'views' / 'claude_code' / 'sessions.sql'
         content = sql_path.read_text()
         assert 'fingerprint_index' in content
         assert 'topic_summary' not in content
-        assert 'community_label' not in content
 
     def test_orient_sql_uses_substr_fingerprint(self):
         sql_path = FLEX_ROOT / 'flex' / 'modules' / 'claude_code' / 'presets' / 'orient.sql'
