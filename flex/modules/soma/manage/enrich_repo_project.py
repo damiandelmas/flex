@@ -40,8 +40,8 @@ CREATE TABLE _enrich_repo_identity (
 """
 
 
-from flex.utils.git import git_root_from_path as _git_root_from_path
-from flex.utils.git import project_from_git_root as _project_from_git_root
+from flex.modules.soma.lib.git import git_root_from_path as _git_root_from_path
+from flex.modules.soma.lib.git import project_from_git_root as _project_from_git_root
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -55,7 +55,7 @@ def build_repo_map(db) -> dict:
     SOMA alias takes priority over path-derived name.
     """
     try:
-        from soma.identity.repo_identity import RepoIdentity
+        from flex.modules.soma.lib.identity.repo_identity import RepoIdentity
         ri = RepoIdentity()
     except ImportError:
         print("  SOMA not available — install soma to resolve repo_root hashes")

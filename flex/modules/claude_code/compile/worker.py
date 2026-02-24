@@ -129,8 +129,8 @@ def find_jsonl(session_id: str) -> Path | None:
     return None
 
 
-from flex.utils.git import git_root_from_path as _git_root_from_path
-from flex.utils.git import project_from_git_root as _project_from_git_root
+from flex.modules.soma.lib.git import git_root_from_path as _git_root_from_path
+from flex.modules.soma.lib.git import project_from_git_root as _project_from_git_root
 
 
 def _git_root(cwd: str) -> str | None:

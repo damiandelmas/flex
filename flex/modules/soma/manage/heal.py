@@ -96,8 +96,8 @@ OLD_BLOB_GAP_SQL = """
 def _pass_file(conn, dry_run=False, limit=0):
     """Pass 1: file_uuid + repo_root backfill."""
     try:
-        from soma.identity.file_identity import FileIdentity
-        from soma.identity.repo_identity import RepoIdentity
+        from flex.modules.soma.lib.identity.file_identity import FileIdentity
+        from flex.modules.soma.lib.identity.repo_identity import RepoIdentity
         file_id = FileIdentity()
         repo_id = RepoIdentity()
     except ImportError:
@@ -168,7 +168,7 @@ def _pass_file(conn, dry_run=False, limit=0):
 def _pass_content(conn, dry_run=False, limit=0):
     """Pass 2: content_hash backfill."""
     try:
-        from soma.identity.content_identity import ContentIdentity
+        from flex.modules.soma.lib.identity.content_identity import ContentIdentity
         content_id = ContentIdentity()
     except ImportError:
         print("[heal] SOMA ContentIdentity not available — skipping content pass", file=sys.stderr)
@@ -209,7 +209,7 @@ def _pass_content(conn, dry_run=False, limit=0):
 def _pass_url(conn, dry_run=False, limit=0):
     """Pass 3: url_uuid backfill."""
     try:
-        from soma.identity.url_identity import URLIdentity
+        from flex.modules.soma.lib.identity.url_identity import URLIdentity
         url_id = URLIdentity()
     except ImportError:
         print("[heal] SOMA URLIdentity not available — skipping url pass", file=sys.stderr)

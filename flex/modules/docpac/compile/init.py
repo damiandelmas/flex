@@ -309,7 +309,7 @@ def main():
     def _get_file_uuid(path):
         """Get stable file UUID via SOMA FileIdentity, falling back to deterministic uuid5."""
         try:
-            from soma.identity.file_identity import FileIdentity
+            from flex.modules.soma.lib.identity.file_identity import FileIdentity
             return FileIdentity().assign(str(path))
         except Exception:
             return str(_uuid.uuid5(_uuid.NAMESPACE_URL, str(path)))

@@ -251,6 +251,23 @@ def cmd_init(args):
     (FLEX_HOME / "cells").mkdir(exist_ok=True)
     print("  [ok] ~/.flex/ created")
 
+    # 1b. Initialize SOMA identity (~/.soma/)
+    try:
+        from flex.modules.soma.lib.identity.file_identity import FileIdentity
+        from flex.modules.soma.lib.identity.repo_identity import RepoIdentity
+        from flex.modules.soma.lib.identity.url_identity import URLIdentity
+        from flex.modules.soma.lib.identity.content_identity import ContentIdentity
+        FileIdentity()
+        RepoIdentity()
+        URLIdentity()
+        ContentIdentity()
+        print("  [ok] ~/.soma/ ready (file, repo, url, content identity)")
+        from flex.modules.soma.lib.eternity.eternity import Eternity
+        Eternity()  # creates ~/.soma/backups/
+        print("  [ok] eternity ready (backup, git versioning, cloud sync)")
+    except ImportError:
+        print("  [warn] soma identity unavailable — file tracking disabled")
+
     # 2. Install model (copy from bundled package, or download from GitHub)
     from flex.onnx.fetch import download_model, model_ready
     if model_ready():

@@ -95,10 +95,10 @@ _URL_IDENTITY = None
 AVAILABLE = False
 
 try:
-    from soma.identity.file_identity import FileIdentity
-    from soma.identity.content_identity import ContentIdentity
-    from soma.identity.repo_identity import RepoIdentity
-    from soma.identity.url_identity import URLIdentity
+    from flex.modules.soma.lib.identity.file_identity import FileIdentity
+    from flex.modules.soma.lib.identity.content_identity import ContentIdentity
+    from flex.modules.soma.lib.identity.repo_identity import RepoIdentity
+    from flex.modules.soma.lib.identity.url_identity import URLIdentity
     _FILE_IDENTITY = FileIdentity()
     _CONTENT_IDENTITY = ContentIdentity()
     _REPO_IDENTITY = RepoIdentity()
