@@ -926,6 +926,10 @@ def _batch_embed_chunks(conn, batch_size: int = 500) -> int:
     done = 0
     t0 = time.time()
 
+    total = conn.execute(
+        "SELECT count(*) FROM _raw_chunks WHERE embedding IS NULL AND content IS NOT NULL"
+    ).fetchone()[0]
+
     while True:
         rows = conn.execute("""
             SELECT id, content FROM _raw_chunks
@@ -947,11 +951,19 @@ def _batch_embed_chunks(conn, batch_size: int = 500) -> int:
         conn.commit()
         done += len(rows)
 
+        elapsed = time.time() - t0
+        rate = done / elapsed if elapsed > 0 else 0
+        remaining = (total - done) / rate if rate > 0 else 0
+        sys.stdout.write(
+            f"\r  ~ {done:,}/{total:,} chunks embedded  ({rate:.0f}/s, ~{remaining:.0f}s left)    "
+        )
+        sys.stdout.flush()
+
     elapsed = time.time() - t0
     if done > 0:
         rate = done / elapsed if elapsed > 0 else 0
-        print(f"[worker] Batch embed: {done:,} chunks in {elapsed:.1f}s "
-              f"({rate:.0f} chunks/s)", file=sys.stderr)
+        sys.stdout.write("\r" + " " * 70 + "\r")  # clear progress line
+        print(f"  [ok] {done:,} chunks embedded in {elapsed:.0f}s ({rate:.0f}/s)")
     return done
 
 
