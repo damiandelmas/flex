@@ -280,9 +280,15 @@ class VectorCache:
             else:
                 query_vec = centroid
 
-        # === TRAJECTORY: from:TEXT to:TEXT replaces query_vec with direction ===
+        # === TRAJECTORY: from:TEXT to:TEXT biases query via score combination ===
+        # Scores = 0.7 * cosine(query) + 0.3 * cosine(direction)
+        # Query defines the topic; direction is a reranking nudge.
+        # Score combination keeps each component in its own embedding space —
+        # avoids normalization weirdness from adding vectors (critical for
+        # asymmetric models like Nomic where query/doc spaces differ).
         traj_from = modifiers.get('trajectory_from') if modifiers else None
         traj_to = modifiers.get('trajectory_to') if modifiers else None
+        _traj_direction = None
         if traj_from and traj_to and embed_fn:
             # Direction must be in document space to match stored embeddings.
             # Use embed_doc_fn if provided (asymmetric models like Nomic),
@@ -294,7 +300,7 @@ class VectorCache:
             d_norm = np.linalg.norm(direction)
             if d_norm > 0:
                 direction /= d_norm
-            query_vec = direction  # Replace query vector with direction
+            _traj_direction = direction  # stored, applied after cosine scores
 
         # === SQL PRE-FILTER: fancy-index into warm matrix ===
         if pre_filter_ids is not None:
@@ -319,6 +325,11 @@ class VectorCache:
 
         # 1. Matrix multiply — all similarities at once
         similarities = active_matrix @ query_vec
+
+        # Trajectory blend: 0.7 * query_score + 0.3 * direction_score
+        if _traj_direction is not None:
+            traj_scores = active_matrix @ _traj_direction
+            similarities = 0.7 * similarities + 0.3 * traj_scores
 
         # === LANDSCAPE MODULATIONS (on active array, before candidate selection) ===
         if modifiers:
@@ -694,7 +705,8 @@ def register_vec_ops(conn, caches: dict, embed_fn, cell_config: dict = None,
         if query_text is None:
             # Check if modifiers provide an alternative query vector
             if modifiers and (modifiers.get('like') or modifiers.get('trajectory_from')):
-                # Use a zero vector as placeholder — centroid/trajectory will replace it
+                # Use a zero vector as placeholder — centroid will replace it, or
+                # trajectory blend will weight query_scores=0 (pure direction mode)
                 query_vec = np.zeros(cache.dims, dtype=np.float32)
             else:
                 return json.dumps({"error": "vec_ops: query_text is NULL and no like: or from:to: token"})
