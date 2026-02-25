@@ -1,6 +1,6 @@
 [project]
 name = "getflex"
-version = "0.1.13"
+version = "0.1.14"
 description = "SQLite knowledge engine for AI Agents"
 requires-python = ">=3.12"
 dependencies = [
@@ -19,6 +19,7 @@ dependencies = [
 
 [project.optional-dependencies]
 relay = ["websockets"]
+nomic = ["nomic"]
 
 [project.scripts]
 flex = "flex.cli:main"
