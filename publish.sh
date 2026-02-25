@@ -103,7 +103,7 @@ VERSION=$(grep '^version' pyproject.toml | head -1 | grep -oP '"\K[^"]+')
 echo "Building getflex==$VERSION for PyPI..."
 
 rm -rf dist/
-python -m build --quiet
+python -m build 2>&1 | tail -3
 
 TWINE_USERNAME=__token__ \
 TWINE_PASSWORD="$(cat "$PYPI_TOKEN_FILE")" \
