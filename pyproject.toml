@@ -1,6 +1,6 @@
 [project]
 name = "getflex"
-version = "0.1.5"
+version = "0.1.6"
 description = "SQLite knowledge engine for AI Agents"
 requires-python = ">=3.12"
 dependencies = [
@@ -11,10 +11,13 @@ dependencies = [
     "tokenizers",
     "rich",
     "tzlocal",
+    "mcp",
+    "starlette",
+    "uvicorn",
+    "websockets",
 ]
 
 [project.optional-dependencies]
-mcp = ["mcp", "starlette", "uvicorn", "websockets"]
 cluster = ["hdbscan"]
 
 [project.scripts]
