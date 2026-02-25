@@ -265,7 +265,7 @@ class TestFlexInitE2E:
         data = json.loads(claude_json.read_text())
         assert "mcpServers" in data
         assert "flex" in data["mcpServers"]
-        assert data["mcpServers"]["flex"]["url"] == "http://localhost:8081/sse"
+        assert data["mcpServers"]["flex"]["url"] == "http://localhost:7532/sse"
 
     def test_sessions_indexed(self, initialized_env):
         conn = _open(initialized_env["cell_path"])

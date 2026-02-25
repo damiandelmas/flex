@@ -45,10 +45,10 @@ echo "       log: $LOG_WORKER"
 sleep 1
 
 # Start MCP server
-python3 -m flex.mcp_server --http --port 8081 \
+python3 -m flex.mcp_server --http --port 7532 \
     >> "$LOG_MCP" 2>&1 &
 echo $! > "$PIDFILE_MCP"
-echo "  [ok] flex-mcp started (pid $(cat $PIDFILE_MCP)) → http://localhost:8081/sse"
+echo "  [ok] flex-mcp started (pid $(cat $PIDFILE_MCP)) → http://localhost:7532/sse"
 echo "       log: $LOG_MCP"
 
 echo ""

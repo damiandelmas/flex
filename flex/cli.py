@@ -155,7 +155,7 @@ def _install_systemd():
             "After=network.target\n\n"
             "[Service]\n"
             "Type=simple\n"
-            f"ExecStart={python} -m flex.mcp_server --http --port 8081\n"
+            f"ExecStart={python} -m flex.mcp_server --http --port 7532\n"
             "Restart=always\n"
             "RestartSec=5\n"
             "Environment=PYTHONUNBUFFERED=1\n\n"
@@ -183,7 +183,7 @@ def _patch_claude_json():
 
     servers = data.setdefault("mcpServers", {})
     if "flex" not in servers:
-        servers["flex"] = {"type": "sse", "url": "http://localhost:8081/sse"}
+        servers["flex"] = {"type": "sse", "url": "http://localhost:7532/sse"}
         CLAUDE_JSON.write_text(json.dumps(data, indent=2) + "\n")
         return True
     return False
@@ -554,7 +554,7 @@ def cmd_init(args):
     panel_content.append("Claude Code  ", style="white")
     panel_content.append("ready\n\n", style="bold green")
     panel_content.append("MCP Server Endpoint   ", style="white")
-    panel_content.append("http://localhost:8081", style="bold green")
+    panel_content.append("http://localhost:7532", style="bold green")
     console.print(Panel(panel_content, padding=(0, 1)))
     console.print()
 

@@ -76,7 +76,7 @@ if claude_json.exists():
     servers = d.get("mcpServers", {})
     check("flex MCP entry",      "flex" in servers)
     check("MCP URL correct",
-          servers.get("flex", {}).get("url") == "http://localhost:8081/sse")
+          servers.get("flex", {}).get("url") == "http://localhost:7532/sse")
 
 # ── Cell contents ─────────────────────────────────────────────────────────────
 import flex.registry as reg
