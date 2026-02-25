@@ -16,7 +16,7 @@ MODEL_DIR = FLEX_HOME / "models"
 # Bundled model lives alongside this file in flex/onnx/
 BUNDLED_DIR = Path(__file__).parent
 
-BASE_URL = "https://github.com/axpsystems/flex/releases/download/v0.1.1"
+BASE_URL = "https://github.com/damian-delmas/flex/releases/download/v0.1.1"
 
 FILES = [
     ("model.onnx", "30ff8ad63546f9efd85019f394445f566ea595c119b08aa6663058af9e18fa87"),

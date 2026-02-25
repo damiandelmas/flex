@@ -1,6 +1,6 @@
 [project]
 name = "getflex"
-version = "0.1.2"
+version = "0.1.4"
 description = "SQLite knowledge engine for AI Agents"
 requires-python = ">=3.12"
 dependencies = [
@@ -29,10 +29,15 @@ flex = [
     "modules/claude_chat/stock/views/*.sql",
     "modules/docpac/stock/views/*.sql",
     "modules/soma/stock/presets/*.sql",
+    "modules/soma/**/*.sql",
+    "modules/soma/*.sql",
     "retrieve/presets/general/*.sql",
     "onnx/*.json",
     "onnx/vocab.txt",
 ]
+
+[tool.setuptools.exclude-package-data]
+flex = ["onnx/model.onnx", "onnx/model.onnx.data"]
 
 [tool.setuptools.packages.find]
 include = ["flex*"]
