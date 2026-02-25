@@ -379,15 +379,16 @@ def cmd_init(args):
 
     # 3. Pre-flight: check system deps before doing anything
     import shutil as _shutil, os as _os
-    if not _shutil.which("jq"):
-        _sudo = "" if _os.geteuid() == 0 else "sudo "
+    _sudo = "" if _os.geteuid() == 0 else "sudo "
+    _missing_sys = [b for b in ("jq", "git") if not _shutil.which(b)]
+    if _missing_sys:
         console.print()
-        console.print("  [yellow]Missing dependency — run first:[/yellow]")
+        console.print("  [yellow]Missing system dependencies — run first:[/yellow]")
         console.print()
         if _shutil.which("brew"):
-            console.print("  [bold]brew install jq[/bold]")
+            console.print(f"  [bold]brew install {' '.join(_missing_sys)}[/bold]")
         else:
-            console.print(f"  [bold]{_sudo}apt install jq[/bold]")
+            console.print(f"  [bold]{_sudo}apt install {' '.join(_missing_sys)}[/bold]")
         console.print()
         console.print("  Then re-run: [bold]flex init[/bold]")
         console.print()
@@ -434,6 +435,8 @@ def cmd_init(args):
         ).fetchone()[0]
         _phase = {"sessions": _already, "chunks": _existing_chunks}
 
+        _nomic_embedder = [None]  # set by _phase2 if user provides a Nomic API key
+
         with Progress(
             TextColumn("  [dim]{task.description:<20}[/dim]"),
             SpinnerColumn(spinner_name="dots", finished_text="[green]✓[/green]"),
@@ -477,6 +480,42 @@ def cmd_init(args):
                                 info=f"{len(jsonls):,} sessions scanned")
                 _phase["sessions"] = sessions
                 _phase["chunks"]   = chunks
+
+                # Nomic API fast-path: offer to CPU-only users with large corpora
+                unembedded = chunks - _already_embedded
+                if unembedded > 10_000:
+                    try:
+                        from flex.onnx.embed import has_gpu as _has_gpu
+                        if not _has_gpu():
+                            progress.stop()
+                            est_secs = unembedded / 27  # ~27 chunks/s CPU baseline
+                            if est_secs < 3600:
+                                est_str = f"~{est_secs / 60:.0f}m"
+                            else:
+                                est_str = f"~{est_secs / 3600:.1f}h"
+                            console.print()
+                            console.print(f"  No GPU detected. Estimated embedding time: {est_str} on CPU.")
+                            console.print("  Recommended: use the Nomic API (same model, ~4 min, free tier).")
+                            console.print("  [dim]Note: chunks sent to Nomic's servers.[/dim]")
+                            console.print("  Get a free key: [bold]atlas.nomic.ai[/bold]")
+                            console.print()
+                            key = input("  Enter Nomic API key (or press Enter to use local CPU): ").strip()
+                            if key:
+                                from flex.onnx.nomic_embed import NomicEmbedder as _NomicEmbedder
+                                _ne = _NomicEmbedder(key)
+                                console.print("  [dim]Validating key...[/dim]", end="")
+                                _err = _ne.validate()
+                                if _err:
+                                    console.print(f"\r  [yellow]⚠  Key invalid: {_err}[/yellow]")
+                                    console.print("  [dim]Falling back to local CPU.[/dim]")
+                                else:
+                                    _nomic_embedder[0] = _ne
+                                    console.print(f"\r  [green]✓  Nomic API ready.[/green]      ")
+                            console.print()
+                            progress.start()
+                    except Exception:
+                        pass  # any failure → fall through to local ONNX
+
                 progress.update(t_index, visible=True,
                                 completed=_already_embedded, total=_existing_chunks,
                                 info=f"{_already_embedded:,} / {_existing_chunks:,} chunks   calculating...")
@@ -498,7 +537,8 @@ def cmd_init(args):
             buf2 = io.StringIO()
             with contextlib.redirect_stderr(buf2):
                 stats = initial_backfill(conn, progress_cb=_progress, phase2_cb=_phase2,
-                                         quiet_embed=True, embed_progress_cb=_embed_progress)
+                                         quiet_embed=True, embed_progress_cb=_embed_progress,
+                                         embedder_ref=_nomic_embedder)
 
             progress.update(t_index, completed=stats['chunks'], total=stats['chunks'],
                             info=f"{stats['chunks']:,} chunks embedded")
@@ -792,6 +832,13 @@ _ENRICHMENT_STUBS = {
 
 def cmd_relay(args):
     """Generate machine_id, start services, print relay URL."""
+    try:
+        import websockets  # noqa: F401
+    except ImportError:
+        from rich.console import Console
+        Console().print("[red]websockets not installed.[/red] Run: [bold]pip install websockets[/bold]")
+        return
+
     import uuid as _uuid
     from rich.console import Console
     from rich.panel import Panel
