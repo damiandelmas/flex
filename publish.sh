@@ -44,7 +44,7 @@ if ! git remote get-url "$REMOTE" &>/dev/null; then
 fi
 
 # Verify clean working tree
-if [[ -n "$(git status --porcelain)" ]]; then
+if [[ -n "$(git status --porcelain --untracked-files=no)" ]]; then
     echo "Working tree not clean. Commit or stash first."
     exit 1
 fi
@@ -81,7 +81,7 @@ git commit -m "release $VERSION"
 git push "$REMOTE" "$BRANCH:$TARGET" --force
 
 # Cleanup
-git checkout dev
+git checkout -f dev
 git branch -D "$BRANCH"
 
 echo ""
