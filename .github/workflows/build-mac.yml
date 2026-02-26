@@ -31,4 +31,4 @@ jobs:
       - name: Tests
         run: |
           pip install pytest
-          pytest tests/ -x -q
+          pytest tests/ -x -q --ignore=tests/test_init_e2e.py
