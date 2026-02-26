@@ -472,8 +472,8 @@ def insert_chunk_atom(conn: sqlite3.Connection, chunk: dict):
         ensure_source_exists(conn, chunk['spawned_agent'])
         cur.execute("""
             INSERT OR IGNORE INTO _edges_delegations (chunk_id, child_session_id, agent_type, created_at)
-            VALUES (?, ?, NULL, ?)
-        """, (chunk_id, chunk['spawned_agent'], chunk['timestamp']))
+            VALUES (?, ?, ?, ?)
+        """, (chunk_id, chunk['spawned_agent'], chunk.get('agent_type'), chunk['timestamp']))
 
     # _enrich_types: stopped writing heuristic values (Plan 9).
     # AI queries role + tool_name directly via curated views.
@@ -538,10 +538,11 @@ def sync_session_messages(session_id: str, conn: sqlite3.Connection,
     tool_content_items = []   # (chunk_id, raw, tool_name, ts)
     tool_ops_items = []       # (chunk_id, tool_name, target_file, cwd, git_branch, success)
     soma_items = []           # (chunk_id, enrichment_dict)
-    delegation_items = []     # (chunk_id, spawned_agent, ts)
+    delegation_items = []     # (chunk_id, spawned_agent, ts, parent_sid, agent_type)
     soft_ops_items = []       # (chunk_id, SoftFileOp)
     tool_use_id_map = {}      # tool_use.id -> tool_name
     tool_use_to_chunk = {}    # tool_use.id -> chunk_id (for delegation resolution)
+    tool_use_agent_type = {}  # tool_use.id -> subagent_type (Task spawns only)
     _seen_delegations = set() # dedup: agent ids already captured from progress entries
     snapshot_hashes = {}      # messageId -> {filepath: git_blob_hash}
 
@@ -621,7 +622,8 @@ def sync_session_messages(session_id: str, conn: sqlite3.Connection,
                 if spawned not in _seen_delegations:
                     _seen_delegations.add(spawned)
                     parent_chunk = tool_use_to_chunk[parent_tuid]
-                    delegation_items.append((parent_chunk, spawned, ts_int, session_id))
+                    at = tool_use_agent_type.get(parent_tuid)
+                    delegation_items.append((parent_chunk, spawned, ts_int, session_id, at))
             continue
 
         # --- system / other → skip ---
@@ -663,6 +665,8 @@ def sync_session_messages(session_id: str, conn: sqlite3.Connection,
                     tool_use_id = item.get('id', '')
                     tool_use_id_map[tool_use_id] = tool_name
                     tool_use_to_chunk[tool_use_id] = chunk_id
+                    if tool_name == 'Task':
+                        tool_use_agent_type[tool_use_id] = tool_input.get('subagent_type')
 
                     # Store full tool input in _raw_content
                     raw = json.dumps(tool_input)
@@ -724,7 +728,10 @@ def sync_session_messages(session_id: str, conn: sqlite3.Connection,
                         agent_match = re.search(r'agentId: ([a-f0-9]+)', raw)
                         if agent_match:
                             spawned = f"agent-{agent_match.group(1)}"
-                            delegation_items.append((chunk_id, spawned, ts_int, session_id))
+                            # Use the Task tool_use chunk, not the tool_result line
+                            task_chunk = tool_use_to_chunk.get(tool_use_id, chunk_id)
+                            at = tool_use_agent_type.get(tool_use_id)
+                            delegation_items.append((task_chunk, spawned, ts_int, session_id, at))
 
         # --- Build chunk content ---
         text_content = '\n'.join(text_parts) if text_parts else None
@@ -834,14 +841,14 @@ def sync_session_messages(session_id: str, conn: sqlite3.Connection,
                 print(f"[worker] SOMA insert error: {e}", file=sys.stderr)
 
     # --- Write delegation edges ---
-    for chunk_id, spawned_agent, ts, parent_sid in delegation_items:
+    for chunk_id, spawned_agent, ts, parent_sid, agent_type in delegation_items:
         try:
             ensure_source_exists(conn, spawned_agent)
             cur.execute("""
                 INSERT OR IGNORE INTO _edges_delegations
                 (chunk_id, child_session_id, agent_type, created_at, parent_source_id)
-                VALUES (?, ?, NULL, ?, ?)
-            """, (chunk_id, spawned_agent, ts, parent_sid))
+                VALUES (?, ?, ?, ?, ?)
+            """, (chunk_id, spawned_agent, agent_type, ts, parent_sid))
         except Exception as e:
             print(f"[worker] Delegation insert error: {e}", file=sys.stderr)
 
@@ -1193,7 +1200,7 @@ def _heal_delegations(conn: sqlite3.Connection) -> int:
 
         # Collect Task tool_use blocks: tool_use_id -> (line_num, ts)
         # and line_num -> tool_use_id for proximity matching
-        tool_use_info = {}   # tool_use_id -> (line_num, ts_int)
+        tool_use_info = {}   # tool_use_id -> (line_num, ts_int, agent_type)
         task_lines = []      # [(line_num, tool_use_id, ts_int)] ordered
 
         for line_num_0, line in enumerate(lines):
@@ -1219,7 +1226,8 @@ def _heal_delegations(conn: sqlite3.Connection) -> int:
                 if isinstance(block, dict) and block.get('type') == 'tool_use' \
                         and block.get('name') == 'Task':
                     tuid = block.get('id', '')
-                    tool_use_info[tuid] = (line_num, ts_int)
+                    at = block.get('input', {}).get('subagent_type')
+                    tool_use_info[tuid] = (line_num, ts_int, at)
                     task_lines.append((line_num, tuid, ts_int))
 
         if not task_lines:
@@ -1277,15 +1285,17 @@ def _heal_delegations(conn: sqlite3.Connection) -> int:
                         break
             best = None
             if result_tuid and result_tuid in tool_use_info:
-                best = tool_use_info[result_tuid]
+                best = tool_use_info[result_tuid]  # (line_num, ts, at)
             else:
                 for tl, tuid, ts in task_lines:
                     if tl < line_num:
-                        best = (tl, ts)
+                        best_at = tool_use_info.get(tuid, (None, None, None))[2]
+                        best = (tl, ts, best_at)
             if best:
                 chunk_id = f"{session_id}_{best[0]}"
                 spawned = f"agent-{aid}"
-                user_delegations.append((chunk_id, spawned, best[1], session_id))
+                best_at = best[2] if len(best) > 2 else None
+                user_delegations.append((chunk_id, spawned, best[1], session_id, best_at))
 
         # Merge: progress-based takes precedence, user-based fills remainder
         seen = set()
@@ -1294,22 +1304,22 @@ def _heal_delegations(conn: sqlite3.Connection) -> int:
         for aid, ptuid in agent_to_parent.items():
             if ptuid not in tool_use_info:
                 continue
-            line_num, ts_int = tool_use_info[ptuid]
+            line_num, ts_int, at = tool_use_info[ptuid]
             chunk_id = f"{session_id}_{line_num}"
             spawned = f"agent-{aid}"
             key = (chunk_id, spawned)
             if key not in seen:
                 seen.add(key)
-                delegation_pairs.append((chunk_id, spawned, ts_int, session_id))
+                delegation_pairs.append((chunk_id, spawned, ts_int, session_id, at))
 
-        for chunk_id, spawned, ts_int, sid in user_delegations:
+        for chunk_id, spawned, ts_int, sid, at in user_delegations:
             key = (chunk_id, spawned)
             if key not in seen:
                 seen.add(key)
-                delegation_pairs.append((chunk_id, spawned, ts_int, sid))
+                delegation_pairs.append((chunk_id, spawned, ts_int, sid, at))
 
         # Insert
-        for chunk_id, spawned, ts_int, sid in delegation_pairs:
+        for chunk_id, spawned, ts_int, sid, at in delegation_pairs:
             exists = conn.execute(
                 "SELECT 1 FROM _raw_chunks WHERE id = ?", (chunk_id,)
             ).fetchone()
@@ -1320,8 +1330,8 @@ def _heal_delegations(conn: sqlite3.Connection) -> int:
                 conn.execute("""
                     INSERT OR IGNORE INTO _edges_delegations
                     (chunk_id, child_session_id, agent_type, created_at, parent_source_id)
-                    VALUES (?, ?, NULL, ?, ?)
-                """, (chunk_id, spawned, ts_int, sid))
+                    VALUES (?, ?, ?, ?, ?)
+                """, (chunk_id, spawned, at, ts_int, sid))
                 inserted += 1
             except Exception:
                 pass
