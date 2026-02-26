@@ -104,19 +104,6 @@ def reembed_sources(db):
         print(f"  Nulled {nulled} chunks with wrong embedding dimension (will re-embed at 128d)")
         sys.stdout.flush()
 
-    # Backup current embeddings
-    db.execute("DROP TABLE IF EXISTS _backup_source_embeddings_meanpool")
-    db.execute("""
-        CREATE TABLE _backup_source_embeddings_meanpool AS
-        SELECT source_id, embedding FROM _raw_sources
-        WHERE embedding IS NOT NULL
-    """)
-    backup_cnt = db.execute(
-        "SELECT COUNT(*) FROM _backup_source_embeddings_meanpool"
-    ).fetchone()[0]
-    print(f"  Backed up {backup_cnt} source embeddings")
-    sys.stdout.flush()
-
     # Compute corpus centroid from existing source embeddings.
     # Used to down-weight chunks that are close to the corpus mean (boilerplate).
     centroid = None

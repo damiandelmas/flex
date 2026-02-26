@@ -583,7 +583,10 @@ def materialize_vec_ops(db, sql: str) -> str:
     # Only materialize when used as a table source
     before = sql[:start.start()].rstrip().upper()
     if not (before.endswith('FROM') or before.endswith('JOIN') or before.endswith(',')):
-        return sql
+        return json.dumps({"error":
+            "vec_ops must be used as a table source (after FROM or JOIN), "
+            "not as a scalar expression. "
+            "Correct: SELECT v.id, v.score FROM vec_ops('_raw_chunks', 'query') v"})
 
     # Find the matching close paren (handles quoted strings with escaped '' quotes)
     paren_start = start.end() - 1
