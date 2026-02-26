@@ -61,11 +61,15 @@ except ImportError:
 try:
     from flex.modules.claude_code.manage.rebuild_all import (
         rebuild_source_graph, rebuild_warmup_types, reembed_sources,
+        rebuild_community_labels, rebuild_file_graph, rebuild_delegation_graph,
     )
 except ImportError:
     rebuild_source_graph = None
     rebuild_warmup_types = None
     reembed_sources = None
+    rebuild_community_labels = None
+    rebuild_file_graph = None
+    rebuild_delegation_graph = None
 
 QUEUE_DB = FLEX_HOME / "queue.db"
 CLAUDE_PROJECTS = Path.home() / ".claude/projects"
@@ -1346,23 +1350,52 @@ def _heal_delegations(conn: sqlite3.Connection) -> int:
 
 
 def _run_enrichment_cycle(conn, graph_threshold=50):
-    """Run the enrichment cycle: graph (if stale), fingerprints, repo_project."""
+    """Run the full enrichment cycle — everything heals within one pass.
+
+    Steps: reembed sources (unconditional) → graph (if stale) → community labels
+    (after graph) → file graph → delegation graph → fingerprints → repo_project
+    → delegation edge heal → NULL embed sweep → queue snapshot → view sync.
+    """
     t0 = time.time()
 
-    # 1. Graph rebuild if stale
+    print("[enrich] Starting enrichment cycle", file=sys.stderr)
+
+    # 1. Unconditional: reembed sources (~1-3s, pure numpy, no ONNX)
+    if reembed_sources:
+        try:
+            reembed_sources(conn)
+        except Exception as e:
+            print(f"[enrich] Reembed error: {e}", file=sys.stderr)
+
+    # 2. Graph rebuild if stale (≥50 new sessions since last build)
     if rebuild_source_graph and _cc_graph_stale(conn, graph_threshold):
         print("[enrich] Graph stale — rebuilding...", file=sys.stderr)
         try:
             if rebuild_warmup_types:
                 rebuild_warmup_types(conn)
-            if reembed_sources:
-                reembed_sources(conn)
             rebuild_source_graph(conn)
+            # Community labels depend on graph — rebuild immediately after
+            if rebuild_community_labels:
+                rebuild_community_labels(conn)
             print(f"[enrich] Graph rebuilt in {time.time()-t0:.1f}s", file=sys.stderr)
         except Exception as e:
             print(f"[enrich] Graph error: {e}", file=sys.stderr)
 
-    # 2. Incremental fingerprints
+    # 3. File co-edit graph (early-exit if no SOMA file identity data, ~2-5s)
+    if rebuild_file_graph:
+        try:
+            rebuild_file_graph(conn)
+        except Exception as e:
+            print(f"[enrich] File graph error: {e}", file=sys.stderr)
+
+    # 4. Delegation graph (early-exit if no delegation data, ~1-2s)
+    if rebuild_delegation_graph:
+        try:
+            rebuild_delegation_graph(conn)
+        except Exception as e:
+            print(f"[enrich] Delegation graph error: {e}", file=sys.stderr)
+
+    # 5. Incremental fingerprints
     if run_fingerprints:
         try:
             n = run_fingerprints(conn)
@@ -1371,7 +1404,7 @@ def _run_enrichment_cycle(conn, graph_threshold=50):
         except Exception as e:
             print(f"[enrich] Fingerprint error: {e}", file=sys.stderr)
 
-    # 3. Incremental repo_project
+    # 6. Incremental repo_project
     if run_repo_project:
         try:
             n = run_repo_project(conn)
@@ -1380,7 +1413,7 @@ def _run_enrichment_cycle(conn, graph_threshold=50):
         except Exception as e:
             print(f"[enrich] Repo project error: {e}", file=sys.stderr)
 
-    # 4. Heal delegation edges for sessions synced before progress-entry detection
+    # 7. Heal delegation edges for sessions synced before progress-entry detection
     try:
         n = _heal_delegations(conn)
         if n > 0:
@@ -1388,7 +1421,15 @@ def _run_enrichment_cycle(conn, graph_threshold=50):
     except Exception as e:
         print(f"[enrich] Delegation heal error: {e}", file=sys.stderr)
 
-    # 5. Queue depth snapshot — write to _ops for @health visibility
+    # 8. NULL embedding sweep — catch orphaned chunks that missed embed phase
+    try:
+        n = _batch_embed_chunks(conn, quiet=True)
+        if n > 0:
+            print(f"[enrich] Embedded {n} orphaned chunks", file=sys.stderr)
+    except Exception as e:
+        print(f"[enrich] Embed sweep error: {e}", file=sys.stderr)
+
+    # 9. Queue depth snapshot — write to _ops for @health visibility
     try:
         qconn = sqlite3.connect(str(QUEUE_DB), timeout=5)
         cc_depth = qconn.execute("SELECT COUNT(*) FROM claude_code_pending").fetchone()[0]
@@ -1400,15 +1441,14 @@ def _run_enrichment_cycle(conn, graph_threshold=50):
     except Exception:
         pass  # non-critical metric
 
-    # 6. View auto-sync — install views if .sql files changed since last install
+    # 10. View auto-sync — install views if .sql files changed since last install
     try:
         _check_and_sync_views(conn)
     except Exception as e:
         print(f"[enrich] View sync error: {e}", file=sys.stderr)
 
     elapsed = time.time() - t0
-    if elapsed > 1.0:
-        print(f"[enrich] Cycle done in {elapsed:.1f}s", file=sys.stderr)
+    print(f"[enrich] Cycle done in {elapsed:.1f}s", file=sys.stderr)
 
 
 def daemon_loop(interval=2):
@@ -1428,6 +1468,7 @@ def daemon_loop(interval=2):
     get_embedder()
 
     conn = sqlite3.connect(str(cell_path), timeout=30.0)
+    conn.row_factory = sqlite3.Row  # enrichment functions use column-name access
     conn.execute("PRAGMA journal_mode=WAL")
     conn.execute("PRAGMA synchronous=NORMAL")
     conn.execute("PRAGMA busy_timeout=30000")
@@ -1493,7 +1534,7 @@ def daemon_loop(interval=2):
             except Exception as e:
                 print(f"[worker] Backfill error: {e}", file=sys.stderr)
 
-        # Enrichment cycle — graph, fingerprints, repo_project (30min)
+        # Enrichment cycle — full heal pass (30min)
         if time.time() - last_enrichment > ENRICHMENT_INTERVAL:
             try:
                 _run_enrichment_cycle(conn, GRAPH_STALENESS_THRESHOLD)
