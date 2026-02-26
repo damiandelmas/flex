@@ -56,6 +56,8 @@ def _install_hooks():
     installed = []
     for event, hooks in HOOKS.items():
         for hook in hooks:
+            if not hook["src"].exists():
+                continue  # module not present in this distribution
             dest = HOOKS_DIR / hook["name"]
             shutil.copy2(hook["src"], dest)
             dest.chmod(dest.stat().st_mode | stat.S_IEXEC | stat.S_IXGRP | stat.S_IXOTH)
