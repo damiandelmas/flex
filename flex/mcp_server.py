@@ -469,7 +469,7 @@ def build_instructions() -> str:
         "    limit:0 falls back to default (500), not zero results",
         "    Only ONE vec_ops per query — for multiple, use CTEs:",
         "      WITH a AS (SELECT * FROM vec_ops(...) v) SELECT * FROM a",
-        "    Agent sessions may have NULL centrality/community — graph covers ~62% of real sessions",
+        "    Some sessions have NULL centrality/community — not all enter the graph. Use COALESCE or LEFT JOIN.",
         "",
         "PHASE 3: SQL COMPOSITION",
         "",
