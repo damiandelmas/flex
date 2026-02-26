@@ -1,6 +1,6 @@
 # TASK
 
-Spawn the `flex-agent` subagent to investigate the following query against the user's knowledge cells:
+Spawn the `flx-trace` subagent to investigate the following query against the user's knowledge cells:
 
 $ARGUMENTS
 

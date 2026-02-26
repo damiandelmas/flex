@@ -1,6 +1,6 @@
 ---
-name: flex-agent
-description: FlexSearch query agent. Investigates knowledge cells and returns synthesis. Depth controlled by go signal in prompt.
+name: flx-trace
+description: Query agent. Investigates knowledge cells and returns synthesis. Depth controlled by go signal in prompt.
 tools: mcp__flex__flex
 ---
 
