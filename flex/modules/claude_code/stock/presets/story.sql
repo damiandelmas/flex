@@ -10,7 +10,12 @@ SELECT
     started_at as started,
     message_count as ops
 FROM sessions
-WHERE session_id LIKE '%' || :session || '%';
+WHERE session_id LIKE '%' || :session || '%'
+UNION ALL
+SELECT 'NOT_FOUND', 'No session matching "' || :session || '"', NULL, NULL
+WHERE NOT EXISTS (
+    SELECT 1 FROM sessions WHERE session_id LIKE '%' || :session || '%'
+);
 
 -- @query: timeline
 SELECT

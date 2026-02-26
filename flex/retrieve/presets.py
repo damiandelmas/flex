@@ -72,6 +72,12 @@ class PresetLoader:
         preset = self.load(name)
         params = {**preset.get('defaults', {}), **(params or {})}
 
+        # Validate required params before execution
+        missing = self._check_missing_params(preset, params)
+        if missing:
+            return [{"error": f"Missing required parameter(s): {', '.join(missing)}",
+                      "usage": f"@{name} " + " ".join(f"{p}=VALUE" for p in missing)}]
+
         if preset['multi']:
             results = []
             for query in preset['queries']:
@@ -102,6 +108,22 @@ class PresetLoader:
                 return [{"error": sql}]
             rows = db.execute(sql).fetchall()
             return [dict(r) for r in rows]
+
+    @staticmethod
+    def _check_missing_params(preset: dict, params: dict) -> list[str]:
+        """Check if required params are missing. Returns list of missing param names."""
+        param_str = preset.get('params', '')
+        if not param_str:
+            return []
+        missing = []
+        for part in param_str.split(','):
+            part = part.strip()
+            if '(default' in part:
+                continue  # has default — not required
+            name = part.split()[0]  # "session (required)" → "session"
+            if name and name != '(required)' and name not in params:
+                missing.append(name)
+        return missing
 
     @staticmethod
     def _materialize_vec_ops(db: sqlite3.Connection, sql: str) -> str:
