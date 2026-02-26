@@ -92,6 +92,18 @@ def reembed_sources(db):
 
     t0 = time.time()
 
+    # Null out any chunk embeddings with wrong dimension (e.g. legacy 384d MiniLM).
+    # The worker re-embeds NULL chunks at 128d on its next cycle.
+    # length(embedding) / 4 = dims (float32). Expected: 128d = 512 bytes.
+    nulled = db.execute("""
+        UPDATE _raw_chunks SET embedding = NULL
+        WHERE embedding IS NOT NULL AND length(embedding) != 512
+    """).rowcount
+    if nulled:
+        db.commit()
+        print(f"  Nulled {nulled} chunks with wrong embedding dimension (will re-embed at 128d)")
+        sys.stdout.flush()
+
     # Backup current embeddings
     db.execute("DROP TABLE IF EXISTS _backup_source_embeddings_meanpool")
     db.execute("""
@@ -526,11 +538,11 @@ def main():
     rebuild_warmup_types(db)
     reembed_sources(db)
     rebuild_source_graph(db)
-    rebuild_community_labels(db)
     rebuild_file_graph(db)
     rebuild_delegation_graph(db)
     rebuild_fingerprints(db)
     rebuild_repo_project(db)
+    rebuild_community_labels(db)
 
     # Install curated views + presets before regenerating auto-generated views.
     # Ensures schema changes in .sql source files are always applied — whether

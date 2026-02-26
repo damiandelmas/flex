@@ -1,6 +1,5 @@
 -- @name: sessions
--- @description: Source-level surface for claude_code cells. Session metadata with graph intelligence and navigational fingerprint.
--- is_warmup_only: COALESCE to 0 — NULL means unclassified (rebuild_all not yet run), treated as non-warmup.
+-- @description: Source-level surface for claude_code cells. Session metadata with graph intelligence and navigational fingerprint. Warmup sessions excluded.
 
 DROP VIEW IF EXISTS sessions;
 CREATE VIEW sessions AS
@@ -14,7 +13,6 @@ SELECT
     datetime(src.start_time, 'unixepoch', 'localtime') AS started_at,
     datetime(src.end_time, 'unixepoch', 'localtime') AS ended_at,
     COUNT(DISTINCT s.chunk_id) as chunk_count,
-    COALESCE(w.is_warmup_only, 0) AS is_warmup_only,
     ess.fingerprint_index,
     g.centrality,
     g.is_hub,
@@ -26,4 +24,5 @@ LEFT JOIN _edges_source s ON src.source_id = s.source_id
 LEFT JOIN _types_source_warmup w ON src.source_id = w.source_id
 LEFT JOIN _enrich_session_summary ess ON src.source_id = ess.source_id
 LEFT JOIN _enrich_source_graph g ON src.source_id = g.source_id
+WHERE COALESCE(w.is_warmup_only, 0) = 0
 GROUP BY src.source_id;

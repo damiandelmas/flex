@@ -267,7 +267,7 @@ def _run_enrichment_quiet(conn) -> tuple[int, list[str]]:
     try:
         from flex.modules.claude_code.manage.rebuild_all import (
             rebuild_warmup_types, reembed_sources, rebuild_source_graph,
-            rebuild_community_labels,
+            rebuild_community_labels, rebuild_file_graph, rebuild_delegation_graph,
         )
         from flex.modules.claude_code.manage.enrich_summary import run as run_fingerprints
         from flex.modules.claude_code.manage.enrich_soma_repos import run as _register_soma_repos
@@ -284,10 +284,12 @@ def _run_enrichment_quiet(conn) -> tuple[int, list[str]]:
             ("warmup types",       lambda: rebuild_warmup_types(conn)),
             ("source pooling",     lambda: reembed_sources(conn)),
             ("source graph",       lambda: rebuild_source_graph(conn)),
-            ("community labels",   lambda: rebuild_community_labels(conn)),
+            ("file graph",         lambda: rebuild_file_graph(conn)),
+            ("delegation graph",   lambda: rebuild_delegation_graph(conn)),
             ("fingerprints",       lambda: run_fingerprints(conn)),
-            ("repo registry",    lambda: _register_soma_repos(conn)),
-            ("repo attribution", lambda: run_repo_project(conn)),
+            ("repo registry",      lambda: _register_soma_repos(conn)),
+            ("repo attribution",   lambda: run_repo_project(conn)),
+            ("community labels",   lambda: rebuild_community_labels(conn)),
         ]:
             try:
                 fn()
