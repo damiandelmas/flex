@@ -39,24 +39,12 @@ WHERE m.type = 'view'
 GROUP BY m.name
 ORDER BY m.name;
 
--- @query: hints
--- Key patterns for querying this cell. Query VIEWS (messages, sessions), not raw _ tables.
-SELECT 'query surface' as pattern,
-    'Use messages and sessions views. Tables starting with _ are internal.' as sql
-UNION ALL
-SELECT 'filter by session',
-    'WHERE m.session_id = ''d332a1a0-...'' OR WHERE m.session_id LIKE ''d332a1a0%'''
-UNION ALL
-SELECT 'file dedup (SOMA)',
-    'GROUP BY COALESCE(json_extract(m.file_uuids, ''$[0]''), m.target_file)'
-UNION ALL
-SELECT 'session drill-down',
-    '@story session=d332a1a0 OR @session-files session=d332a1a0';
 
 -- @query: hubs
 SELECT g.source_id AS session_id,
     COALESCE(substr(ess.fingerprint_index, 1, 120), src.title) as label,
-    ROUND(g.centrality, 4) as centrality, g.community_label
+    ROUND(g.centrality, 4) as centrality,
+    substr(g.community_label, 1, instr(g.community_label || ' ·', ' ·') - 1) AS community
 FROM _enrich_source_graph g
 JOIN _raw_sources src ON g.source_id = src.source_id
 LEFT JOIN _enrich_session_summary ess ON g.source_id = ess.source_id
@@ -64,7 +52,11 @@ WHERE g.is_hub = 1
 ORDER BY g.centrality DESC LIMIT 10;
 
 -- @query: communities
-SELECT g.community_id, g.community_label, COUNT(*) as sources
+SELECT
+    g.community_id,
+    substr(g.community_label, 1, instr(g.community_label || ' ·', ' ·') - 1) AS label,
+    substr(g.community_label, instr(g.community_label, ' · ') + 3) AS sub_labels,
+    COUNT(*) as sources
 FROM _enrich_source_graph g
 GROUP BY g.community_id ORDER BY sources DESC LIMIT 8;
 
