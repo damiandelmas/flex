@@ -215,6 +215,6 @@ No cloud account. No API key. No vendor. No rate limits.
 pip install getflex
 ```
 
-Apache 2.0 · Python 3.12 · SQLite · ONNX · numpy · networkx
+MIT · Python 3.12 · SQLite · ONNX · numpy · networkx
 
 [getflex.dev](https://getflex.dev) · [github](https://github.com/getflex) · [x](https://x.com/damian_delmas)
