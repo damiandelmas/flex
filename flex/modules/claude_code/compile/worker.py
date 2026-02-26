@@ -135,8 +135,38 @@ def find_jsonl(session_id: str) -> Path | None:
     return None
 
 
-from flex.modules.soma.lib.git import git_root_from_path as _git_root_from_path
-from flex.modules.soma.lib.git import project_from_git_root as _project_from_git_root
+try:
+    from flex.modules.soma.lib.git import git_root_from_path as _git_root_from_path
+    from flex.modules.soma.lib.git import project_from_git_root as _project_from_git_root
+except ImportError:
+    import subprocess as _subprocess
+    from pathlib import Path as _Path
+    _GENERIC_DIR_NAMES = {'main', 'master', 'dev', 'staging', 'prod', 'context', 'sandbox'}
+
+    def _git_root_from_path(path: str) -> str | None:
+        p = _Path(path)
+        check = p if p.is_dir() else p.parent
+        if not check.exists():
+            return None
+        try:
+            r = _subprocess.run(
+                ["git", "-C", str(check), "rev-parse", "--show-toplevel"],
+                capture_output=True, text=True, timeout=3
+            )
+            return r.stdout.strip() or None if r.returncode == 0 else None
+        except Exception:
+            return None
+
+    def _project_from_git_root(git_root: str) -> str:
+        p = _Path(git_root)
+        parts = p.parts
+        if 'worktrees' in parts:
+            idx = parts.index('worktrees')
+            if idx > 0:
+                return parts[idx - 1]
+        if p.name in _GENERIC_DIR_NAMES and p.parent.name:
+            return p.parent.name
+        return p.name
 
 
 def _git_root(cwd: str) -> str | None:
