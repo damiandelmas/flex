@@ -83,9 +83,11 @@ class TestRegisterAndResolve:
 
     def test_corpus_path_stored(self, tmp_registry):
         db_path = _make_cell(tmp_registry)
-        register_cell("mycel", db_path, corpus_path="/home/user/project/context")
+        corpus = str(tmp_registry / "project" / "context")
+        register_cell("mycel", db_path, corpus_path=corpus)
         cells = list_cells()
-        assert cells[0]['corpus_path'] == "/home/user/project/context"
+        from pathlib import Path
+        assert cells[0]['corpus_path'] == str(Path(corpus).resolve())
 
 
 class TestResolveForPath:
