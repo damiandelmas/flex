@@ -874,6 +874,15 @@ def sync_session_messages(session_id: str, conn: sqlite3.Connection,
         except Exception as e:
             print(f"[worker] Tool content store error: {e}", file=sys.stderr)
 
+    # Clean up empty source stubs — if we parsed the JSONL but produced zero
+    # chunks (e.g. file-history-snapshot only), remove the source row so it
+    # doesn't pollute session counts and graph coverage metrics.
+    if inserted == 0 and last_num == 0:
+        cur.execute("""
+            DELETE FROM _raw_sources
+            WHERE source_id = ? AND message_count = 0
+        """, (session_id,))
+
     return inserted
 
 
