@@ -13,29 +13,17 @@ SELECT 'chunks' as what, COUNT(*) as n FROM _raw_chunks
 UNION ALL
 SELECT 'sources', COUNT(*) FROM _raw_sources;
 
--- @query: schema
-SELECT name,
-    CASE
-        WHEN name LIKE '_raw_%' THEN 'raw (immutable, COMPILE)'
-        WHEN name LIKE '_edges_%' THEN 'edges (relationships)'
-        WHEN name LIKE '_types_%' THEN 'types (classification)'
-        WHEN name LIKE '_enrich_%' THEN 'enrich (mutable, meditate)'
-        WHEN name LIKE '_meta' OR name LIKE '_presets' OR name LIKE '_views' OR name LIKE '_ops' THEN 'infrastructure'
-        ELSE 'other'
-    END as lifecycle
-FROM sqlite_master
-WHERE type='table' AND name NOT LIKE '%fts%' AND name NOT LIKE '_qmem%'
-ORDER BY lifecycle, name;
-
--- @query: views
-SELECT name FROM sqlite_master WHERE type='view' ORDER BY name;
-
--- @query: view_schemas
-SELECT m.name as view_name, GROUP_CONCAT(p.name, ', ') as columns
+-- @query: query_surface
+-- Everything composable: views (primary), table functions, edge tables for explicit JOIN.
+SELECT 'view' as kind, m.name as name, GROUP_CONCAT(p.name, ', ') as columns, '' as note
 FROM sqlite_master m, pragma_table_info(m.name) p
 WHERE m.type = 'view'
 GROUP BY m.name
-ORDER BY m.name;
+UNION ALL
+SELECT 'table_function', 'vec_ops(''_raw_chunks'', ...)', 'id, score', 'Semantic retrieval — use after FROM/JOIN'
+UNION ALL
+SELECT 'table_function', 'chunks_fts', 'rowid, content', 'FTS5 keyword search (MATCH). Bridge to vec_ops via: SELECT c.id FROM chunks_fts f JOIN _raw_chunks c ON f.rowid = c.rowid'
+ORDER BY kind, name;
 
 -- @query: hubs
 SELECT g.source_id, src.title as label,

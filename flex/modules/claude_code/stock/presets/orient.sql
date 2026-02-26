@@ -14,30 +14,30 @@ SELECT 'chunks' as what, COUNT(*) as n FROM _raw_chunks
 UNION ALL
 SELECT 'sources', COUNT(*) FROM _raw_sources;
 
--- @query: schema
--- Internal tables. Query VIEWS (messages, sessions) instead — they compose these into a clean surface.
-SELECT name,
-    CASE
-        WHEN name LIKE '_raw_%' THEN 'raw (immutable, COMPILE)'
-        WHEN name LIKE '_edges_%' THEN 'edges (relationships)'
-        WHEN name LIKE '_types_%' THEN 'types (classification)'
-        WHEN name LIKE '_enrich_%' THEN 'enrich (mutable, meditate)'
-        WHEN name LIKE '_meta' OR name LIKE '_presets' OR name LIKE '_views' OR name LIKE '_ops' THEN 'infrastructure'
-        ELSE 'other'
-    END as lifecycle
-FROM sqlite_master
-WHERE type='table' AND name NOT LIKE '%fts%' AND name NOT LIKE '_qmem%'
-ORDER BY lifecycle, name;
-
--- @query: views
-SELECT name FROM sqlite_master WHERE type='view' ORDER BY name;
-
--- @query: view_schemas
-SELECT m.name as view_name, GROUP_CONCAT(p.name, ', ') as columns
+-- @query: query_surface
+-- Everything composable in one section: views (primary), table functions, edge tables for explicit JOIN.
+SELECT 'view' as kind, m.name as name, GROUP_CONCAT(p.name, ', ') as columns,
+    CASE m.name
+        WHEN 'messages' THEN 'Chunks with tool ops, identity, message type'
+        WHEN 'sessions' THEN 'Sources with graph intelligence, fingerprints'
+        ELSE ''
+    END as note
 FROM sqlite_master m, pragma_table_info(m.name) p
 WHERE m.type = 'view'
 GROUP BY m.name
-ORDER BY m.name;
+UNION ALL
+SELECT 'table_function', 'vec_ops(''_raw_chunks'', ...)', 'id, score', 'Semantic retrieval — use after FROM/JOIN'
+UNION ALL
+SELECT 'table_function', 'chunks_fts', 'rowid, content', 'FTS5 keyword search (MATCH). Bridge to vec_ops via: SELECT c.id FROM chunks_fts f JOIN _raw_chunks c ON f.rowid = c.rowid'
+UNION ALL
+SELECT 'edge_table', '_edges_raw_content', 'chunk_id, content, role', 'Tool input/output bodies — explicit JOIN when views not enough'
+UNION ALL
+SELECT 'edge_table', '_edges_delegations', 'chunk_id, child_session_id, agent_type, parent_source_id', 'Parent→child agent tree (recursive CTE)'
+UNION ALL
+SELECT 'edge_table', '_edges_content_identity', 'chunk_id, content_hash, blob_hash, old_blob_hash', 'Git content identity'
+UNION ALL
+SELECT 'edge_table', '_edges_repo_identity', 'chunk_id, repo_root', 'Repo root hash → _enrich_repo_identity lookup'
+ORDER BY kind, name;
 
 
 -- @query: hubs
