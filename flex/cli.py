@@ -367,6 +367,18 @@ def cmd_init(args):
     FLEX_HOME.mkdir(parents=True, exist_ok=True)
     (FLEX_HOME / "cells").mkdir(exist_ok=True)
 
+    # Auto-migrate queue.db from 2-col to 3-col schema (pre-0.2.0 installs)
+    _qdb = FLEX_HOME / "queue.db"
+    if _qdb.exists():
+        try:
+            _qconn = _sqlite3.connect(str(_qdb), timeout=5)
+            _qcols = [r[1] for r in _qconn.execute("PRAGMA table_info(claude_code_pending)")]
+            if _qcols and "payload" not in _qcols:
+                _qconn.execute("DROP TABLE claude_code_pending")
+                _qconn.commit()
+            _qconn.close()
+        except Exception:
+            pass  # queue.db is transient — worst case recreated by next hook
 
     buf = io.StringIO()
     with contextlib.redirect_stdout(buf), contextlib.redirect_stderr(buf):
