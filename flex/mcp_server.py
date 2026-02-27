@@ -319,6 +319,17 @@ def _execute_attaches(db: sqlite3.Connection, sql: str) -> tuple[str, str | None
     return remaining, None
 
 
+def _is_bare_text(query: str) -> bool:
+    """Detect bare text queries that aren't SQL or presets."""
+    q = query.strip()
+    if q.startswith('@'):
+        return False
+    upper = q.upper().lstrip()
+    sql_starts = ('SELECT', 'WITH', 'PRAGMA', 'EXPLAIN', 'INSERT', 'DELETE',
+                  'UPDATE', 'DROP', 'CREATE', 'ALTER', 'ATTACH')
+    return not any(upper.startswith(kw) for kw in sql_starts)
+
+
 def execute_query(db: sqlite3.Connection, query: str) -> str:
     """Execute read-only SQL or @preset on a cell. Returns JSON string."""
     sql = query.strip()
@@ -326,6 +337,26 @@ def execute_query(db: sqlite3.Connection, query: str) -> str:
     # Preset dispatch — @name [params]
     if sql.startswith('@'):
         return execute_preset(db, sql)
+
+    # Detect bare text before executing — surface a helpful error
+    if _is_bare_text(sql):
+        escaped = sql.replace("'", "''")
+        return json.dumps({
+            "error": f"Not valid SQL: \"{sql}\"",
+            "hint": "Use vec_ops() for semantic search, FTS for keyword match, or @preset syntax.",
+            "semantic": (
+                f"SELECT v.id, v.score, m.content "
+                f"FROM vec_ops('_raw_chunks', '{escaped}') v "
+                f"JOIN messages m ON v.id = m.id "
+                f"ORDER BY v.score DESC LIMIT 10"
+            ),
+            "keyword": (
+                f"SELECT c.id, c.content "
+                f"FROM chunks_fts f JOIN _raw_chunks c ON f.rowid = c.rowid "
+                f"WHERE chunks_fts MATCH '{escaped}' "
+                f"ORDER BY bm25(chunks_fts) LIMIT 10"
+            ),
+        })
 
     upper = sql.upper()
 
