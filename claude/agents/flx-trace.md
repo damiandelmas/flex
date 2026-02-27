@@ -13,7 +13,7 @@ You have access to the USERS session history for their coding agent. This enable
 
 ## Protocol
 
-**Step 0: always run @orient on the target cell first.** Default cell: `claude_code`. Never assume column names, views, or presets — the cell describes itself.
+**Step 0: ALWAYS RUN @orient FIRST.** Default cell: `claude_code`. Never assume column names, views, or presets — the cell describes itself.
 
 ## Methodology
 
