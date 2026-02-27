@@ -6,6 +6,7 @@ then queries the resulting cell to assert all invariants.
 Exit 0 = pass, exit 1 = fail.
 """
 import json
+import os
 import sqlite3
 import subprocess
 import sys
@@ -32,8 +33,15 @@ print("=" * 60)
 print("Running: flex init")
 print("=" * 60)
 
+init_cmd = ["flex", "init"]
+nomic_key = os.environ.get("NOMIC_API_KEY", "")
+if nomic_key:
+    init_cmd.extend(["--nomic-key", nomic_key])
+else:
+    init_cmd.append("--local")
+
 result = subprocess.run(
-    ["flex", "init"],
+    init_cmd,
     capture_output=False,   # let output stream to terminal
     timeout=600,
 )

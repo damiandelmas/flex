@@ -471,17 +471,30 @@ def cmd_init(args):
                             _saved_key = _line.split("=", 1)[1].strip()
                             break
                 _env_key = os.environ.get("NOMIC_API_KEY", "").strip()
-                key = _saved_key or _env_key
+                _flag_key = getattr(args, 'nomic_key', None) or ''
+                _force_local = getattr(args, 'local', False)
+                key = _saved_key or _flag_key or _env_key
 
-                if key:
+                if _force_local:
+                    key = ''  # explicit --local: skip Nomic entirely
+                elif key:
                     _nomic_embedder[0] = _NomicEmbedder(key)
-                else:
+                elif not sys.stdin.isatty():
+                    # Non-interactive (Docker, CI, PTY tools) — fall through to CPU
+                    console.print("  [dim]Non-interactive terminal detected, using local CPU.[/dim]")
+                    console.print("  [dim]For faster embeddings: flex init --nomic-key <key>[/dim]")
+                    key = ''
+
+                if not key and not _force_local and not _nomic_embedder[0] and sys.stdin.isatty():
                     est_secs = _est_unembedded / 27
                     est_str = f"~{est_secs / 60:.0f}m" if est_secs < 3600 else f"~{est_secs / 3600:.1f}h"
-                    console.print(f"  No GPU detected. Estimated embedding time: {est_str} on CPU.")
-                    console.print("  Recommended: use the Nomic API (same model, ~4 min, free tier).")
-                    console.print("  [dim]Note: chunks sent to Nomic's servers.[/dim]")
-                    console.print("  Get a free key: [bold blue][link=https://atlas.nomic.ai/cli-login]atlas.nomic.ai/cli-login[/link][/bold blue]")
+                    console.print("  No GPU detected.")
+                    console.print(f"  Estimated time to build your vectors on CPU: {est_str}.")
+                    console.print()
+                    console.print("  For faster indexing, use the Nomic API (~2m, free tier):")
+                    console.print("  [bold blue][link=https://atlas.nomic.ai/cli-login]atlas.nomic.ai/cli-login[/link][/bold blue]")
+                    console.print()
+                    console.print("  [dim]Ctrl+C is safe —[/dim] [blue]flex init[/blue] [dim]picks up where it left off.[/dim]")
                     console.print()
                     key = ''.join(c for c in input("  Enter Nomic API key (or press Enter to use local CPU): ") if c.isprintable()).strip()
                     if key:
@@ -1094,7 +1107,9 @@ def main():
     sub = parser.add_subparsers(dest="command")
 
     # flex init
-    sub.add_parser("init", help="Wire hooks, daemon, and MCP for Claude Code")
+    init_p = sub.add_parser("init", help="Wire hooks, daemon, and MCP for Claude Code")
+    init_p.add_argument("--local", action="store_true", help="Use local CPU for embeddings, skip Nomic prompt")
+    init_p.add_argument("--nomic-key", help="Nomic API key (skips interactive prompt)")
 
     # flex index
     idx = sub.add_parser("index", help="Index sessions or corpus")
