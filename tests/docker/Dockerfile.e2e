@@ -24,6 +24,7 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
     python3-pip \
     build-essential \
     git \
+    jq \
     && rm -rf /var/lib/apt/lists/*
 
 # ── Working dir ───────────────────────────────────────────────────────────────
@@ -39,6 +40,10 @@ RUN pip3 install --break-system-packages -e ".[mcp,cluster]"
 # Creates ~/.claude/projects/-home-testuser-myapp/{session}.jsonl
 COPY tests/docker/seed_sessions.py /seed_sessions.py
 RUN python3 /seed_sessions.py
+
+# ── flex-serve helper ─────────────────────────────────────────────────────
+COPY tests/docker/flex-serve.sh /usr/local/bin/flex-serve
+RUN chmod +x /usr/local/bin/flex-serve
 
 # ── Test runner ───────────────────────────────────────────────────────────────
 # Runs flex init and asserts all E2E invariants.
