@@ -18,7 +18,7 @@ SELECT 'sources', COUNT(*) FROM _raw_sources;
 -- Everything composable in one section: views (primary), table functions, edge tables for explicit JOIN.
 SELECT 'view' as kind, m.name as name, GROUP_CONCAT(p.name, ', ') as columns,
     CASE m.name
-        WHEN 'messages' THEN 'Chunks with tool ops, identity, message type'
+        WHEN 'messages' THEN 'type: user_prompt|assistant|tool_call. file_body: full file for Write, diff payload for Edit (NULL for non-file ops). Tool ops, identity, message type'
         WHEN 'sessions' THEN 'Sources with graph intelligence, fingerprints'
         ELSE ''
     END as note

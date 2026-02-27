@@ -942,6 +942,16 @@ class TestMaterializeVecOps:
         result = materialize_vec_ops(mat_db, sql)
         assert result == sql
 
+    def test_empty_prefilter_surfaces_error(self, mat_db):
+        """Pre-filter returning 0 candidates should say so, not 'no such table'."""
+        from flex.retrieve.vec_ops import materialize_vec_ops
+        sql = "SELECT v.id FROM vec_ops('_raw_chunks', 'test', '', " \
+              "'SELECT id FROM _raw_chunks WHERE id = ''nonexistent''') v LIMIT 3"
+        result = materialize_vec_ops(mat_db, sql)
+        assert '"error"' in result
+        assert '0 results' in result
+        assert 'no such table' not in result
+
     def test_vec_ops_fn_exception_surfaces_error(self):
         """If vec_ops_fn raises (not returns error dict), error surfaces, not 'no such table'."""
         from flex.retrieve.vec_ops import materialize_vec_ops

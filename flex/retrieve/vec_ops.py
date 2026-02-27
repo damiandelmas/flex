@@ -633,7 +633,7 @@ def materialize_vec_ops(db, sql: str) -> str:
             return json.dumps(results)
         return sql
     if not results:
-        return sql
+        return json.dumps({"error": "vec_ops returned 0 results — pre-filter may have matched no chunks. Check your WHERE clause."})
 
     # Populate temp table (unique name per call for HTTP concurrency)
     tmp_name = f"_vec_results_{uuid.uuid4().hex[:8]}"
