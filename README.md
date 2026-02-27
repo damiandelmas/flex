@@ -180,7 +180,6 @@ Capture any query as a preset. Ship with your module. Discoverable via `@orient`
 @genealogy       concept lineage — timeline, hubs, key excerpts
 @delegation-tree recursive sub-agent tree from any parent session
 @bridges         cross-community connector sessions
-@concept-diff    compare a concept between two time periods
 ```
 
 `@file` resolves a file UUID from any path, fans out to every session that ever touched it — across renames, moves, worktrees — and falls back to path matching for older data. One MCP call.

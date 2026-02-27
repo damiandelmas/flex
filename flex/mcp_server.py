@@ -588,7 +588,7 @@ def build_instructions() -> str:
         "`GROUP BY COALESCE(json_extract(m.file_uuids, '$[0]'), m.target_file)`",
         "",
         "**Session drill-down:**",
-        "`@story session=d332a1a0` or `@session-files session=d332a1a0`",
+        "`@story session=d332a1a0`",
         "",
         "# METHODOLOGY",
         "",
