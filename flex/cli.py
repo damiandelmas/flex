@@ -610,7 +610,7 @@ def cmd_init(args):
         console.print(
             f"  [bold]{stats['sessions']:,} sessions[/bold] · "
             f"[bold]{stats['chunks']:,} chunks[/bold]"
-            + (f" · [bold]{n_clusters}[/bold][dim] topic clusters[/dim]" if n_clusters else "")
+            + (f" · [bold]{n_clusters}[/bold] topic clusters" if n_clusters else "")
         )
         if _enrich_failures:
             console.print()
@@ -648,28 +648,26 @@ def cmd_init(args):
 
     # Final box
     panel_content = Text()
-    panel_content.append("Claude Code          ", style="white")
-    panel_content.append("ready\n\n", style="bold green")
-    panel_content.append("MCP Server Endpoint  ", style="white")
-    panel_content.append("http://localhost:7134", style="bold green")
-    console.print(Panel(panel_content, padding=(0, 1)))
-
-    # Onboarding hints
-    console.print()
-    console.print("  Flex is installed as an MCP server. Open a new Claude")
-    console.print("  session — type [bold]/mcp[/bold] to verify it's connected.")
+    panel_content.append("Flex is ready.\n\n", style="bold magenta")
+    panel_content.append("Claude Code            ", style="white")
+    panel_content.append("MCP server installed\n", style="green")
+    panel_content.append("restart or open a new session to connect\n\n", style="dim")
+    panel_content.append("MCP Server Endpoint    ", style="white")
+    panel_content.append("http://localhost:7134\n", style="green")
+    panel_content.append("use with claude.ai, Cursor, or any MCP client", style="dim")
+    console.print(Panel(panel_content, padding=(1, 2)))
     console.print()
     console.print("  Ask:")
-    console.print('    "Use flex: What did we accomplish today?"')
-    console.print('    "Use flex: What\'s the lineage of this file?"')
+    console.print('    [blue]"Use flex: What did we accomplish today?"[/blue]')
+    console.print('    [blue]"Use flex: What\'s the lineage of this file?"[/blue]')
     console.print()
     console.print("  Agent:")
-    console.print('    "Use flx-trace: What projects am I working on?"')
+    console.print('    [blue]"Use flx-trace: What projects am I working on?"[/blue]')
     console.print("    [dim]Spawns a dedicated retrieval sub-agent for deeper searches.[/dim]")
     console.print()
     console.print("  Slash commands:")
-    console.print("    [bold]/flex:local[/bold] [dim]— search with the current agent[/dim]")
-    console.print("    [bold]/flex:agent[/bold] [dim]— delegate to flx-trace[/dim]")
+    console.print("    [blue]/flex:local[/blue] [dim]— search with the current agent[/dim]")
+    console.print("    [blue]/flex:agent[/blue] [dim]— delegate to flx-trace[/dim]")
     console.print()
     console.print("  Control depth by ending your slash command with:")
     console.print("    [dim]go           quick[/dim]")
