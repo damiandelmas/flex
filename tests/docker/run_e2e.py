@@ -313,6 +313,55 @@ if shutil.which("flex-serve"):
         except json.JSONDecodeError:
             check("orient json parse", False, f"raw: {r_orient.stdout[:300]}")
 
+# ── Claude Code MCP integration ───────────────────────────────────────────────
+# If OAuth credentials are available, test the full chain:
+# Claude Code → flex MCP → cell query → real result
+creds = Path.home() / ".claude" / ".credentials.json"
+if creds.exists() and shutil.which("claude"):
+    print()
+    print("=" * 60)
+    print("Testing Claude Code → flex MCP integration")
+    print("=" * 60)
+
+    r_claude = subprocess.run(
+        ["claude", "-p",
+         "--output-format", "json",
+         "--allowedTools", "mcp__flex__flex_search",
+         "--max-turns", "3",
+         'Use the flex MCP tool (mcp__flex__flex_search) to run this exact SQL query: '
+         'SELECT COUNT(*) as n FROM sessions. '
+         'The cell parameter should be "claude_code". '
+         'Return ONLY the number from the result, nothing else.'],
+        capture_output=True, text=True, timeout=120,
+    )
+
+    try:
+        claude_out = json.loads(r_claude.stdout) if r_claude.stdout else {}
+    except json.JSONDecodeError:
+        claude_out = {}
+
+    is_error = claude_out.get("is_error", True)
+    result_text = str(claude_out.get("result", ""))
+    num_turns = claude_out.get("num_turns", 0)
+
+    check("claude -p exit 0", r_claude.returncode == 0,
+          r_claude.stderr[:200] if r_claude.stderr else "")
+    check("claude MCP no error", not is_error,
+          f"result: {result_text[:200]}")
+    check("claude MCP used tool", num_turns >= 2,
+          f"num_turns={num_turns} (1 = no tool call)")
+    # Result should contain a number (the session count)
+    import re
+    numbers = re.findall(r'\d+', result_text)
+    check("claude MCP returned count",
+          any(int(n) > 0 for n in numbers) if numbers else False,
+          f"result: {result_text[:200]}")
+else:
+    print()
+    print("=" * 60)
+    print("Skipping Claude Code MCP test (no credentials)")
+    print("=" * 60)
+
 # ── Cleanup ────────────────────────────────────────────────────────────────────
 subprocess.run(["flex-serve", "--stop"], capture_output=True)
 
