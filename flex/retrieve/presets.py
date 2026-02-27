@@ -198,12 +198,14 @@ class PresetLoader:
 
             current_sql_lines.append(line)
 
-        # Save last query
-        if current_query_name is not None and current_sql_lines:
+        # Save last query.
+        # If no -- @query: was ever seen, this is a single-query preset — use 'default'.
+        final_name = current_query_name if current_query_name is not None else 'default'
+        if current_sql_lines:
             sql = '\n'.join(current_sql_lines).strip()
             if sql:
                 preset['queries'].append({
-                    'name': current_query_name,
+                    'name': final_name,
                     'sql': sql
                 })
 

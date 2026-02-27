@@ -616,7 +616,9 @@ def build_instructions() -> str:
         "Pass `@name` as the query parameter. Run `@orient` to discover all presets per cell.",
         "Presets accept positional args: `@story session=abc123`, `@digest days=14`.",
         "",
-        "**ALWAYS START WITH: `query=\"@orient\"` for cell schema, views, communities, hubs, and presets.**",
+        "# EXTREMELY IMPORTANT",
+        "",
+        "**ALWAYS START WITH: `query=\"@orient\"` BEFORE RUNNING ANY QUERIES. THIS GIVES YOU UP TO DATE INFORMATION ON: cell schema, views, communities, hubs, and presets.**",
         "",
     ])
     return "\n".join(parts)
