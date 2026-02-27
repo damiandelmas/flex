@@ -32,6 +32,12 @@ PRIVATE=(
     tests/test_unified_sync.py
     publish.sh
     bump.sh
+    bin/flex
+    flex/mcp_server.service
+    flex/modules/claude_code/scripts
+    flex/modules/claude_code/manage/enrich_soma_repos.py
+    flex/modules/claude_code/manage/backfill_metadata.py
+    flex/modules/claude_code/resume.py
 )
 
 DRY_RUN=false

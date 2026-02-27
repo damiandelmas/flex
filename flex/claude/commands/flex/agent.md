@@ -1,6 +1,6 @@
 # TASK
 
-Spawn the `flex-agent` subagent to investigate the following query against the user's knowledge cells:
+Spawn the `flx-trace` subagent to investigate the following query against the user's knowledge cells:
 
 $ARGUMENTS
 
@@ -8,7 +8,11 @@ The agent will orient, explore, and return a synthesis. Compile an appropriate r
 
 ## Depth
 
-**VERY IMPORTANT:** THIS SIGNALS THE DEPTH OF RESEARCH FOR THE USERS. FOR QUICK: JUST SURFACE A QUICK ANSWER. USE ONE TO THREE QUERIES. FOR EXHAUSTIVE SEARCH: DO EXTENSIVE AND EXPLORATIVE RESEARCH USING FLEX. RETURN A COMPLETE REPORT.
+**VERY IMPORTANT:** THIS SIGNALS THE DEPTH OF RESEARCH FOR THE USERS.
+
+FOR QUICK: JUST SURFACE A QUICK ANSWER. USE ONE TO THREE QUERIES.
+
+FOR EXHAUSTIVE SEARCH: DO EXTENSIVE AND EXPLORATIVE RESEARCH USING FLEX. RETURN A COMPLETE REPORT.
 
 Count the o's after the g in the go signal:
 
