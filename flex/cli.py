@@ -478,7 +478,14 @@ def cmd_init(args):
                 if _force_local:
                     key = ''  # explicit --local: skip Nomic entirely
                 elif key:
-                    _nomic_embedder[0] = _NomicEmbedder(key)
+                    _ne = _NomicEmbedder(key)
+                    _err = _ne.validate()
+                    if _err:
+                        console.print(f"  [yellow]Nomic key invalid: {_err}[/yellow]")
+                        console.print("  Falling back to local CPU.")
+                        key = ''
+                    else:
+                        _nomic_embedder[0] = _ne
                 elif not sys.stdin.isatty():
                     # Non-interactive (Docker, CI, PTY tools) — fall through to CPU
                     console.print("  [dim]Non-interactive terminal detected, using local CPU.[/dim]")
