@@ -3,6 +3,7 @@
 # Usage: ./bump.sh
 
 set -euo pipefail
+cd "$(dirname "$0")"
 
 CURRENT=$(grep '^version' pyproject.toml | head -1 | grep -oP '"\K[^"]+')
 IFS='.' read -r MAJOR MINOR PATCH <<< "$CURRENT"
