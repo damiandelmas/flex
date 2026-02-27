@@ -106,6 +106,7 @@ git push "$REMOTE" "v$VERSION" --force
 
 # Cleanup
 git checkout -f dev
+git clean -fd flex/ tests/ .github/
 git branch -D "$BRANCH"
 git tag -d "v$VERSION"
 
