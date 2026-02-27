@@ -30,7 +30,7 @@ SELECT 'table_function', 'vec_ops [_raw_chunks]', 'id, score', 'Semantic retriev
 UNION ALL
 SELECT 'table_function', 'chunks_fts', 'rowid, content', 'FTS5 keyword search (MATCH). Bridge to vec_ops via: SELECT c.id FROM chunks_fts f JOIN _raw_chunks c ON f.rowid = c.rowid'
 UNION ALL
-SELECT 'edge_table', '_edges_raw_content', 'chunk_id, content, role', 'Tool input/output bodies — explicit JOIN when views not enough'
+SELECT 'edge_table', '_edges_raw_content', 'chunk_id, content_hash', 'Bridge to _raw_content(hash, content). Use file_body in messages view instead'
 UNION ALL
 SELECT 'edge_table', '_edges_delegations', 'chunk_id, child_session_id, agent_type, parent_source_id', 'Parent→child agent tree (recursive CTE)'
 UNION ALL
