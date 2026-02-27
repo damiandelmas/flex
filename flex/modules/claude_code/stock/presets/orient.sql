@@ -26,7 +26,7 @@ FROM sqlite_master m, pragma_table_info(m.name) p
 WHERE m.type = 'view'
 GROUP BY m.name
 UNION ALL
-SELECT 'table_function', 'vec_ops(''_raw_chunks'', ...)', 'id, score', 'Semantic retrieval — use after FROM/JOIN'
+SELECT 'table_function', 'vec_ops [_raw_chunks]', 'id, score', 'Semantic retrieval — use after FROM/JOIN. Args: table, query, tokens, pre_filter_sql'
 UNION ALL
 SELECT 'table_function', 'chunks_fts', 'rowid, content', 'FTS5 keyword search (MATCH). Bridge to vec_ops via: SELECT c.id FROM chunks_fts f JOIN _raw_chunks c ON f.rowid = c.rowid'
 UNION ALL
@@ -62,9 +62,6 @@ GROUP BY g.community_id ORDER BY sources DESC LIMIT 8;
 
 -- @query: presets
 SELECT name, description, params FROM _presets ORDER BY name;
-
--- @query: retrieval
-SELECT key, value FROM _meta WHERE key LIKE 'retrieval:%' ORDER BY key;
 
 -- @query: coverage
 -- Identity edges are PARTIAL BY DESIGN. <100% is normal.

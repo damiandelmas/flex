@@ -148,7 +148,7 @@ class PresetLoader:
             'defaults': {}
         }
 
-        current_query_name = 'default'
+        current_query_name = None
         current_sql_lines = []
 
         for line in text.split('\n'):
@@ -167,7 +167,7 @@ class PresetLoader:
                         preset['multi'] = value.lower() == 'true'
                     elif key == 'query':
                         # Save previous query
-                        if current_sql_lines:
+                        if current_query_name is not None and current_sql_lines:
                             sql = '\n'.join(current_sql_lines).strip()
                             if sql:
                                 preset['queries'].append({
@@ -199,7 +199,7 @@ class PresetLoader:
             current_sql_lines.append(line)
 
         # Save last query
-        if current_sql_lines:
+        if current_query_name is not None and current_sql_lines:
             sql = '\n'.join(current_sql_lines).strip()
             if sql:
                 preset['queries'].append({

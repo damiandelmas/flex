@@ -135,6 +135,69 @@ if cell_path and cell_path.exists():
     ).fetchone()[0]
     check("source graph has rows", n_graph > 0, f"got {n_graph}")
 
+    # ── Delegation edges ──────────────────────────────────────────────────────
+    n_deleg = conn.execute(
+        "SELECT COUNT(*) FROM _edges_delegations"
+    ).fetchone()[0]
+    n_deleg_valid = conn.execute(
+        "SELECT COUNT(*) FROM _edges_delegations d "
+        "JOIN _raw_chunks r ON d.chunk_id = r.id"
+    ).fetchone()[0]
+    check("delegation edges exist", n_deleg > 0, f"got {n_deleg}")
+    check("delegation 100% JOIN rate",
+          n_deleg == n_deleg_valid,
+          f"total={n_deleg} valid={n_deleg_valid}")
+
+    n_agent_type = conn.execute(
+        "SELECT COUNT(*) FROM _edges_delegations WHERE agent_type IS NOT NULL"
+    ).fetchone()[0]
+    check("delegation agent_type populated",
+          n_agent_type == n_deleg,
+          f"nonnull={n_agent_type} total={n_deleg}")
+
+    # no duplicate delegation edges
+    n_dupes = conn.execute(
+        "SELECT COUNT(*) FROM ("
+        "  SELECT chunk_id, child_session_id, COUNT(*) as c"
+        "  FROM _edges_delegations GROUP BY chunk_id, child_session_id HAVING c > 1"
+        ")"
+    ).fetchone()[0]
+    check("delegation no duplicates", n_dupes == 0, f"got {n_dupes} dupes")
+
+    # ── Preset param validation ───────────────────────────────────────────────
+    # @story with no session param should return error, not crash
+    r_preset = subprocess.run(
+        ["flex", "search", "--json", "@story"],
+        capture_output=True, text=True, timeout=15,
+    )
+    check("preset missing param no crash", r_preset.returncode == 0)
+    if r_preset.returncode == 0:
+        try:
+            out = json.loads(r_preset.stdout)
+            has_error = (isinstance(out, dict) and "error" in out) or (
+                isinstance(out, list) and len(out) > 0
+                and isinstance(out[0], dict) and "error" in out[0])
+            check("preset missing param returns error", has_error,
+                  f"got: {r_preset.stdout[:200]}")
+        except Exception:
+            # non-JSON is also acceptable (error message)
+            check("preset missing param returns error", True)
+
+    # ── View exclusions (graceful with empty _meta) ───────────────────────────
+    # Views should work even without exclude_paths/_meta keys seeded
+    conn.row_factory = sqlite3.Row
+    try:
+        n_msg_view = conn.execute("SELECT COUNT(*) as n FROM messages").fetchone()[0]
+        check("messages view queryable", n_msg_view > 0, f"got {n_msg_view}")
+    except Exception as e:
+        check("messages view queryable", False, str(e))
+
+    try:
+        n_sess_view = conn.execute("SELECT COUNT(*) as n FROM sessions").fetchone()[0]
+        check("sessions view queryable", n_sess_view > 0, f"got {n_sess_view}")
+    except Exception as e:
+        check("sessions view queryable", False, str(e))
+
     conn.close()
 
 # ── flex-serve + vec_ops ───────────────────────────────────────────────────────
@@ -163,6 +226,42 @@ if shutil.which("flex-serve"):
                   all("score" in row for row in rows), "missing score")
         except Exception as e:
             check("vec_ops json parse", False, str(e))
+
+    # ── Authorizer — write operations blocked ─────────────────────────────────
+    for label, sql in [
+        ("DELETE blocked",  "DELETE FROM _raw_chunks WHERE 1=0"),
+        ("DROP blocked",    "DROP TABLE _raw_chunks"),
+        ("comment bypass blocked", "/* hi */ DROP TABLE _raw_chunks"),
+    ]:
+        r_auth = subprocess.run(
+            ["flex", "search", "--json", sql],
+            capture_output=True, text=True, timeout=15,
+        )
+        if r_auth.returncode == 0:
+            try:
+                out = json.loads(r_auth.stdout)
+                blocked = isinstance(out, dict) and "error" in out
+                check(label, blocked, f"got: {r_auth.stdout[:200]}")
+            except Exception:
+                check(label, True)  # non-JSON error output = blocked
+        else:
+            check(label, True)  # non-zero exit = blocked
+
+    # ── Orient query_surface structure ────────────────────────────────────────
+    r_orient = subprocess.run(
+        ["flex", "search", "--json", "@orient"],
+        capture_output=True, text=True, timeout=15,
+    )
+    check("orient exit 0", r_orient.returncode == 0,
+          r_orient.stderr[:200] if r_orient.stderr else "")
+    if r_orient.returncode == 0:
+        try:
+            orient_out = r_orient.stdout
+            check("orient has query_surface",
+                  "query_surface" in orient_out or "view" in orient_out,
+                  f"first 300 chars: {orient_out[:300]}")
+        except Exception as e:
+            check("orient structure", False, str(e))
 
 # ── Summary ───────────────────────────────────────────────────────────────────
 print()
