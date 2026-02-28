@@ -1,0 +1,32 @@
+# Dirty devtools test — simulates Mac-like environment with GNU flex installed.
+#
+# GNU flex (the lexer generator) occupies /usr/bin/flex. Tests verify that
+# getflex's `flx` binary works regardless.
+#
+# Build:
+#   docker build -f tests/docker/Dockerfile.dirty-devtools -t flex-test-dirty-devtools .
+#
+# Run:
+#   docker run --rm flex-test-dirty-devtools
+
+FROM ubuntu:24.04
+
+RUN apt-get update && apt-get install -y \
+    flex bison gcc make \
+    python3 python3-pip python3-venv python3.12-dev \
+    git jq build-essential \
+    && rm -rf /var/lib/apt/lists/*
+
+# GNU flex is now at /usr/bin/flex — tests must verify flx works regardless
+COPY pyproject.toml /flex/
+COPY flex/ /flex/flex/
+WORKDIR /flex
+
+RUN pip install -e ".[mcp,cluster]" --break-system-packages
+
+COPY tests/docker/seed_sessions.py /seed_sessions.py
+COPY tests/docker/harness.py /harness.py
+COPY tests/docker/run_dirty.py /run_dirty.py
+RUN NUM_SESSIONS=20 python3 /seed_sessions.py
+
+CMD ["python3", "/run_dirty.py", "--scenario", "devtools"]

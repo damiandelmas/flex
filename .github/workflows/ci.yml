@@ -39,6 +39,27 @@ jobs:
           pip install pytest
           pytest tests/ -x -q -m "not pipeline" --tb=short
 
+      - name: Install smoke test (Unix)
+        if: runner.os != 'Windows'
+        run: |
+          flx init --local
+          flx search "SELECT COUNT(*) FROM sessions"
+          python3 -c "
+          import json, pathlib, sys
+          cfg = json.loads(pathlib.Path.home().joinpath('.claude.json').read_text())
+          srv = cfg['mcpServers']['flex']
+          assert 'command' in srv, f'Expected stdio transport, got: {srv}'
+          assert sys.executable in srv['command'], f'Expected {sys.executable} in command'
+          print('MCP config OK: stdio transport with correct Python path')
+          "
+
+      - name: Install smoke test (Windows)
+        if: runner.os == 'Windows'
+        run: |
+          flx init --local
+          flx search "SELECT COUNT(*) FROM sessions"
+          python -c "import json, pathlib, sys; cfg = json.loads(pathlib.Path.home().joinpath('.claude.json').read_text()); srv = cfg['mcpServers']['flex']; assert 'command' in srv, f'Expected stdio transport, got: {srv}'; assert sys.executable in srv['command'], f'Expected {sys.executable} in command'; print('MCP config OK: stdio transport with correct Python path')"
+
   docker-e2e:
     name: Docker E2E
     runs-on: ubuntu-latest

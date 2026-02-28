@@ -1,0 +1,30 @@
+# Dirty conda test — simulates conda Python environment.
+#
+# Verifies sys.executable resolution and MCP config correctness when
+# Python lives inside a conda env path.
+#
+# Build:
+#   docker build -f tests/docker/Dockerfile.dirty-conda -t flex-test-dirty-conda .
+#
+# Run:
+#   docker run --rm flex-test-dirty-conda
+
+FROM continuumio/miniconda3
+
+RUN conda create -n testenv python=3.12 -y
+RUN apt-get update && apt-get install -y git jq && rm -rf /var/lib/apt/lists/*
+
+SHELL ["conda", "run", "-n", "testenv", "/bin/bash", "-c"]
+
+COPY pyproject.toml /flex/
+COPY flex/ /flex/flex/
+WORKDIR /flex
+
+RUN pip install -e ".[mcp,cluster]"
+
+COPY tests/docker/seed_sessions.py /seed_sessions.py
+COPY tests/docker/harness.py /harness.py
+COPY tests/docker/run_dirty.py /run_dirty.py
+RUN NUM_SESSIONS=20 python3 /seed_sessions.py
+
+CMD ["conda", "run", "-n", "testenv", "python3", "/run_dirty.py", "--scenario", "conda"]

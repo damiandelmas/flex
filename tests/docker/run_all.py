@@ -66,6 +66,34 @@ SUITES = {
         "timeout": 300,
         "needs_rw_model": False,
     },
+    "dirty-devtools": {
+        "dockerfile": "Dockerfile.dirty-devtools",
+        "runner": "/run_dirty.py --scenario devtools",
+        "image": "flex-test-dirty-devtools",
+        "timeout": 300,
+        "needs_rw_model": False,
+    },
+    "dirty-conda": {
+        "dockerfile": "Dockerfile.dirty-conda",
+        "runner": "/run_dirty.py --scenario conda",
+        "image": "flex-test-dirty-conda",
+        "timeout": 300,
+        "needs_rw_model": False,
+    },
+    "dirty-upgrade": {
+        "dockerfile": "Dockerfile.dirty-upgrade",
+        "runner": "/run_dirty.py --scenario upgrade",
+        "image": "flex-test-dirty-upgrade",
+        "timeout": 300,
+        "needs_rw_model": False,
+    },
+    "dirty-minimal": {
+        "dockerfile": "Dockerfile.dirty-minimal",
+        "runner": "/run_dirty.py --scenario minimal",
+        "image": "flex-test-dirty-minimal",
+        "timeout": 300,
+        "needs_rw_model": False,
+    },
 }
 
 # Default suites (fast, deterministic)
@@ -108,12 +136,13 @@ def _run_suite(name: str, suite: dict) -> dict:
 
     model_args = _model_mount_args(suite)
 
+    runner_parts = suite["runner"].split()
     cmd = [
         "docker", "run", "--rm",
         *model_args,
         "-v", f"{suite_dir}:/tmp:rw",
         suite["image"],
-        "python3", suite["runner"],
+        "python3", *runner_parts,
     ]
 
     r = subprocess.run(

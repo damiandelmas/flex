@@ -610,6 +610,60 @@ else:
     h.phase("Claude Code MCP integration (SKIPPED)")
     h.skip("claude MCP checks", "no credentials or claude binary")
 
+# ── Background Indexer Queue Drain ────────────────────────────────────────────
+h.phase("Background Indexer Queue Drain")
+
+queue_db = os.path.expanduser("~/.flex/queue.db")
+conn_q = sqlite3.connect(queue_db)
+conn_q.execute(
+    "CREATE TABLE IF NOT EXISTS claude_code_pending "
+    "(session_id TEXT NOT NULL, ts INTEGER NOT NULL, payload TEXT NOT NULL)"
+)
+# Use a session_id from the seed data
+fake_event = json.dumps({
+    "tool": "Read",
+    "file": "/test/file.py",
+    "session": "00000001-0000-0000-0000-000000000001",
+    "msg": 999,
+    "cwd": "/tmp",
+    "ts": int(time.time()),
+})
+conn_q.execute(
+    "INSERT INTO claude_code_pending VALUES (?, ?, ?)",
+    ("00000001-0000-0000-0000-000000000001", int(time.time()), fake_event),
+)
+conn_q.commit()
+conn_q.close()
+
+# Start MCP server in background (stdio mode)
+mcp_proc = subprocess.Popen(
+    [sys.executable, "-m", "flex.mcp_server"],
+    stdin=subprocess.PIPE,
+    stdout=subprocess.PIPE,
+    stderr=subprocess.PIPE,
+)
+
+# Poll for queue drain (up to 10s)
+drained = False
+remaining = -1
+for _ in range(20):
+    time.sleep(0.5)
+    c = sqlite3.connect(queue_db)
+    remaining = c.execute("SELECT COUNT(*) FROM claude_code_pending").fetchone()[0]
+    c.close()
+    if remaining == 0:
+        drained = True
+        break
+
+h.check("bg-indexer-queue-drain", drained,
+        f"Background indexer drained queue within 10s (remaining: {remaining})")
+
+mcp_proc.terminate()
+try:
+    mcp_proc.wait(timeout=5)
+except Exception:
+    mcp_proc.kill()
+
 # ── Cleanup ────────────────────────────────────────────────────────────────────
 if shutil.which("flex-serve"):
     subprocess.run(["flex-serve", "--stop"], capture_output=True)

@@ -1,4 +1,4 @@
-.PHONY: test test-unit test-pipeline test-docker test-all test-ux clean-test
+.PHONY: test test-unit test-pipeline test-docker test-all test-ux test-dirty clean-test
 
 # Fast unit tests (in-memory SQLite, no Docker, <30s)
 test-unit:
@@ -23,7 +23,11 @@ test-all:
 test-ux:
 	python tests/docker/run_all.py --suite ux
 
+# Dirty environment tests (GNU flex collision, conda, upgrade, minimal)
+test-dirty:
+	python tests/docker/run_all.py --suite dirty-devtools --suite dirty-conda --suite dirty-upgrade --suite dirty-minimal
+
 # Clean test artifacts
 clean-test:
 	rm -rf /tmp/flex-test-results/
-	docker rmi flex-test-e2e flex-test-install flex-test-upgrade 2>/dev/null || true
+	docker rmi flex-test-e2e flex-test-install flex-test-upgrade flex-test-dirty-devtools flex-test-dirty-conda flex-test-dirty-upgrade flex-test-dirty-minimal 2>/dev/null || true
