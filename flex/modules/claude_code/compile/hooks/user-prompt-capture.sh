@@ -50,7 +50,7 @@ EVENT=$(jq -cn \
     }')
 
 # SQLite queue — hook must create table inline (may fire before worker starts)
-echo "$EVENT" | python3 -c "
+echo "$EVENT" | __FLEX_PYTHON__ -c "
 import sqlite3, sys
 event = sys.stdin.read()
 db = sqlite3.connect('${QUEUE_DB}', timeout=5)

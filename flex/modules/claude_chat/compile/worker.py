@@ -305,7 +305,7 @@ def main():
             persist(db, scores, table='_enrich_source_graph',
                     id_col='source_id')
             print(f"Graph: {len(scores.get('hubs', []))} hubs, "
-                  f"{len(set(scores.get('communities', {}).values()))} communities")
+                  f"{len(scores.get('communities', []))} communities")
 
     # Regenerate views
     from flex.views import regenerate_views

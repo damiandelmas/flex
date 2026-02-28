@@ -82,7 +82,7 @@ case "$TOOL_NAME" in
         SUBAGENT=$(echo "$INPUT" | jq -r '.tool_input.subagent_type // empty')
         PROMPT=$(echo "$INPUT" | jq -r '.tool_input.prompt // empty' | head -c 500)
         RESULT_TEXT=$(echo "$INPUT" | jq -r '.tool_result // .result // ""')
-        SPAWNED_AGENT=$(echo "$RESULT_TEXT" | grep -oP 'agentId: \K[a-f0-9]+' | head -1 || true)
+        SPAWNED_AGENT=$(echo "$RESULT_TEXT" | grep -o 'agentId: [a-f0-9]*' | head -1 | sed 's/agentId: //' || true)
         ;;
     TaskOutput)
         COMMAND=$(echo "$INPUT" | jq -r '.tool_input.task_id // empty')
@@ -183,7 +183,7 @@ EVENT=$(jq -cn \
     } | with_entries(select(.value != null))')
 
 # SQLite queue — hook must create table inline (may fire before worker starts)
-echo "$EVENT" | python3 -c "
+echo "$EVENT" | __FLEX_PYTHON__ -c "
 import sqlite3, sys
 event = sys.stdin.read()
 db = sqlite3.connect('${QUEUE_DB}', timeout=5)

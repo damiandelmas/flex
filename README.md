@@ -10,6 +10,8 @@ Flex gives your agent the schema and gets out of the way. Your agent reads what 
 pip install getflex && flex init
 ```
 
+> If `flex` resolves to GNU flex on your system, use `python -m flex init` instead.
+
 ---
 
 ## Ecosystem

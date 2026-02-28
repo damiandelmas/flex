@@ -223,7 +223,7 @@ def _refresh_graph(conn, cell_name: str):
         log_op(conn, 'build_similarity_graph', '_enrich_source_graph',
                params={'threshold': 0.55, 'center': True,
                        'nodes': G.number_of_nodes(), 'edges': edge_count,
-                       'communities': len(set(scores.get('communities', {}).values())),
+                       'communities': len(scores.get('communities', [])),
                        'hubs': len(scores.get('hubs', [])),
                        'trigger': 'auto_refresh'},
                rows_affected=G.number_of_nodes(),

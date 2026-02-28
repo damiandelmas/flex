@@ -7,7 +7,7 @@ vec_ops registered as a function for semantic queries.
 
 Usage:
     python -m flex.mcp_server                          # stdio (Claude Code)
-    python -m flex.mcp_server --http --port 8080       # SSE  (claude.ai)
+    python -m flex.mcp_server --http --port 7134       # streamable HTTP
     python -m flex.mcp_server --cell claude_code --cell qmem # multi-cell
 """
 
@@ -21,7 +21,7 @@ from contextlib import contextmanager
 from datetime import datetime, timezone
 from pathlib import Path
 
-from mcp.server.lowlevel import Server, NotificationOptions
+from mcp.server.lowlevel import Server
 from mcp.server.stdio import stdio_server
 import mcp.types as types
 
@@ -915,27 +915,25 @@ async def handle_call_tool(
 
 
 # ============================================================
-# HTTP/SSE Mode (for claude.ai)
+# HTTP Mode (streamable HTTP for Claude Code, claude.ai, Cursor)
 # ============================================================
 
-def run_http_server(port: int = 8080):
-    from mcp.server.sse import SseServerTransport
+def run_http_server(port: int = 7134):
+    from mcp.server.streamable_http_manager import StreamableHTTPSessionManager
     from starlette.applications import Starlette
     from starlette.routing import Route, Mount
     from starlette.requests import Request
-    from starlette.responses import JSONResponse, Response
+    from starlette.responses import JSONResponse
     import uvicorn
 
-    sse = SseServerTransport("/messages")
+    session_manager = StreamableHTTPSessionManager(
+        app=server,
+        json_response=True,
+        stateless=True,
+    )
 
-    async def handle_sse(request: Request) -> Response:
-        async with sse.connect_sse(
-            request.scope, request.receive, request._send
-        ) as streams:
-            await server.run(
-                streams[0], streams[1], server.create_initialization_options()
-            )
-        return Response()
+    async def handle_mcp(scope, receive, send):
+        await session_manager.handle_request(scope, receive, send)
 
     async def health(request: Request) -> JSONResponse:
         return JSONResponse({
@@ -953,7 +951,8 @@ def run_http_server(port: int = 8080):
         task = None
         if _machine_id():
             task = asyncio.create_task(_run_relay_client())
-        yield
+        async with session_manager.run():
+            yield
         if task:
             task.cancel()
 
@@ -962,12 +961,11 @@ def run_http_server(port: int = 8080):
         lifespan=lifespan,
         routes=[
             Route("/health", health),
-            Route("/sse", handle_sse, methods=["GET"]),
-            Mount("/messages", app=sse.handle_post_message),
+            Mount("/mcp", app=handle_mcp),
         ],
     )
 
-    print(f"[flex-mcp] HTTP/SSE on port {port}", file=sys.stderr)
+    print(f"[flex-mcp] streamable-http on port {port}", file=sys.stderr)
     uvicorn.run(app, host="127.0.0.1", port=port)
 
 
@@ -1071,9 +1069,9 @@ def main():
     parser.add_argument("--no-embed", action="store_true",
                         help="Skip loading embeddings/VectorCache")
     parser.add_argument("--http", action="store_true",
-                        help="Run as HTTP/SSE server (for claude.ai)")
-    parser.add_argument("--port", type=int, default=8080,
-                        help="HTTP port (default: 8080)")
+                        help="Run as streamable HTTP server")
+    parser.add_argument("--port", type=int, default=7134,
+                        help="HTTP port (default: 7134)")
     args = parser.parse_args()
 
     global _no_embed
@@ -1106,12 +1104,99 @@ def main():
         asyncio.run(_run_stdio())
 
 
+async def _background_indexer():
+    """Background task: drains queue.db and runs enrichment in stdio mode.
+
+    Defense-in-depth. On platforms with a daemon (systemd/launchd), this
+    finds nothing to drain. On platforms without a daemon (Windows, broken
+    installs), this is the only thing keeping the cell fresh.
+    """
+    from flex.registry import resolve_cell, FLEX_HOME
+
+    QUEUE_DB = FLEX_HOME / "queue.db"
+    ENRICH_INTERVAL = 30 * 60  # 30 minutes
+    POLL_INTERVAL = 2
+
+    # Wait for cell to exist
+    cell_path = None
+    while cell_path is None:
+        try:
+            cell_path = resolve_cell("claude_code")
+        except Exception:
+            pass
+        if cell_path is None or not cell_path.exists():
+            cell_path = None
+            await asyncio.sleep(5)
+
+    print("[flex-mcp] Background indexer started", file=sys.stderr)
+
+    loop = asyncio.get_running_loop()
+    last_enrich = 0
+
+    def _drain_queue():
+        """Synchronous queue drain — runs in executor."""
+        import sqlite3
+        if not QUEUE_DB.exists():
+            return
+
+        try:
+            from flex.modules.claude_code.compile.worker import process_queue
+            conn = sqlite3.connect(str(cell_path), timeout=30)
+            conn.row_factory = sqlite3.Row
+            conn.execute("PRAGMA journal_mode=WAL")
+            conn.execute("PRAGMA busy_timeout=30000")
+            process_queue(conn)
+            conn.close()
+        except Exception as e:
+            print(f"[flex-mcp] bg drain error: {e}", file=sys.stderr)
+
+    def _run_bg_enrichment():
+        """Synchronous enrichment — runs in executor."""
+        import sqlite3
+        try:
+            from flex.modules.claude_code.compile.worker import _run_enrichment_cycle
+            conn = sqlite3.connect(str(cell_path), timeout=30)
+            conn.row_factory = sqlite3.Row
+            conn.execute("PRAGMA journal_mode=WAL")
+            conn.execute("PRAGMA busy_timeout=30000")
+            _run_enrichment_cycle(conn)
+            conn.close()
+        except Exception as e:
+            print(f"[flex-mcp] bg enrichment error: {e}", file=sys.stderr)
+
+    while True:
+        try:
+            # Drain queue
+            await loop.run_in_executor(None, _drain_queue)
+
+            # Enrichment every 30 minutes
+            now = time.monotonic()
+            if now - last_enrich >= ENRICH_INTERVAL:
+                await loop.run_in_executor(None, _run_bg_enrichment)
+                last_enrich = now
+
+            await asyncio.sleep(POLL_INTERVAL)
+        except asyncio.CancelledError:
+            break
+        except Exception as e:
+            print(f"[flex-mcp] bg indexer error: {e}", file=sys.stderr)
+            await asyncio.sleep(POLL_INTERVAL)
+
+
 async def _run_stdio():
-    """Run the server over stdio transport."""
-    async with stdio_server() as (read_stream, write_stream):
-        await server.run(
-            read_stream, write_stream, server.create_initialization_options()
-        )
+    """Run the server over stdio transport with background indexer."""
+    bg_task = asyncio.create_task(_background_indexer())
+    try:
+        async with stdio_server() as (read_stream, write_stream):
+            await server.run(
+                read_stream, write_stream, server.create_initialization_options()
+            )
+    finally:
+        bg_task.cancel()
+        try:
+            await bg_task
+        except asyncio.CancelledError:
+            pass
 
 
 if __name__ == "__main__":

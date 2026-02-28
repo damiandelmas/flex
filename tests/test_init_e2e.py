@@ -198,8 +198,9 @@ def initialized_env(tmp_path, monkeypatch):
     import flex.onnx.fetch as fetch_mod
     monkeypatch.setattr(fetch_mod, "model_ready", lambda: True)
 
-    # --- systemd: no-op ---
+    # --- services: no-op (mock as successful) ---
     monkeypatch.setattr(cli_mod, "_install_systemd", lambda: True)
+    monkeypatch.setattr(cli_mod, "_install_launchd", lambda: False)
 
     # --- run flex init ---
     from flex.cli import cmd_init
@@ -268,7 +269,9 @@ class TestFlexInitE2E:
         data = json.loads(claude_json.read_text())
         assert "mcpServers" in data
         assert "flex" in data["mcpServers"]
-        assert data["mcpServers"]["flex"]["url"] == "http://localhost:7134/sse"
+        assert data["mcpServers"]["flex"]["type"] == "http"
+        assert "localhost:7134" in data["mcpServers"]["flex"]["url"]
+        assert "/mcp" in data["mcpServers"]["flex"]["url"]
 
     def test_sessions_indexed(self, initialized_env):
         conn = _open(initialized_env["cell_path"])

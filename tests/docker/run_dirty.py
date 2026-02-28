@@ -69,14 +69,14 @@ def scenario_devtools():
     # ── flx CLI works ────────────────────────────────────────────────────
     h.phase("flx CLI")
 
-    r = _run(["flx", "--help"])
+    r = _run(["flex", "--help"])
     h.check("flx --help exit 0", r.returncode == 0,
             r.stderr[:200] if r.stderr else "")
 
     # ── flx init --local ─────────────────────────────────────────────────
     h.phase("flx init")
 
-    r = subprocess.run(["flx", "init", "--local"],
+    r = subprocess.run(["flex", "init", "--local"],
                        capture_output=False, timeout=600)
     h.check("flx init --local exit 0", r.returncode == 0,
             f"exit code {r.returncode}")
@@ -85,7 +85,7 @@ def scenario_devtools():
     # ── flx search ───────────────────────────────────────────────────────
     h.phase("flx search")
 
-    r = _run(["flx", "search", "SELECT COUNT(*) FROM sessions"])
+    r = _run(["flex", "search", "SELECT COUNT(*) FROM sessions"])
     h.check("flx search exit 0", r.returncode == 0,
             r.stderr[:200] if r.stderr else "")
 
@@ -124,7 +124,7 @@ def scenario_conda():
     # ── flx init --local ─────────────────────────────────────────────────
     h.phase("flx init")
 
-    r = subprocess.run(["flx", "init", "--local"],
+    r = subprocess.run(["flex", "init", "--local"],
                        capture_output=False, timeout=600)
     h.check("flx init --local exit 0", r.returncode == 0,
             f"exit code {r.returncode}")
@@ -144,7 +144,7 @@ def scenario_conda():
     # ── flx search ───────────────────────────────────────────────────────
     h.phase("flx search")
 
-    r = _run(["flx", "search", "@orient"])
+    r = _run(["flex", "search", "@orient"])
     h.check("flx search @orient exit 0", r.returncode == 0,
             r.stderr[:200] if r.stderr else "")
 
@@ -169,7 +169,7 @@ def scenario_upgrade():
     # ── flx init --local on top of any existing ~/.flex/ ──────────────────
     h.phase("flx init after upgrade")
 
-    r = subprocess.run(["flx", "init", "--local"],
+    r = subprocess.run(["flex", "init", "--local"],
                        capture_output=False, timeout=600)
     h.check("flx init --local exit 0", r.returncode == 0,
             f"exit code {r.returncode}")
@@ -195,7 +195,7 @@ def scenario_upgrade():
     # ── flx search works ─────────────────────────────────────────────────
     h.phase("flx search")
 
-    r = _run(["flx", "search", "--json",
+    r = _run(["flex", "search", "--json",
               "SELECT COUNT(*) as n FROM sessions"])
     h.check("flx search exit 0", r.returncode == 0,
             r.stderr[:200] if r.stderr else "")
@@ -217,7 +217,7 @@ def scenario_upgrade():
     # ── flx sync ─────────────────────────────────────────────────────────
     h.phase("flx sync")
 
-    r = _run(["flx", "sync"], timeout=60)
+    r = _run(["flex", "sync"], timeout=60)
     h.check("flx sync exit 0", r.returncode == 0,
             r.stderr[:200] if r.stderr else "")
 
@@ -241,7 +241,7 @@ def scenario_minimal():
     # ── flx init --local should fail with clear error ────────────────────
     h.phase("flx init failure")
 
-    r = _run(["flx", "init", "--local"])
+    r = _run(["flex", "init", "--local"])
     h.check("flx init exit non-zero", r.returncode != 0,
             f"exit code {r.returncode}")
 

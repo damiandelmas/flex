@@ -74,8 +74,8 @@ if claude_json.exists():
     d = json.loads(claude_json.read_text())
     servers = d.get("mcpServers", {})
     h.check("flex MCP entry",      "flex" in servers)
-    h.check("MCP URL correct",
-            servers.get("flex", {}).get("url") == "http://localhost:7134/sse")
+    h.check("MCP HTTP transport",
+            servers.get("flex", {}).get("type") == "http")
 
 # ── Cell contents ─────────────────────────────────────────────────────────────
 h.phase("Cell contents")

@@ -1,13 +1,15 @@
 # Flex MCP Server - systemd user service
 #
-# Install:
+# NOTE: `flex init` generates this unit dynamically with the correct
+# Python path. This file is a reference template only.
+#
+# Install via flex init (recommended):
+#   flex init
+#
+# Manual install:
 #   cp flex/mcp_server.service ~/.config/systemd/user/flex-mcp.service
 #   systemctl --user daemon-reload
-#   systemctl --user enable flex-mcp
-#   systemctl --user start flex-mcp
-#
-# Then expose via Tailscale Funnel:
-#   tailscale funnel 8080
+#   systemctl --user enable --now flex-mcp
 #
 # View logs:
 #   journalctl --user -u flex-mcp -f
@@ -18,12 +20,10 @@ After=network.target
 
 [Service]
 Type=simple
-ExecStart=/home/axp/projects/flex/main/venv/bin/python -m flex.mcp_server --http --port 8081
-WorkingDirectory=/home/axp/projects/flex/main
-Environment="PYTHONPATH=/home/axp/projects/flex/main"
-
+ExecStart=python -m flex.mcp_server --http --port 7134
 Restart=always
 RestartSec=5
+Environment=PYTHONUNBUFFERED=1
 
 [Install]
 WantedBy=default.target

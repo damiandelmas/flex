@@ -22,6 +22,15 @@ CLAUDE_DIR = Path.home() / ".claude"
 CLAUDE_JSON = Path.home() / ".claude.json"
 HOOKS_DIR = CLAUDE_DIR / "hooks"
 SYSTEMD_DIR = Path.home() / ".config" / "systemd" / "user"
+LAUNCHD_DIR = Path.home() / "Library" / "LaunchAgents"
+
+
+def _safe_write(path: Path, content: str):
+    """Write content to path, replacing symlinks with regular files."""
+    if path.is_symlink():
+        path.unlink()
+    path.write_text(content)
+
 
 # Package data locations (relative to this file)
 PKG_ROOT = Path(__file__).parent
@@ -51,7 +60,12 @@ HOOKS = {
 # ============================================================
 
 def _install_hooks():
-    """Copy hook scripts to ~/.claude/hooks/ and set executable."""
+    """Copy hook scripts to ~/.claude/hooks/ and set executable.
+
+    Replaces __FLEX_PYTHON__ placeholder with the absolute path to the
+    Python interpreter that ran ``flex init``, so hooks use the same
+    interpreter regardless of conda/venv/PATH differences.
+    """
     HOOKS_DIR.mkdir(parents=True, exist_ok=True)
     installed = []
     for event, hooks in HOOKS.items():
@@ -59,7 +73,9 @@ def _install_hooks():
             if not hook["src"].exists():
                 continue  # module not present in this distribution
             dest = HOOKS_DIR / hook["name"]
-            shutil.copy2(hook["src"], dest)
+            content = hook["src"].read_text()
+            content = content.replace("__FLEX_PYTHON__", sys.executable)
+            _safe_write(dest, content)
             dest.chmod(dest.stat().st_mode | stat.S_IEXEC | stat.S_IXGRP | stat.S_IXOTH)
             installed.append(hook["name"])
     return installed
@@ -74,6 +90,8 @@ def _install_claude_assets():
         rel = src.relative_to(_claude_src)
         dest = CLAUDE_DIR / rel
         dest.parent.mkdir(parents=True, exist_ok=True)
+        if dest.is_symlink():
+            dest.unlink()
         shutil.copy2(src, dest)
 
 
@@ -90,7 +108,7 @@ def _patch_settings_json():
 
     # --- PostToolUse ---
     post_hooks = hooks.setdefault("PostToolUse", [])
-    our_commands = {str(HOOKS_DIR / h["name"]) for h in HOOKS["PostToolUse"]}
+    our_commands = {str(HOOKS_DIR / h["name"]) for h in HOOKS["PostToolUse"] if h["src"].exists()}
     # Check if our hooks are already registered
     already = set()
     for group in post_hooks:
@@ -110,7 +128,7 @@ def _patch_settings_json():
 
     # --- UserPromptSubmit ---
     user_hooks = hooks.setdefault("UserPromptSubmit", [])
-    our_commands = {str(HOOKS_DIR / h["name"]) for h in HOOKS["UserPromptSubmit"]}
+    our_commands = {str(HOOKS_DIR / h["name"]) for h in HOOKS["UserPromptSubmit"] if h["src"].exists()}
     already = set()
     for group in user_hooks:
         for h in group.get("hooks", []):
@@ -126,7 +144,7 @@ def _patch_settings_json():
         }
         user_hooks.append(new_group)
 
-    settings_path.write_text(json.dumps(settings, indent=2) + "\n")
+    _safe_write(settings_path, json.dumps(settings, indent=2) + "\n")
 
 
 def _install_systemd():
@@ -188,17 +206,111 @@ def _install_systemd():
     return True
 
 
+def _install_launchd():
+    """Generate and install launchd user agents (macOS). Returns True if installed."""
+    if sys.platform != "darwin":
+        return False
+
+    LAUNCHD_DIR.mkdir(parents=True, exist_ok=True)
+    python = sys.executable
+
+    _LAUNCHD_PLISTS = {
+        "dev.getflex.worker.plist": f"""<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+    <key>Label</key>
+    <string>dev.getflex.worker</string>
+    <key>ProgramArguments</key>
+    <array>
+        <string>{python}</string>
+        <string>-m</string>
+        <string>flex.modules.claude_code.compile.worker</string>
+        <string>--daemon</string>
+    </array>
+    <key>RunAtLoad</key>
+    <true/>
+    <key>KeepAlive</key>
+    <true/>
+    <key>StandardOutPath</key>
+    <string>{FLEX_HOME / "logs" / "worker.log"}</string>
+    <key>StandardErrorPath</key>
+    <string>{FLEX_HOME / "logs" / "worker.err"}</string>
+    <key>EnvironmentVariables</key>
+    <dict>
+        <key>PYTHONUNBUFFERED</key>
+        <string>1</string>
+    </dict>
+</dict>
+</plist>""",
+        "dev.getflex.mcp.plist": f"""<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+    <key>Label</key>
+    <string>dev.getflex.mcp</string>
+    <key>ProgramArguments</key>
+    <array>
+        <string>{python}</string>
+        <string>-m</string>
+        <string>flex.mcp_server</string>
+        <string>--http</string>
+        <string>--port</string>
+        <string>7134</string>
+    </array>
+    <key>RunAtLoad</key>
+    <true/>
+    <key>KeepAlive</key>
+    <true/>
+    <key>StandardOutPath</key>
+    <string>{FLEX_HOME / "logs" / "mcp.log"}</string>
+    <key>StandardErrorPath</key>
+    <string>{FLEX_HOME / "logs" / "mcp.err"}</string>
+    <key>EnvironmentVariables</key>
+    <dict>
+        <key>PYTHONUNBUFFERED</key>
+        <string>1</string>
+    </dict>
+</dict>
+</plist>""",
+    }
+
+    (FLEX_HOME / "logs").mkdir(exist_ok=True)
+
+    for name, content in _LAUNCHD_PLISTS.items():
+        plist_path = LAUNCHD_DIR / name
+        # Unload existing before overwriting
+        if plist_path.exists():
+            subprocess.run(
+                ["launchctl", "unload", str(plist_path)],
+                capture_output=True, timeout=10,
+            )
+        plist_path.write_text(content)
+        subprocess.run(
+            ["launchctl", "load", str(plist_path)],
+            capture_output=True, timeout=10,
+        )
+
+    return True
+
+
 def _patch_claude_json():
-    """Add MCP server entry to ~/.claude.json."""
+    """Add MCP server entry to ~/.claude.json.
+
+    Streamable HTTP transport — stateless per-request, supports unlimited
+    concurrent Claude Code sessions. One process, warm cache, shared across
+    sessions. Services (systemd/launchd) keep it running.
+    """
     if CLAUDE_JSON.exists():
         data = json.loads(CLAUDE_JSON.read_text())
     else:
         data = {}
 
     servers = data.setdefault("mcpServers", {})
-    if "flex" not in servers:
-        servers["flex"] = {"type": "sse", "url": "http://localhost:7134/sse"}
-        CLAUDE_JSON.write_text(json.dumps(data, indent=2) + "\n")
+    entry = {"type": "http", "url": "http://localhost:7134/mcp"}
+    if "flex" not in servers or servers["flex"] != entry:
+        servers["flex"] = entry
+        _safe_write(CLAUDE_JSON, json.dumps(data, indent=2) + "\n")
         return True
     return False
 
@@ -414,7 +526,7 @@ def cmd_init(args):
 
     # 3. Pre-flight: check system deps before doing anything
     import shutil as _shutil, os as _os
-    _sudo = "" if _os.geteuid() == 0 else "sudo "
+    _sudo = "" if getattr(_os, 'geteuid', lambda: 1)() == 0 else "sudo "
     _missing_sys = [b for b in ("jq", "git") if not _shutil.which(b)]
     if _missing_sys:
         console.print()
@@ -697,12 +809,12 @@ def cmd_init(args):
         conn.close()
 
     # 5. Services
-    systemd_ok = _install_systemd()
-    if systemd_ok:
+    services_ok = _install_systemd() or _install_launchd()
+    if services_ok:
         console.print("  [dim]worker[/dim]             [green]running[/green]")
         console.print("  [dim]MCP[/dim]                [green]running[/green]")
 
-    # 6. Claude Code wiring (localhost — direct, no relay)
+    # 6. Claude Code wiring — streamable HTTP to localhost:7134
     _patch_claude_json()
     console.print()
 
@@ -1120,7 +1232,7 @@ def cmd_sync(args):
     print()
     print("[4/4] Services")
 
-    # Install systemd units if missing (recovery from partial init)
+    # Install service units if missing (recovery from partial init)
     if sys.platform == "linux":
         worker_unit = SYSTEMD_DIR / "flex-worker.service"
         if not worker_unit.exists():
@@ -1132,17 +1244,37 @@ def cmd_sync(args):
         elif "flex.modules.claude_code.compile.worker" not in worker_unit.read_text():
             pass  # custom unit — don't overwrite
 
-    for service in ["flex-worker", "flex-mcp"]:
-        try:
-            subprocess.run(
-                ["systemctl", "--user", "restart", service],
-                check=True, capture_output=True, timeout=10,
-            )
-            print(f"  {service}: restarted")
-        except subprocess.CalledProcessError as e:
-            print(f"  {service}: FAILED ({e.stderr.decode().strip()})")
-        except FileNotFoundError:
-            print(f"  {service}: SKIP (systemctl not found)")
+        for service in ["flex-worker", "flex-mcp"]:
+            try:
+                subprocess.run(
+                    ["systemctl", "--user", "restart", service],
+                    check=True, capture_output=True, timeout=10,
+                )
+                print(f"  {service}: restarted")
+            except subprocess.CalledProcessError as e:
+                print(f"  {service}: FAILED ({e.stderr.decode().strip()})")
+            except FileNotFoundError:
+                print(f"  {service}: SKIP (systemctl not found)")
+
+    elif sys.platform == "darwin":
+        worker_plist = LAUNCHD_DIR / "dev.getflex.worker.plist"
+        if not worker_plist.exists():
+            print("  Installing missing launchd agents...")
+            try:
+                _install_launchd()
+            except Exception as e:
+                print(f"  launchd install FAILED: {e}")
+        else:
+            for label in ["dev.getflex.worker", "dev.getflex.mcp"]:
+                try:
+                    subprocess.run(
+                        ["launchctl", "kickstart", "-k",
+                         f"gui/{os.getuid()}/{label}"],
+                        capture_output=True, timeout=10,
+                    )
+                    print(f"  {label}: restarted")
+                except Exception as e:
+                    print(f"  {label}: FAILED ({e})")
 
     # Install MCP wiring if missing (recovery from partial init)
     try:
