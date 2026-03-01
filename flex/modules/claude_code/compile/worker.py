@@ -1443,21 +1443,21 @@ def _run_enrichment_cycle(conn, graph_threshold=50):
         except Exception as e:
             print(f"[enrich] Graph error: {e}", file=sys.stderr)
 
-    # 3. File co-edit graph (early-exit if no SOMA file identity data, ~2-5s)
+    # 4. File co-edit graph (early-exit if no SOMA file identity data, ~2-5s)
     if rebuild_file_graph:
         try:
             rebuild_file_graph(conn)
         except Exception as e:
             print(f"[enrich] File graph error: {e}", file=sys.stderr)
 
-    # 4. Delegation graph (early-exit if no delegation data, ~1-2s)
+    # 5. Delegation graph (early-exit if no delegation data, ~1-2s)
     if rebuild_delegation_graph:
         try:
             rebuild_delegation_graph(conn)
         except Exception as e:
             print(f"[enrich] Delegation graph error: {e}", file=sys.stderr)
 
-    # 5. Incremental fingerprints
+    # 6. Incremental fingerprints
     if run_fingerprints:
         try:
             n = run_fingerprints(conn)
@@ -1466,7 +1466,7 @@ def _run_enrichment_cycle(conn, graph_threshold=50):
         except Exception as e:
             print(f"[enrich] Fingerprint error: {e}", file=sys.stderr)
 
-    # 6. Incremental repo_project
+    # 7. Incremental repo_project
     if run_repo_project:
         try:
             n = run_repo_project(conn)
@@ -1475,7 +1475,7 @@ def _run_enrichment_cycle(conn, graph_threshold=50):
         except Exception as e:
             print(f"[enrich] Repo project error: {e}", file=sys.stderr)
 
-    # 7. Heal delegation edges for sessions synced before progress-entry detection
+    # 8. Heal delegation edges for sessions synced before progress-entry detection
     try:
         n = _heal_delegations(conn)
         if n > 0:
@@ -1483,7 +1483,7 @@ def _run_enrichment_cycle(conn, graph_threshold=50):
     except Exception as e:
         print(f"[enrich] Delegation heal error: {e}", file=sys.stderr)
 
-    # 8. NULL embedding sweep — catch orphaned chunks that missed embed phase
+    # 9. NULL embedding sweep — catch orphaned chunks that missed embed phase
     try:
         n = _batch_embed_chunks(conn, quiet=True)
         if n > 0:
@@ -1491,7 +1491,7 @@ def _run_enrichment_cycle(conn, graph_threshold=50):
     except Exception as e:
         print(f"[enrich] Embed sweep error: {e}", file=sys.stderr)
 
-    # 9. Queue depth snapshot — write to _ops for @health visibility
+    # 10. Queue depth snapshot — write to _ops for @health visibility
     try:
         qconn = sqlite3.connect(str(QUEUE_DB), timeout=5)
         cc_depth = qconn.execute("SELECT COUNT(*) FROM claude_code_pending").fetchone()[0]

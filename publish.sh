@@ -104,6 +104,17 @@ git tag -f "v$VERSION"
 git push "$REMOTE" "$BRANCH:$TARGET"
 git push "$REMOTE" "v$VERSION" --force
 
+# Deploy install.sh to getflex.dev
+echo "Deploying install.sh to getflex.dev..."
+_deploy_dir=$(mktemp -d)
+cp install.sh "$_deploy_dir/install.sh"
+if npx wrangler pages deploy "$_deploy_dir" --project-name getflex-site --commit-dirty=true 2>&1 | tail -1; then
+    echo "install.sh deployed"
+else
+    echo "WARNING: Cloudflare deploy failed — install.sh not updated"
+fi
+rm -rf "$_deploy_dir"
+
 # Cleanup
 git checkout -f dev
 git clean -fd flex/ tests/ .github/

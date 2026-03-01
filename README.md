@@ -7,10 +7,25 @@ Every `memory.search()` call is a dumbed-down SELECT. Every `memory.add()` is a 
 Flex gives your agent the schema and gets out of the way. Your agent reads what exists and composes with what's available.
 
 ```bash
-pip install getflex && flex init
+curl -sSL https://getflex.dev/install.sh | bash
 ```
 
-> If `flex` resolves to GNU flex on your system, use `python -m flex init` instead.
+<details>
+<summary>Other install methods</summary>
+
+```bash
+# pipx (if you have it)
+pipx install getflex && flex init
+
+# manual venv
+python3 -m venv ~/.flex/venv && source ~/.flex/venv/bin/activate
+pip install getflex && flex init
+
+# escape hatch (any install method)
+python -m flex init
+```
+
+</details>
 
 ---
 
@@ -213,7 +228,7 @@ No cloud account. No API key. No vendor. No rate limits.
 ---
 
 ```bash
-pip install getflex
+curl -sSL https://getflex.dev/install.sh | bash
 ```
 
 MIT · Python 3.12 · SQLite · ONNX · numpy · networkx

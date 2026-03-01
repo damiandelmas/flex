@@ -1,22 +1,20 @@
 """Claude Code noise filtering — session eligibility and graph filters.
 
 These are specific to claude-code cells where:
-- Warmup sessions exist (title = 'Warmup')
-- Agent children are short-lived (source_id LIKE 'agent-%')
-- 2,404 of 5,774 sessions have <= 2 chunks (aborts, /mcp reconnects)
-- Sessions with < 20 chunks carry 4.7% of content
+- Warmup sessions (message_count < 5): /mcp reconnects, aborts, empty spawns
+- Sessions with < 20 chunks carry minimal content (graph exclusion only)
+
+Agent sessions (source_id LIKE 'agent-%') are NOT excluded — they are
+sub-sessions linked to parents via the delegation graph. The warmup
+heuristic catches junk agents (empty spawns). Substantive agent work
+(audits, pipeline runs, research) gets fingerprints and graph signal.
+Query-time filtering via delegation_depth or parent_session is available.
 
 Doc-pac cells do NOT use these filters — 3-8 chunk sources are normal there.
 """
 
-# Minimum chunk count for a session to be considered "real work"
+# Minimum chunk count for a session to enter the similarity graph
 MIN_CHUNKS = 20
-
-# Minimum message_count for session summary enrichment
-# Lowered from 5 → 2 to match Claude's own session filtering (user_message_count >= 2).
-# message_count is raw JSONL count (includes tool calls), so >= 2 still excludes
-# empty/abort sessions (0-1 messages) while capturing short but real sessions.
-MIN_MESSAGES = 2
 
 # Warmup detection: sessions with fewer than this many JSONL messages are warmup.
 # Catches /mcp reconnects (0-1 msgs), aborted sessions, empty agent spawns.
@@ -71,29 +69,27 @@ def session_filter_sql():
     """WHERE clause for eligible sessions (summary, profile enrichments).
 
     Returns SQL that selects source_ids from _raw_sources.
-    Filters: min messages, no agent children, no warmups.
+    Filters: no warmups (message_count < WARMUP_MESSAGE_THRESHOLD).
+    Agent sessions included — they are sub-sessions, not noise.
     """
     return """
         SELECT source_id FROM _raw_sources
-        WHERE message_count >= {min_messages}
-          AND source_id NOT LIKE 'agent-%'
-          AND source_id NOT IN (
-              SELECT source_id FROM _types_source_warmup WHERE is_warmup_only = 1
-          )
-    """.format(min_messages=MIN_MESSAGES)
+        WHERE source_id NOT IN (
+            SELECT source_id FROM _types_source_warmup WHERE is_warmup_only = 1
+        )
+    """
 
 
 def graph_filter_sql():
     """WHERE fragment for build_similarity_graph().
 
     Pass as: build_similarity_graph(db, where=graph_filter_sql())
-    Filters: min chunks, no warmups (_types_source_warmup), no agent children.
-    Unified with session_filter_sql() — same exclusion policy.
+    Filters: min chunks (content threshold), no warmups.
+    Agent sessions included — substantive agents enter the graph.
     """
     return """source_id IN (
         SELECT source_id FROM _edges_source
         GROUP BY source_id HAVING COUNT(*) >= {min_chunks}
-    ) AND source_id NOT LIKE 'agent-%'
-    AND source_id NOT IN (
+    ) AND source_id NOT IN (
         SELECT source_id FROM _types_source_warmup WHERE is_warmup_only = 1
     )""".format(min_chunks=MIN_CHUNKS)

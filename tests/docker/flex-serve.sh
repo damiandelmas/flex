@@ -48,7 +48,7 @@ sleep 1
 python3 -m flex.mcp_server --http --port 7134 \
     >> "$LOG_MCP" 2>&1 &
 echo $! > "$PIDFILE_MCP"
-echo "  [ok] flex-mcp started (pid $(cat $PIDFILE_MCP)) → http://localhost:7134/sse"
+echo "  [ok] flex-mcp started (pid $(cat $PIDFILE_MCP)) → http://localhost:7134/mcp"
 echo "       log: $LOG_MCP"
 
 echo ""

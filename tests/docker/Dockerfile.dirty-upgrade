@@ -1,7 +1,7 @@
 # Dirty upgrade test — simulates upgrade from 0.1.43 to current.
 #
 # Installs the old PyPI version first, then overlays local source.
-# Tests that flx init, search, sync all work on top of old data.
+# Tests that flex init, search, sync all work on top of old data.
 #
 # Build:
 #   docker build -f tests/docker/Dockerfile.dirty-upgrade -t flex-test-dirty-upgrade .

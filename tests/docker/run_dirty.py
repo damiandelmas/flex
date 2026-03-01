@@ -1,5 +1,5 @@
 """
-Dirty environment test runner — validates flx in hostile/unusual environments.
+Dirty environment test runner — validates flex in hostile/unusual environments.
 
 Scenarios:
   devtools  — GNU flex collision (/usr/bin/flex is the lexer)
@@ -50,7 +50,7 @@ def _run(cmd, **kwargs):
 # ── Scenario: devtools ────────────────────────────────────────────────────────
 
 def scenario_devtools():
-    """GNU flex collision — /usr/bin/flex is the lexer, flx is getflex."""
+    """GNU flex collision — /usr/bin/flex is the lexer, flex binary is getflex."""
     h = Harness("dirty-devtools")
 
     # ── Verify GNU flex occupies /usr/bin/flex ─────────────────────────────
@@ -61,47 +61,42 @@ def scenario_devtools():
             which_flex == "/usr/bin/flex",
             f"got: {which_flex}")
 
-    which_flx = shutil.which("flx")
-    h.check("which flx returns getflex binary",
-            which_flx is not None,
-            f"got: {which_flx}")
-
-    # ── flx CLI works ────────────────────────────────────────────────────
-    h.phase("flx CLI")
+    # ── flex CLI works (via python -m flex in Docker) ─────────────────────
+    h.phase("flex CLI")
 
     r = _run(["flex", "--help"])
-    h.check("flx --help exit 0", r.returncode == 0,
+    h.check("flex --help exit 0", r.returncode == 0,
             r.stderr[:200] if r.stderr else "")
 
-    # ── flx init --local ─────────────────────────────────────────────────
-    h.phase("flx init")
+    # ── flex init --local ─────────────────────────────────────────────────
+    h.phase("flex init")
 
     r = subprocess.run(["flex", "init", "--local"],
                        capture_output=False, timeout=600)
-    h.check("flx init --local exit 0", r.returncode == 0,
+    h.check("flex init --local exit 0", r.returncode == 0,
             f"exit code {r.returncode}")
     h.check("~/.flex/ created", FLEX_HOME.exists())
 
-    # ── flx search ───────────────────────────────────────────────────────
-    h.phase("flx search")
+    # ── flex search ───────────────────────────────────────────────────────
+    h.phase("flex search")
 
     r = _run(["flex", "search", "SELECT COUNT(*) FROM sessions"])
-    h.check("flx search exit 0", r.returncode == 0,
+    h.check("flex search exit 0", r.returncode == 0,
             r.stderr[:200] if r.stderr else "")
 
-    # ── MCP config: stdio transport ──────────────────────────────────────
+    # ── MCP config: HTTP transport ────────────────────────────────────────
     h.phase("MCP config")
 
     h.check("~/.claude.json exists", CLAUDE_JSON.exists())
     srv = _mcp_config()
     h.check("flex MCP entry exists", srv is not None)
     if srv:
-        h.check("MCP has 'command' key (stdio)",
-                "command" in srv,
-                f"keys: {list(srv.keys())}")
-        h.check("MCP has no 'url' key (not SSE)",
-                "url" not in srv,
-                f"keys: {list(srv.keys())}")
+        h.check("MCP transport is HTTP",
+                srv.get("type") == "http",
+                f"got: {srv.get('type')}")
+        h.check("MCP URL has port 7134",
+                "localhost:7134" in srv.get("url", ""),
+                f"got: {srv.get('url')}")
 
     return h
 
@@ -121,31 +116,33 @@ def scenario_conda():
             has_conda_path,
             f"sys.executable = {exe}")
 
-    # ── flx init --local ─────────────────────────────────────────────────
-    h.phase("flx init")
+    # ── flex init --local ─────────────────────────────────────────────────
+    h.phase("flex init")
 
     r = subprocess.run(["flex", "init", "--local"],
                        capture_output=False, timeout=600)
-    h.check("flx init --local exit 0", r.returncode == 0,
+    h.check("flex init --local exit 0", r.returncode == 0,
             f"exit code {r.returncode}")
 
-    # ── MCP command matches sys.executable ────────────────────────────────
+    # ── MCP config: HTTP transport ────────────────────────────────────────
     h.phase("MCP config")
 
     h.check("~/.claude.json exists", CLAUDE_JSON.exists())
     srv = _mcp_config()
     h.check("flex MCP entry exists", srv is not None)
     if srv:
-        cmd = srv.get("command", "")
-        h.check("MCP command matches sys.executable",
-                exe in cmd,
-                f"sys.executable={exe}, command={cmd}")
+        h.check("MCP transport is HTTP",
+                srv.get("type") == "http",
+                f"got: {srv.get('type')}")
+        h.check("MCP URL has port 7134",
+                "localhost:7134" in srv.get("url", ""),
+                f"got: {srv.get('url')}")
 
-    # ── flx search ───────────────────────────────────────────────────────
-    h.phase("flx search")
+    # ── flex search ───────────────────────────────────────────────────────
+    h.phase("flex search")
 
     r = _run(["flex", "search", "@orient"])
-    h.check("flx search @orient exit 0", r.returncode == 0,
+    h.check("flex search @orient exit 0", r.returncode == 0,
             r.stderr[:200] if r.stderr else "")
 
     # ── import flex works ────────────────────────────────────────────────
@@ -166,12 +163,12 @@ def scenario_upgrade():
     """0.1.43 -> current upgrade path."""
     h = Harness("dirty-upgrade")
 
-    # ── flx init --local on top of any existing ~/.flex/ ──────────────────
-    h.phase("flx init after upgrade")
+    # ── flex init --local on top of any existing ~/.flex/ ────────────────
+    h.phase("flex init after upgrade")
 
     r = subprocess.run(["flex", "init", "--local"],
                        capture_output=False, timeout=600)
-    h.check("flx init --local exit 0", r.returncode == 0,
+    h.check("flex init --local exit 0", r.returncode == 0,
             f"exit code {r.returncode}")
     h.check("~/.flex/ exists", FLEX_HOME.exists())
 
@@ -192,33 +189,33 @@ def scenario_upgrade():
         h.check("chunks indexed after upgrade", n_chunks > 0, f"got {n_chunks}")
         h.check("sessions indexed after upgrade", n_sessions > 0, f"got {n_sessions}")
 
-    # ── flx search works ─────────────────────────────────────────────────
-    h.phase("flx search")
+    # ── flex search works ─────────────────────────────────────────────────
+    h.phase("flex search")
 
     r = _run(["flex", "search", "--json",
               "SELECT COUNT(*) as n FROM sessions"])
-    h.check("flx search exit 0", r.returncode == 0,
+    h.check("flex search exit 0", r.returncode == 0,
             r.stderr[:200] if r.stderr else "")
 
-    # ── MCP config: stdio, not SSE ───────────────────────────────────────
+    # ── MCP config: HTTP transport ────────────────────────────────────────
     h.phase("MCP config")
 
     h.check("~/.claude.json exists", CLAUDE_JSON.exists())
     srv = _mcp_config()
     h.check("flex MCP entry exists", srv is not None)
     if srv:
-        h.check("MCP has stdio config ('command' key)",
-                "command" in srv,
-                f"keys: {list(srv.keys())}")
-        h.check("MCP has no SSE config ('url' key)",
-                "url" not in srv,
-                f"keys: {list(srv.keys())}")
+        h.check("MCP transport is HTTP",
+                srv.get("type") == "http",
+                f"got: {srv.get('type')}")
+        h.check("MCP URL has port 7134",
+                "localhost:7134" in srv.get("url", ""),
+                f"got: {srv.get('url')}")
 
-    # ── flx sync ─────────────────────────────────────────────────────────
-    h.phase("flx sync")
+    # ── flex sync ─────────────────────────────────────────────────────────
+    h.phase("flex sync")
 
     r = _run(["flex", "sync"], timeout=60)
-    h.check("flx sync exit 0", r.returncode == 0,
+    h.check("flex sync exit 0", r.returncode == 0,
             r.stderr[:200] if r.stderr else "")
 
     return h
@@ -238,11 +235,11 @@ def scenario_minimal():
     h.check("jq not installed", shutil.which("jq") is None,
             f"found at: {shutil.which('jq')}")
 
-    # ── flx init --local should fail with clear error ────────────────────
-    h.phase("flx init failure")
+    # ── flex init --local should fail with clear error ──────────────────
+    h.phase("flex init failure")
 
     r = _run(["flex", "init", "--local"])
-    h.check("flx init exit non-zero", r.returncode != 0,
+    h.check("flex init exit non-zero", r.returncode != 0,
             f"exit code {r.returncode}")
 
     # Check that error message mentions missing deps

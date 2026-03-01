@@ -1,7 +1,7 @@
 # Dirty devtools test — simulates Mac-like environment with GNU flex installed.
 #
 # GNU flex (the lexer generator) occupies /usr/bin/flex. Tests verify that
-# getflex's `flx` binary works regardless.
+# getflex's `flex` binary works regardless.
 #
 # Build:
 #   docker build -f tests/docker/Dockerfile.dirty-devtools -t flex-test-dirty-devtools .
@@ -17,7 +17,7 @@ RUN apt-get update && apt-get install -y \
     git jq build-essential \
     && rm -rf /var/lib/apt/lists/*
 
-# GNU flex is now at /usr/bin/flex — tests must verify flx works regardless
+# GNU flex is now at /usr/bin/flex — tests must verify flex (getflex) works regardless
 COPY pyproject.toml /flex/
 COPY flex/ /flex/flex/
 WORKDIR /flex

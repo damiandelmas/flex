@@ -1,6 +1,6 @@
 # Dirty minimal test — no jq, no git.
 #
-# Verifies that flx init fails gracefully with a clear error message
+# Verifies that flex init fails gracefully with a clear error message
 # when required system dependencies are missing.
 #
 # Build:

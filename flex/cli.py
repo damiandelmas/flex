@@ -825,7 +825,7 @@ def cmd_init(args):
     panel_content.append("MCP server installed\n", style="green")
     panel_content.append("restart or open a new session to connect\n\n", style="dim")
     panel_content.append("MCP Server Endpoint    ", style="white")
-    panel_content.append("http://localhost:7134\n", style="green")
+    panel_content.append("http://localhost:7134/mcp\n", style="green")
     panel_content.append("use with claude.ai, Cursor, or any MCP client", style="dim")
     console.print(Panel(panel_content, padding=(1, 2)))
     console.print()
