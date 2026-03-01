@@ -28,7 +28,9 @@ GROUP BY m.name
 UNION ALL
 SELECT 'table_function', 'vec_ops [_raw_chunks]', 'id, score', 'Semantic retrieval — use after FROM/JOIN. Args: table, query, tokens, pre_filter_sql'
 UNION ALL
-SELECT 'table_function', 'chunks_fts', 'rowid, content', 'FTS5 keyword search (MATCH). Bridge to vec_ops via: SELECT c.id FROM chunks_fts f JOIN _raw_chunks c ON f.rowid = c.rowid'
+SELECT 'table_function', 'keyword', 'id, rank, snippet', 'FTS5 keyword search — use after FROM/JOIN. keyword(''term'') returns ranked matches with snippets'
+UNION ALL
+SELECT 'table_function', 'chunks_fts', 'rowid, content', 'Raw FTS5 table (prefer keyword() instead). Bridge to vec_ops via: SELECT c.id FROM chunks_fts f JOIN _raw_chunks c ON f.rowid = c.rowid'
 UNION ALL
 SELECT 'edge_table', '_edges_raw_content', 'chunk_id, content_hash', 'Bridge to _raw_content(hash, content). Use file_body in messages view instead'
 UNION ALL
@@ -52,13 +54,22 @@ WHERE g.is_hub = 1
 ORDER BY g.centrality DESC LIMIT 10;
 
 -- @query: communities
-SELECT
-    g.community_id,
-    substr(g.community_label, 1, instr(g.community_label || ' ·', ' ·') - 1) AS label,
-    substr(g.community_label, instr(g.community_label, ' · ') + 3) AS sub_labels,
-    COUNT(*) as sources
-FROM _enrich_source_graph g
-GROUP BY g.community_id ORDER BY sources DESC LIMIT 8;
+SELECT * FROM (
+    SELECT
+        g.community_id,
+        substr(g.community_label, 1, instr(g.community_label || ' ·', ' ·') - 1) AS label,
+        substr(g.community_label, instr(g.community_label, ' · ') + 3) AS sub_labels,
+        COUNT(*) as sources
+    FROM _enrich_source_graph g
+    WHERE g.community_label IS NOT NULL
+    GROUP BY g.community_id ORDER BY sources DESC LIMIT 10
+)
+UNION ALL
+SELECT NULL,
+    (SELECT COUNT(DISTINCT community_id) FROM _enrich_source_graph) || ' total ('
+    || (SELECT COUNT(DISTINCT community_id) FROM _enrich_source_graph WHERE community_label IS NOT NULL)
+    || ' labeled)',
+    NULL, NULL;
 
 -- @query: presets
 SELECT name, description, params FROM _presets ORDER BY name;

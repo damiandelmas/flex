@@ -22,7 +22,9 @@ GROUP BY m.name
 UNION ALL
 SELECT 'table_function', 'vec_ops(''_raw_chunks'', ...)', 'id, score', 'Semantic retrieval — use after FROM/JOIN'
 UNION ALL
-SELECT 'table_function', 'chunks_fts', 'rowid, content', 'FTS5 keyword search (MATCH). Bridge to vec_ops via: SELECT c.id FROM chunks_fts f JOIN _raw_chunks c ON f.rowid = c.rowid'
+SELECT 'table_function', 'keyword(''term'')', 'id, rank, snippet', 'FTS5 keyword search — use after FROM/JOIN. Returns ranked matches with snippets'
+UNION ALL
+SELECT 'table_function', 'chunks_fts', 'rowid, content', 'Raw FTS5 table (prefer keyword() instead). Bridge via: SELECT c.id FROM chunks_fts f JOIN _raw_chunks c ON f.rowid = c.rowid'
 ORDER BY kind, name;
 
 -- @query: hubs
