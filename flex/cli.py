@@ -1279,7 +1279,98 @@ def cmd_sync(args):
 # Main
 # ============================================================
 
+def _gnu_flex_proxy():
+    """Detect GNU flex usage and transparently forward to the real lexer.
+
+    GNU flex (the lexer generator) ships with Xcode on macOS and is common
+    on Linux dev machines.  Our `flex` binary can shadow it.  Instead of
+    breaking the user's C build, we detect GNU-style invocations and exec
+    the real thing.
+    """
+    argv = sys.argv[1:]
+    if not argv:
+        return  # bare `flex` — ours
+
+    # Our commands — definitely not GNU flex
+    our_commands = {"init", "search", "sync", "-h", "--help"}
+    if argv[0] in our_commands:
+        return
+
+    # Heuristics: does this look like GNU flex?
+    gnu_extensions = {".l", ".lex", ".ll", ".l++", ".lxx"}
+    gnu_flags = {
+        "-o", "--outfile", "--header-file", "--header",
+        "-C", "-Ca", "-Ce", "-Cf", "-CF", "-Cm", "-Cr",
+        "-d", "--debug",
+        "-i", "--case-insensitive",
+        "-l", "--lex-compat",
+        "-L", "--noline",
+        "-s", "--nodefault",
+        "-t", "--stdout",
+        "-v", "--verbose",
+        "-V", "--version",
+        "-w", "--nowarn",
+        "-B", "--batch",
+        "-I", "--interactive",
+        "-P", "--prefix",
+        "-S", "--skel",
+        "--nounistd", "--bison-bridge", "--bison-locations",
+        "--posix", "--noansi-definitions", "--noansi-prototypes",
+    }
+
+    looks_gnu = False
+    for arg in argv:
+        if any(arg.endswith(ext) for ext in gnu_extensions):
+            looks_gnu = True
+            break
+        if arg in gnu_flags or any(arg.startswith(f + "=") for f in gnu_flags):
+            looks_gnu = True
+            break
+
+    if not looks_gnu:
+        return
+
+    # Find the real GNU flex — skip ourselves
+    my_path = os.path.realpath(shutil.which("flex") or "")
+    real_flex = None
+
+    # Check well-known paths first
+    for candidate in ["/usr/bin/flex", "/usr/local/opt/flex/bin/flex"]:
+        if os.path.isfile(candidate) and os.path.realpath(candidate) != my_path:
+            real_flex = candidate
+            break
+
+    # Fall back to which -a
+    if not real_flex:
+        try:
+            all_paths = subprocess.check_output(
+                ["which", "-a", "flex"], text=True, stderr=subprocess.DEVNULL
+            ).strip().split("\n")
+            for p in all_paths:
+                if os.path.realpath(p) != my_path:
+                    real_flex = p
+                    break
+        except subprocess.CalledProcessError:
+            pass
+
+    if real_flex:
+        os.execv(real_flex, [real_flex] + argv)
+        # execv replaces the process — never returns
+    else:
+        print(
+            "This is getflex (AI knowledge engine), not GNU flex (lexer generator).\n"
+            "GNU flex doesn't appear to be installed on this system.\n"
+            "\n"
+            "  Install GNU flex:  apt install flex  /  brew install flex\n"
+            "  Use getflex:       flex init  |  flex search  |  flex sync",
+            file=sys.stderr,
+        )
+        sys.exit(1)
+
+
 def main():
+    _gnu_flex_proxy()
+
     parser = argparse.ArgumentParser(
         prog="flex",
         description="Your AI sessions, searchable forever.",
