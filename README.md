@@ -69,7 +69,7 @@ SQL pre-filter  →  NumPy vector operations  →  SQL compose
 
 **SQL pre-filter.** Any SQL whose first column returns chunk IDs. `WHERE type = 'user_prompt'`. `WHERE session_id LIKE 'abc%'`. `JOIN _edges_file_identity ON file_uuid = ?`. Every table in the database is pre-filter vocabulary.
 
-**NumPy vector operations.** Cosine similarity across the candidate set. Modulation tokens reshape the landscape before selection.
+**NumPy vector operations.** Cosine similarity across the candidate set. Modulation tokens reshape the landscape before selection. The retrieval engine is published independently as [flexvec](https://github.com/damian-delmas/flexvec) for use in any SQLite database.
 
 **SQL compose.** Full SQL on 500 candidates. Hub boost. Community filter. JOINs against edge tables. Graph arithmetic. All composable.
 
