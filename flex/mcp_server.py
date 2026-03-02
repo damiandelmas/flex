@@ -797,7 +797,13 @@ def _execute_cell_query(cell: str, query: str) -> str:
             if 'interrupt' in str(e).lower():
                 error_msg = json.dumps({"error": f"Query timed out after {_QUERY_TIMEOUT_S}s"})
             else:
-                error_msg = json.dumps({"error": f"OperationalError: {e}"})
+                msg = str(e)
+                hint = None
+                if "no such column" in msg or "no such table" in msg:
+                    hint = 'Use @orient to see available views, columns, and tables.'
+                elif "not valid SQL" in msg.lower() or "near " in msg:
+                    hint = 'Use @orient to see query examples and syntax.'
+                error_msg = json.dumps({"error": msg, **({"hint": hint} if hint else {})})
             _log_query(cell, query, error_msg, (time.monotonic() - start) * 1000)
             return error_msg
         except Exception as e:
