@@ -4,7 +4,8 @@
 -- NOTE: claude_code override — enhances hubs with terse fingerprint_index from _enrich_session_summary
 
 -- @query: now
-SELECT datetime('now', 'localtime') as now;
+SELECT datetime('now', 'localtime') as now,
+       'UTC' || printf('%+d', cast((julianday('now','localtime') - julianday('now')) * 24 as integer)) as timezone;
 
 -- @query: about
 SELECT value as description FROM _meta WHERE key = 'description';

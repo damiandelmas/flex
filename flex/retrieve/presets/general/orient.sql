@@ -3,7 +3,8 @@
 -- @multi: true
 
 -- @query: now
-SELECT datetime('now', 'localtime') as now;
+SELECT datetime('now', 'localtime') as now,
+       'UTC' || printf('%+d', cast((julianday('now','localtime') - julianday('now')) * 24 as integer)) as timezone;
 
 -- @query: about
 SELECT value as description FROM _meta WHERE key = 'description';
