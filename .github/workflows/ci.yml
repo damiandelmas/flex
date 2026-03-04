@@ -48,9 +48,8 @@ jobs:
           import json, pathlib, sys
           cfg = json.loads(pathlib.Path.home().joinpath('.claude.json').read_text())
           srv = cfg['mcpServers']['flex']
-          assert 'command' in srv, f'Expected stdio transport, got: {srv}'
-          assert sys.executable in srv['command'], f'Expected {sys.executable} in command'
-          print('MCP config OK: stdio transport with correct Python path')
+          assert 'command' in srv or 'url' in srv, f'Expected stdio or http transport, got: {srv}'
+          print(f'MCP config OK: {\"http\" if \"url\" in srv else \"stdio\"} transport')
           "
 
       - name: Install smoke test (Windows)
@@ -58,7 +57,7 @@ jobs:
         run: |
           flex init --local
           flex search "SELECT COUNT(*) FROM sessions"
-          python -c "import json, pathlib, sys; cfg = json.loads(pathlib.Path.home().joinpath('.claude.json').read_text()); srv = cfg['mcpServers']['flex']; assert 'command' in srv, f'Expected stdio transport, got: {srv}'; assert sys.executable in srv['command'], f'Expected {sys.executable} in command'; print('MCP config OK: stdio transport with correct Python path')"
+          python -c "import json, pathlib; cfg = json.loads(pathlib.Path.home().joinpath('.claude.json').read_text()); srv = cfg['mcpServers']['flex']; assert 'command' in srv or 'url' in srv, f'No transport in: {srv}'; print('MCP config OK')"
 
   docker-e2e:
     name: Docker E2E

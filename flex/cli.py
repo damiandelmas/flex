@@ -689,6 +689,28 @@ def cmd_init(args):
     # Always bootstrap cell (even if empty) so flex search works immediately
     cell_path = bootstrap_claude_code_cell()
 
+    # Install enrichment stubs + views on every init (even empty cells)
+    _stub_conn = _sqlite3.connect(str(cell_path), timeout=30.0)
+    try:
+        _stub_conn.execute("PRAGMA journal_mode=WAL")
+        _stub_conn.execute("PRAGMA busy_timeout=30000")
+        for ddl in _ENRICHMENT_STUBS.get('claude-code', []):
+            _stub_conn.execute(ddl)
+        _stub_conn.commit()
+        try:
+            from flex.views import install_views as _siv, regenerate_views as _srv
+            from flex.manage.install_presets import install_cell as _sip
+            _svd = _find_view_dir('claude_code', 'claude-code')
+            if _svd:
+                _siv(_stub_conn, _svd)
+            _srv(_stub_conn)
+            _stub_conn.commit()
+            _sip('claude_code')
+        except Exception:
+            pass
+    finally:
+        _stub_conn.close()
+
     if not jsonls:
         console.print("  [dim]No Claude Code sessions found.[/dim]")
         console.print("  [dim]Sessions index automatically as you use Claude Code.[/dim]")
