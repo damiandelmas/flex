@@ -747,7 +747,7 @@ def cmd_init(args):
 
             with Progress(
                 TextColumn("  {task.description:<20}"),
-                SpinnerColumn(spinner_name="dots", finished_text="[green]✓[/green]"),
+                SpinnerColumn(spinner_name="dots", style="white", finished_text="[green]✓[/green]"),
                 BarColumn(bar_width=20, complete_style="white", finished_style="green"),
                 TextColumn("{task.fields[info]}"),
                 console=console,
