@@ -19,14 +19,14 @@ main() {
 
     # ── Color (respect NO_COLOR / dumb terminals) ────────────────
     if [ -n "${NO_COLOR:-}" ] || [ "${TERM:-}" = "dumb" ] || ! [ -t 1 ]; then
-        RED='' GREEN='' YELLOW='' DIM='' BOLD='' RESET=''
+        RED='' GREEN='' YELLOW='' CYAN='' DIM='' BOLD='' RESET=''
     else
-        RED='\033[0;31m' GREEN='\033[0;32m' YELLOW='\033[0;33m' DIM='\033[0;90m'
+        RED='\033[0;31m' GREEN='\033[0;32m' YELLOW='\033[0;33m' CYAN='\033[0;36m' DIM='\033[0;90m'
         BOLD='\033[1m' RESET='\033[0m'
     fi
 
     info()  { echo -e "${DIM}$1${RESET}"; }
-    ok()    { printf "${DIM}  %-10s${GREEN}%s${RESET}\n" "$1" "$2"; }
+    ok()    { printf "  %-10s${GREEN}%s${RESET}\n" "$1" "$2"; }
     warn()  { printf "${DIM}  %-10s${YELLOW}%s${RESET}\n" "$1" "$2"; }
     fail()  { echo -e "${RED}$1${RESET}" >&2; exit 1; }
 
@@ -35,7 +35,7 @@ main() {
         local label="$1" msg="$2"
         while true; do
             for c in '⠋' '⠙' '⠹' '⠸' '⠼' '⠴' '⠦' '⠧' '⠇' '⠏'; do
-                printf "\r${DIM}  %-10s${YELLOW}%s %s${RESET}" "$label" "$c" "$msg"
+                printf "\r  %-10s%s %s" "$label" "$c" "$msg"
                 sleep 0.1
             done
         done
@@ -78,7 +78,7 @@ main() {
     # ── Uninstall ────────────────────────────────────────────────
     if [ "$DO_UNINSTALL" = true ]; then
         echo ""
-        echo -e "${BOLD}flex${RESET} uninstaller"
+        echo -e "${CYAN}flex${RESET} uninstaller"
         echo ""
         if [ -L "${BIN_DIR}/flex" ]; then
             rm "${BIN_DIR}/flex"
@@ -97,7 +97,7 @@ main() {
 
     # ── Banner ───────────────────────────────────────────────────
     echo ""
-    echo -e "${BOLD}flex${RESET} installer"
+    echo -e "${CYAN}flex${RESET} installer"
     echo ""
 
     # ── Find Python 3.12+ ────────────────────────────────────────

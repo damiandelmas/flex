@@ -660,7 +660,7 @@ def cmd_init(args):
     _model_ok = True
     _model_valid = model_ready()
     if not _model_valid:
-        console.print("  model               [yellow]downloading[/yellow]")
+        console.print("  model               downloading")
         try:
             download_model()
         except RuntimeError as e:
