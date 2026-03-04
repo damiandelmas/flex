@@ -15,7 +15,7 @@ dependencies = [
     "mcp",
     "starlette",
     "uvicorn",
-    "hdbscan",
+    "hdbscan<0.8.41",
 ]
 
 [project.optional-dependencies]
