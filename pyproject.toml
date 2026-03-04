@@ -1,6 +1,6 @@
 [project]
 name = "getflex"
-version = "0.3.1"
+version = "0.3.2"
 description = "SQLite knowledge engine for AI Agents"
 license = { text = "MIT" }
 requires-python = ">=3.12"
