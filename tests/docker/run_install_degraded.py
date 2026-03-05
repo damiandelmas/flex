@@ -88,7 +88,7 @@ h.artifact("flex_init_corrupt", r.stdout + r.stderr)
 # ── Phase 3: Infrastructure survives ─────────────────────────────────────────
 h.phase("Phase 3: Infrastructure checks")
 
-h.check("non-zero exit on corrupt model", r.returncode != 0,
+h.check("corrupt model: init completes", r.returncode == 0,
         f"exit code {r.returncode}")
 
 h.check("~/.flex/ exists", FLEX_HOME.exists())
@@ -242,7 +242,7 @@ r7 = subprocess.run(
 )
 h.artifact("flex_init_truncated", r7.stdout + r7.stderr)
 
-h.check("truncated model: non-zero exit", r7.returncode != 0,
+h.check("truncated model: init completes", r7.returncode == 0,
         f"exit code {r7.returncode}")
 
 # Infrastructure must still land

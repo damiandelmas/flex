@@ -531,6 +531,9 @@ if shutil.which("flex-serve"):
     h.check("sync: re-init exit 0", r_init2.returncode == 0,
             f"exit {r_init2.returncode}")
 
+    # Stop background services before sync to avoid DB lock contention
+    subprocess.run(["flex-serve", "--stop"], capture_output=True)
+    time.sleep(1)
     r_sync = subprocess.run(
         ["flex", "sync"],
         capture_output=True, text=True, timeout=60,

@@ -947,7 +947,7 @@ def cmd_init(args):
     console.print()
 
     # Exit code: 0 = success (possibly with soft warnings), 1 = hard failure
-    _soft_prefixes = ("Embedding incomplete",)
+    _soft_prefixes = ("Model download:", "Embedding incomplete")
     _hard = [w for w in _warnings if not any(w.startswith(p) for p in _soft_prefixes)]
     if _warnings:
         console.print(f"  [yellow]Completed with {len(_warnings)} warning(s):[/yellow]")
