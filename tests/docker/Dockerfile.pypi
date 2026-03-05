@@ -1,0 +1,38 @@
+# PyPI install demo — real user experience, start to finish.
+#
+# Build:
+#   cd /home/axp/projects/flexsearch/main && docker build -f tests/docker/Dockerfile.pypi -t flex-pypi .
+#
+# Run:
+#   docker run --rm -it -p 7134:7134 flex-pypi
+#
+# Then inside:
+#   curl -sSL https://getflex.dev/install.sh | bash
+#   claude
+
+FROM ubuntu:24.04
+
+# ── Bare system (what a real user has) ────────────────────────────────────
+RUN apt-get update && apt-get install -y --no-install-recommends \
+    python3.12 \
+    python3.12-dev \
+    python3.12-venv \
+    python3-pip \
+    build-essential \
+    git \
+    jq \
+    curl \
+    && rm -rf /var/lib/apt/lists/*
+
+# ── Node + Claude Code CLI ───────────────────────────────────────────────
+RUN curl -fsSL https://deb.nodesource.com/setup_20.x | bash - \
+    && apt-get install -y nodejs \
+    && npm install -g @anthropic-ai/claude-code \
+    && rm -rf /var/lib/apt/lists/*
+
+# ── Seed sessions (simulate existing Claude Code user) ───────────────────
+COPY tests/docker/seed_sessions.py /seed_sessions.py
+RUN python3 /seed_sessions.py
+
+# ── Drop to shell ────────────────────────────────────────────────────────
+CMD ["bash"]

@@ -618,8 +618,13 @@ else:
 h.phase("Background Indexer Size-Based Scan")
 
 # Get current chunk count before we append to a JSONL
-cell_path_str = _query("SELECT path FROM cells LIMIT 1", registry=True)
-cell_path_bg = cell_path_str.strip() if cell_path_str else None
+_reg_db = os.path.expanduser("~/.flex/registry.db")
+cell_path_bg = None
+if os.path.exists(_reg_db):
+    _reg = sqlite3.connect(_reg_db)
+    _row = _reg.execute("SELECT path FROM cells LIMIT 1").fetchone()
+    cell_path_bg = _row[0] if _row else None
+    _reg.close()
 pre_count = 0
 if cell_path_bg:
     c = sqlite3.connect(cell_path_bg)
