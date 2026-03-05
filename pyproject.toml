@@ -16,7 +16,6 @@ dependencies = [
     "starlette",
     "uvicorn",
     "hdbscan<0.8.41",
-    "flexscore>=0.1.1",
 ]
 
 [project.optional-dependencies]
@@ -43,7 +42,7 @@ flex = [
 ]
 
 [tool.setuptools.exclude-package-data]
-flex = ["onnx/model.onnx", "onnx/model.onnx.data", "retrieve/_scoring.py", "retrieve/_scoring_rs/**"]
+flex = ["onnx/model.onnx", "onnx/model.onnx.data"]
 
 [tool.setuptools.packages.find]
 include = ["flex*"]

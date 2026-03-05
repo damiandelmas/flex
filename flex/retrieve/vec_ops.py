@@ -1,8 +1,8 @@
 """
 Flex Vector Operations — SQL-accessible semantic search.
 
-Bridges numpy scoring into SQLite via virtual table registration.
-The scoring engine lives in _scoring (compiled).
+Bridges the scoring engine into SQLite via virtual table registration.
+The scoring engine lives in _scoring.
 
 SQL usage:
     vec_ops('_raw_chunks', 'auth')                    -- raw cosine
@@ -19,8 +19,7 @@ import uuid
 import numpy as np
 from typing import Optional, List, Dict, Any
 
-from _scoring_rs import parse_modifiers, score_candidates
-from _scoring_rs import mmr_select_py as _mmr_select
+from flex.retrieve._scoring import parse_modifiers, score_candidates, _mmr_select
 
 
 class VectorCache:
@@ -131,103 +130,30 @@ class VectorCache:
                embed_fn=None, embed_doc_fn=None) -> List[Dict[str, Any]]:
         """Search for similar vectors with optional landscape modulations.
 
-        Pre-computes text->vector conversions, then delegates to Rust scoring engine.
+        Delegates to the scoring engine (_scoring.score_candidates).
         """
         if self.matrix is None or len(self.ids) == 0:
             return []
 
-        mods = modifiers or {}
-        cfg = config or {}
-
-        # Pre-compute contrastive vector (Python-side embed call)
-        if not_like_vec is None and mods.get('unlike') and embed_fn is not None:
-            not_like_vec = np.squeeze(embed_fn(mods['unlike']))
-
-        # Pre-compute trajectory vectors (Python-side embed call)
-        traj_from_vec = None
-        traj_to_vec = None
-        traj_from = mods.get('trajectory_from')
-        traj_to = mods.get('trajectory_to')
-        if traj_from and traj_to and embed_fn:
-            _embed_for_traj = embed_doc_fn if embed_doc_fn is not None else embed_fn
-            traj_from_vec = np.squeeze(_embed_for_traj(traj_from)).astype(np.float32)
-            traj_to_vec = np.squeeze(_embed_for_traj(traj_to)).astype(np.float32)
-
-        # Unpack modifier flags
-        if mods.get('diverse'):
-            diverse = True
-        if mods.get('limit'):
-            limit = mods['limit']
-
-        recent = bool(mods.get('recent'))
-        recent_days = float(
-            mods.get('recent_days') or cfg.get('vec:recent:half_life', 30)
-        ) if recent else None
-
-        like_ids = mods.get('like')
-        detect_communities = bool(mods.get('local_communities'))
-
-        # Convert pre_filter_ids to list for Rust
-        pf_list = list(pre_filter_ids) if pre_filter_ids is not None else None
-
-        # Call Rust scoring engine — pure arrays, no callbacks
-        results = score_candidates(
+        return score_candidates(
             matrix=self.matrix,
             ids=self.ids,
             id_to_idx=self._id_to_idx,
             query_vec=query_vec,
             timestamps=self.timestamps,
-            pre_filter_ids=pf_list,
+            pre_filter_ids=pre_filter_ids,
             not_like_vec=not_like_vec,
             diverse=diverse,
             limit=limit,
             oversample=oversample,
+            mask=mask,
             threshold=threshold,
             mmr_lambda=mmr_lambda,
-            recent=recent,
-            recent_days=recent_days,
-            like_ids=like_ids,
-            traj_from_vec=traj_from_vec,
-            traj_to_vec=traj_to_vec,
-            mask=mask,
+            modifiers=modifiers,
+            config=config,
+            embed_fn=embed_fn,
+            embed_doc_fn=embed_doc_fn,
         )
-
-        # Convert PyO3 dicts to plain dicts
-        results = [dict(r) for r in results]
-
-        # Local communities (Python-side networkx — runs on small candidate set)
-        if detect_communities and len(results) >= 3:
-            self._detect_communities(results)
-
-        return results
-
-    def _detect_communities(self, results: list):
-        """Run Louvain on candidate set, annotate results with _community."""
-        import networkx as nx
-        indices = []
-        for r in results:
-            idx = self._id_to_idx.get(r['id'])
-            if idx is not None:
-                indices.append(idx)
-        if len(indices) < 3:
-            return
-        cand_vecs = self.matrix[np.array(indices)]
-        sims = cand_vecs @ cand_vecs.T
-        rows, cols = np.where(np.triu(sims > 0.5, k=1))
-        G = nx.Graph()
-        G.add_nodes_from(range(len(indices)))
-        G.add_weighted_edges_from(
-            (int(r_), int(c), float(sims[r_, c])) for r_, c in zip(rows, cols)
-        )
-        if G.number_of_edges() > 0:
-            comms = nx.community.louvain_communities(G)
-            node_to_comm = {}
-            for ci, comm in enumerate(comms):
-                for node in comm:
-                    node_to_comm[node] = ci
-            for i, r in enumerate(results):
-                if i in node_to_comm:
-                    r['_community'] = node_to_comm[i]
 
     def _mmr_select_on(self, candidates: list, similarities: np.ndarray,
                        matrix: np.ndarray, k: int, lambda_: float = 0.7) -> list:
