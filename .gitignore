@@ -33,3 +33,7 @@ htmlcov/
 *.db
 *.db-wal
 *.db-shm
+
+# Rust
+target/
+Cargo.lock
