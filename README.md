@@ -4,7 +4,7 @@ AI was trained on SQL — it doesn't need another retrieval API.
 
 flex compiles AI agent conversations and knowledge bases into SQLite. Each knowledge base is a self-describing cell — chunks, embeddings, graph intelligence, and extensible functionality.
 
-Instead of encoding retrieval intelligence into the pipeline — re-rankers, learned scoring, custom APIs — flex exposes the schema and lets the agent compose its own queries over a rich data surface.
+Instead of encoding retrieval intelligence into the pipeline flex exposes the schema and lets the agent compose its own queries over a rich data surface.
 
 ```bash
 curl -sSL https://getflex.dev/install.sh | bash
@@ -48,7 +48,7 @@ LIMIT 10
 
 Flex keeps embeddings as numpy arrays you can modulate — diverse, unlike, trajectory, contrastive, temporal decay — operations on the embedding space itself.
 
-The retrieval engine is published independently as [flexvec](https://github.com/damian-delmas/flexvec) for use in any SQLite database.
+The retrieval engine is published independently as [flexvec](https://github.com/damiandelmas/flexvec) for use in any SQLite database.
 
 Every query runs three steps. The agent writes the query.
 

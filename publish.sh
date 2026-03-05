@@ -47,7 +47,7 @@ fi
 # Verify remote exists
 if ! git remote get-url "$REMOTE" &>/dev/null; then
     echo "Remote '$REMOTE' not found. Add it:"
-    echo "  git remote add $REMOTE git@github.com:damian-delmas/flex.git"
+    echo "  git remote add $REMOTE git@github.com:damiandelmas/flex.git"
     exit 1
 fi
 
@@ -105,21 +105,6 @@ git tag -f "v$VERSION"
 # Push (regular — preserves history)
 git push "$REMOTE" "$BRANCH:$TARGET"
 git push "$REMOTE" "v$VERSION" --force
-
-# Deploy install.sh + landing page to getflex.dev
-echo "Deploying to getflex.dev..."
-_deploy_dir=$(mktemp -d)
-cp install.sh "$_deploy_dir/install.sh"
-_website_dir="$HOME/projects/flex/website/main"
-if [[ -f "$_website_dir/getflexdotdev-claudecode.html" ]]; then
-    cp "$_website_dir/getflexdotdev-claudecode.html" "$_deploy_dir/index.html"
-fi
-if npx wrangler pages deploy "$_deploy_dir" --project-name getflex-site --branch main --commit-dirty=true 2>&1 | tail -1; then
-    echo "getflex.dev deployed"
-else
-    echo "WARNING: Cloudflare deploy failed — getflex.dev not updated"
-fi
-rm -rf "$_deploy_dir"
 
 # Cleanup
 git checkout -f dev

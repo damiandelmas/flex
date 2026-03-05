@@ -606,6 +606,9 @@ def cmd_init(args):
     console = Console()
     _warnings: list[str] = []  # accumulate phase failures for exit code
 
+    # Stop running worker/MCP before init to avoid DB lock contention
+    _kill_pid_services()
+
     console.print()
 
     # 0. Pre-flight: check system deps before doing anything
