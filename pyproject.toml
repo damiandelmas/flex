@@ -36,13 +36,14 @@ flex = [
     "modules/soma/**/*.sql",
     "modules/soma/*.sql",
     "retrieve/presets/general/*.sql",
+    "retrieve/_scoring.pyc",
     "onnx/*.json",
     "onnx/vocab.txt",
     "ai/**/*.md",
 ]
 
 [tool.setuptools.exclude-package-data]
-flex = ["onnx/model.onnx", "onnx/model.onnx.data"]
+flex = ["onnx/model.onnx", "onnx/model.onnx.data", "retrieve/_scoring.py"]
 
 [tool.setuptools.packages.find]
 include = ["flex*"]

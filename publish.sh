@@ -35,6 +35,7 @@ PRIVATE=(
     flex/modules/claude_code/scripts
     flex/modules/claude_code/manage/backfill_metadata.py
     flex/modules/claude_code/resume.py
+    flex/retrieve/_scoring.py
 )
 
 DRY_RUN=false
@@ -83,7 +84,18 @@ git checkout -B "$BRANCH" "$REMOTE/$TARGET"
 git read-tree dev
 git checkout dev -- .
 
-# Remove private files from index
+# Compile _scoring.py to .pyc (bytecode-only distribution)
+echo "Compiling scoring engine to bytecode..."
+python3 -c "
+import py_compile, sys, os
+src = 'flex/retrieve/_scoring.py'
+# Compile to __pycache__ first, then move to package dir
+py_compile.compile(src, cfile='flex/retrieve/_scoring.pyc', doraise=True)
+print(f'  Compiled {src} -> flex/retrieve/_scoring.pyc')
+"
+git add flex/retrieve/_scoring.pyc
+
+# Remove private files from index (including _scoring.py source)
 for p in "${PRIVATE[@]}"; do
     git rm -r --cached "$p" 2>/dev/null || true
 done
