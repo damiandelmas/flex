@@ -1,0 +1,9 @@
+[project]
+name = "flex"
+version = "0.5.0"
+description = "SQLite knowledge engine for AI Agents"
+license = { text = "MIT" }
+readme = "README.md"
+
+# This package is not installable via pip.
+# Install flex via: curl -sSL https://getflex.dev/install.sh | bash
