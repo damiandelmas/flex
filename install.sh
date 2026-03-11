@@ -103,21 +103,25 @@ main() {
     # ── Find Python 3.12+ ────────────────────────────────────────
     find_python() {
         for cmd in python3.14 python3.13 python3.12 python3; do
-            if command -v "$cmd" &>/dev/null; then
-                # Skip pythons inside a venv/conda env — we need a system python
-                local in_venv
-                in_venv=$("$cmd" -c "import sys; print(int(sys.prefix != sys.base_prefix or hasattr(sys, 'real_prefix')))" 2>/dev/null) || continue
-                [ "$in_venv" = "1" ] && continue
+            local candidate
+            candidate=$(command -v "$cmd" 2>/dev/null) || continue
 
-                local ver
-                ver=$("$cmd" -c "import sys; print(f'{sys.version_info.major}.{sys.version_info.minor}')" 2>/dev/null) || continue
-                local major minor
-                major=$(echo "$ver" | cut -d. -f1)
-                minor=$(echo "$ver" | cut -d. -f2)
-                if [ "$major" -ge 3 ] && [ "$minor" -ge 12 ]; then
-                    echo "$cmd"
-                    return 0
-                fi
+            # If inside a venv/conda, resolve to the system python it was created from
+            local in_venv
+            in_venv=$("$candidate" -c "import sys; print(int(sys.prefix != sys.base_prefix or hasattr(sys, 'real_prefix')))" 2>/dev/null) || continue
+            if [ "$in_venv" = "1" ]; then
+                candidate=$("$candidate" -c "import sys, os; print(os.path.join(sys.base_prefix, 'bin', 'python' + str(sys.version_info.major) + '.' + str(sys.version_info.minor)))" 2>/dev/null) || continue
+                [ -x "$candidate" ] || continue
+            fi
+
+            local ver
+            ver=$("$candidate" -c "import sys; print(f'{sys.version_info.major}.{sys.version_info.minor}')" 2>/dev/null) || continue
+            local major minor
+            major=$(echo "$ver" | cut -d. -f1)
+            minor=$(echo "$ver" | cut -d. -f2)
+            if [ "$major" -ge 3 ] && [ "$minor" -ge 12 ]; then
+                echo "$candidate"
+                return 0
             fi
         done
         return 1
@@ -191,7 +195,7 @@ main() {
     fi
 
     # ── Install getflex ──────────────────────────────────────────
-    FLEX_VERSION="${FLEX_VERSION:-0.7.0}"
+    FLEX_VERSION="${FLEX_VERSION:-0.8.0}"
 
     # Skip if already on target version (unless --reinstall)
     local _cur_ver

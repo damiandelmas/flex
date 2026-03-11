@@ -27,7 +27,7 @@ def open_cell(db_path: str) -> sqlite3.Connection:
     db.execute("PRAGMA cache_size=-20000")
     db.execute("PRAGMA temp_store=MEMORY")
     db.execute("PRAGMA journal_mode=WAL")
-    db.execute("PRAGMA max_page_count=262144")  # 1GB ceiling (256K × 4KB pages)
+    db.execute("PRAGMA max_page_count=1048576")  # 4GB ceiling (1M × 4KB pages)
     return db
 
 

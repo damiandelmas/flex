@@ -6,9 +6,9 @@ The AI writes SQL. The server executes it read-only.
 vec_ops registered as a function for semantic queries.
 
 Usage:
-    python -m flex.mcp_server                          # stdio (Claude Code)
-    python -m flex.mcp_server --http --port 7134       # streamable HTTP
-    python -m flex.mcp_server --cell claude_code --cell qmem # multi-cell
+    python -m flex.serve                               # stdio (Claude Code)
+    python -m flex.serve --http --port 7134             # streamable HTTP
+    python -m flex.serve --cell claude_code --cell qmem # multi-cell
 """
 
 import asyncio
@@ -22,7 +22,6 @@ from datetime import datetime, timezone
 from pathlib import Path
 
 from mcp.server.lowlevel import Server
-from mcp.server.stdio import stdio_server
 import mcp.types as types
 
 from flex.core import open_cell, get_meta
@@ -40,8 +39,6 @@ try:
         register_vec_udf,
         execute_preset as _engine_execute_preset,
         materialize as _engine_materialize,
-        drain_queue,
-        run_enrichment,
     )
     HAS_ENGINE = True
 except ImportError:
@@ -163,7 +160,32 @@ def get_cell(name: str):
 _no_embed = False
 
 
-def warm_all(cell_names: list[str]):
+def init(cell_names: list[str], no_embed: bool = False):
+    """Initialize the server: discover cells, warm caches, set instructions.
+
+    Called by serve.py (the entrypoint) before transport starts.
+    """
+    global _no_embed
+    _no_embed = no_embed
+
+    _known_cells.update(cell_names)
+
+    if not no_embed:
+        print(f"[flex-mcp] Warming VectorCaches...", file=sys.stderr)
+        _warm_all(cell_names)
+    else:
+        print("[flex-mcp] Skipping embeddings", file=sys.stderr)
+
+    server.instructions = build_instructions()
+    print(f"[flex-mcp] {len(_known_cells)} cells, {len(_vec_state)} cached", file=sys.stderr)
+
+
+def get_server() -> Server:
+    """Return the MCP Server instance for transport wiring."""
+    return server
+
+
+def _warm_all(cell_names: list[str]):
     """Pre-warm VectorCaches and ONNX embedder at startup."""
     if not HAS_ENGINE:
         print("[flex-mcp] Engine not installed — skipping warmup", file=sys.stderr)
@@ -241,15 +263,15 @@ def execute_query(db: sqlite3.Connection, query: str) -> str:
             "error": f"Not valid SQL: \"{sql}\"",
             "hint": "Use vec_ops() for semantic search, FTS for keyword match, or @preset syntax.",
             "semantic": (
-                f"SELECT v.id, v.score, m.content "
-                f"FROM vec_ops('_raw_chunks', '{escaped}') v "
-                f"JOIN messages m ON v.id = m.id "
+                f"SELECT v.id, v.score, c.content "
+                f"FROM vec_ops('similar:{escaped}') v "
+                f"JOIN chunks c ON v.id = c.id "
                 f"ORDER BY v.score DESC LIMIT 10"
             ),
             "keyword": (
-                f"SELECT k.id, k.rank, k.snippet, m.content "
+                f"SELECT k.id, k.rank, k.snippet, c.content "
                 f"FROM keyword('{escaped}') k "
-                f"JOIN messages m ON k.id = m.id "
+                f"JOIN chunks c ON k.id = c.id "
                 f"ORDER BY k.rank DESC LIMIT 10"
             ),
         })
@@ -362,30 +384,30 @@ def build_instructions() -> str:
         "",
         "This phase returns (id, score) pairs that Phase 3 joins, boosts, filters, and paginates.",
         "",
-        "`vec_ops('_raw_chunks', 'query_text', 'tokens', 'pre_filter_sql')`",
+        "`vec_ops('similar:query_text tokens', 'pre_filter_sql')`",
         "",
         "**IMPORTANT:** vec_ops is a table source \u2014 always use after FROM or JOIN:",
         "```sql",
-        "FROM vec_ops('_raw_chunks', 'query') v",
+        "FROM vec_ops('similar:query') v",
         "```",
         "",
         "### Modulation Tokens",
         "",
-        "Tokens compose freely: `'diverse unlike:jwt recent:7'`",
+        "Tokens compose freely: `'similar:auth diverse suppress:jwt decay:7'`",
         "",
         "#### diverse",
         "",
         "MMR \u2014 each successive result is penalized for similarity to already-selected results. Use when you want breadth across subtopics rather than 10 variations of the same answer.",
         "",
-        "#### unlike:TEXT",
+        "#### suppress:TEXT",
         "",
         "Contrastive search. Embeds TEXT separately, demotes chunks similar to it. The dominant signal gets suppressed \u2014 what surfaces are the edges that a normal query drowns out.",
         "",
-        "#### recent:N",
+        "#### decay:N",
         "",
-        "Temporal decay with N-day half-life. A chunk from N days ago scores 50% of an identical chunk from today. Omit N for gentle decay. `recent:1` is aggressive \u2014 yesterday is half-weighted.",
+        "Temporal decay with N-day half-life. A chunk from N days ago scores 50% of an identical chunk from today. Omit N for gentle decay. `decay:1` is aggressive \u2014 yesterday is half-weighted.",
         "",
-        "#### like:id1,id2,...",
+        "#### centroid:id1,id2,...",
         "",
         "Centroid search. Computes the mean embedding of the given chunk IDs, then searches from that synthetic vantage point. Use when you found a good result and want more like it, or when 2-3 examples define a concept better than words can.",
         "",
@@ -393,7 +415,7 @@ def build_instructions() -> str:
         "",
         "Trajectory \u2014 a direction vector through embedding space. Finds content along the conceptual arc from one idea to another. Not \"search for X then Y\" \u2014 it's the delta between two concepts applied as a lens.",
         "",
-        "#### limit:N",
+        "#### pool:N",
         "",
         "Candidate pool size (default 500).",
         "",
@@ -401,36 +423,34 @@ def build_instructions() -> str:
         "",
         "Broad survey with recency bias:",
         "```sql",
-        "SELECT v.id, v.score, m.content, m.project",
-        "FROM vec_ops('_raw_chunks', 'decisions and tradeoffs', 'diverse recent:7',",
-        "  'SELECT id FROM messages WHERE type = ''user_prompt''') v",
-        "JOIN messages m ON v.id = m.id",
+        "SELECT v.id, v.score, c.content, c.session_id",
+        "FROM vec_ops('similar:decisions and tradeoffs diverse decay:7',",
+        "  'SELECT id FROM chunks WHERE type = ''user_prompt''') v",
+        "JOIN chunks c ON v.id = c.id",
         "ORDER BY v.score DESC LIMIT 15",
         "```",
         "",
         "Contrastive \u2014 suppress a dominant theme:",
         "```sql",
-        "SELECT v.id, v.score, m.content",
-        "FROM vec_ops('_raw_chunks', 'architecture design',",
-        "  'diverse unlike:deployment pipeline shipping') v",
-        "JOIN messages m ON v.id = m.id",
+        "SELECT v.id, v.score, c.content",
+        "FROM vec_ops('similar:architecture design diverse suppress:deployment pipeline shipping') v",
+        "JOIN chunks c ON v.id = c.id",
         "ORDER BY v.score DESC LIMIT 10",
         "```",
         "",
         "Trajectory \u2014 evolution from one concept to another:",
         "```sql",
-        "SELECT v.id, v.score, m.content",
-        "FROM vec_ops('_raw_chunks', 'architecture design',",
-        "  'from:single file monolith to:modular cell-based system') v",
-        "JOIN messages m ON v.id = m.id",
+        "SELECT v.id, v.score, c.content",
+        "FROM vec_ops('similar:architecture design from:single file monolith to:modular cell-based system') v",
+        "JOIN chunks c ON v.id = c.id",
         "ORDER BY v.score DESC LIMIT 10",
         "```",
         "",
         "### Edge Cases",
         "",
         "- `diverse` is boolean \u2014 `diverse:0.5` has no effect, just use `diverse`",
-        "- `recent:0` disables temporal decay (not 'zero days')",
-        "- `limit:0` falls back to default (500), not zero results",
+        "- `decay:0` disables temporal decay (not 'zero days')",
+        "- `pool:0` falls back to default (500), not zero results",
         "- Only ONE vec_ops per query \u2014 for multiple, use CTEs:",
         "  `WITH a AS (SELECT * FROM vec_ops(...) v) SELECT * FROM a`",
         "- Some sessions have NULL centrality/community \u2014 use COALESCE or LEFT JOIN.",
@@ -440,21 +460,21 @@ def build_instructions() -> str:
         "Phase 3 takes the scored results from vec_ops and composes the final output with full SQL. This is where you join back to views, boost scores with graph metadata, group by community or project, filter on columns that only exist in the views, and paginate. Hub/bridge reranking and graph arithmetic live here.",
         "",
         "```sql",
-        "SELECT v.id, v.score, m.content",
-        "FROM vec_ops('_raw_chunks', 'authentication') v",
-        "JOIN messages m ON v.id = m.id",
+        "SELECT v.id, v.score, c.content",
+        "FROM vec_ops('similar:authentication') v",
+        "JOIN chunks c ON v.id = c.id",
         "ORDER BY v.score DESC",
         "LIMIT 10",
         "```",
         "",
         "### Structure Tokens",
         "",
-        "`local_communities` \u2014 per-query Louvain, adds `_community` column to candidates:",
+        "`communities` \u2014 per-query Louvain, adds `_community` column to candidates:",
         "",
         "```sql",
-        "SELECT _community, COUNT(*) as n, MIN(m.content) as sample",
-        "FROM vec_ops('_raw_chunks', 'authentication', 'local_communities') v",
-        "JOIN messages m ON v.id = m.id",
+        "SELECT _community, COUNT(*) as n, MIN(c.content) as sample",
+        "FROM vec_ops('similar:authentication communities') v",
+        "JOIN chunks c ON v.id = c.id",
         "GROUP BY _community",
         "```",
         "",
@@ -468,24 +488,25 @@ def build_instructions() -> str:
         "",
         "**Semantic search** (the skeleton):",
         "```sql",
-        "SELECT v.id, v.score, m.content",
-        "FROM vec_ops('_raw_chunks', 'YOUR TOPIC', 'TOKENS', 'PRE_FILTER') v",
-        "JOIN messages m ON v.id = m.id",
+        "SELECT v.id, v.score, c.content",
+        "FROM vec_ops('similar:YOUR TOPIC TOKENS', 'PRE_FILTER') v",
+        "JOIN chunks c ON v.id = c.id",
         "ORDER BY v.score DESC LIMIT 10",
         "```",
         "",
         "Narrow the search with a pre-filter:",
-        "- Session scope: `'SELECT id FROM messages WHERE session_id LIKE ''abc%'''`",
-        "- Human voice only: `'SELECT id FROM messages WHERE type = ''user_prompt'''`",
-        "- Date range: `'SELECT id FROM messages WHERE created_at >= ''2026-02-22'''`",
-        "- By project: `'SELECT id FROM messages WHERE project = ''flexsearch'''`",
+        "- Session scope: `'SELECT id FROM chunks WHERE session_id LIKE ''abc%'''`",
+        "- Human voice only: `'SELECT id FROM chunks WHERE type = ''user_prompt'''`",
+        "- Date range: `'SELECT id FROM chunks WHERE created_at >= ''2026-02-22'''`",
+        "- By project: `'SELECT id FROM chunks WHERE session_id IN (SELECT session_id FROM sessions WHERE project = ''flexsearch'')'''`",
+        "- Files only: `'SELECT id FROM chunks WHERE type = ''file'''`",
         "- No filter: omit or `''`",
         "",
         "**Exact term** (FTS5 \u2014 domain name, filename, error, UUID):",
         "```sql",
-        "SELECT k.id, k.rank, k.snippet, m.content",
+        "SELECT k.id, k.rank, k.snippet, c.content",
         "FROM keyword('term') k",
-        "JOIN messages m ON k.id = m.id",
+        "JOIN chunks c ON k.id = c.id",
         "ORDER BY k.rank DESC LIMIT 10",
         "-- keyword() is a table source \u2014 always use after FROM or JOIN.",
         "-- Returns (id, rank, snippet). rank is positive \u2014 higher = better.",
@@ -494,40 +515,70 @@ def build_instructions() -> str:
         "",
         "**Hybrid intersection** (only chunks matching BOTH keyword and semantic):",
         "```sql",
-        "SELECT k.id, k.rank, v.score, m.content",
+        "SELECT k.id, k.rank, v.score, c.content",
         "FROM keyword('auth') k",
-        "JOIN vec_ops('_raw_chunks', 'authentication patterns') v ON k.id = v.id",
-        "JOIN messages m ON k.id = m.id",
+        "JOIN vec_ops('similar:authentication patterns') v ON k.id = v.id",
+        "JOIN chunks c ON k.id = c.id",
         "ORDER BY k.rank + v.score DESC",
         "LIMIT 10",
         "```",
         "",
         "**FTS as pre-filter** (all semantic results, scoped to keyword matches):",
         "```sql",
-        "SELECT v.id, v.score, m.content",
-        "FROM vec_ops('_raw_chunks', 'YOUR TOPIC', '',",
+        "SELECT v.id, v.score, c.content",
+        "FROM vec_ops('similar:YOUR TOPIC',",
         "  'SELECT c.id FROM chunks_fts f JOIN _raw_chunks c ON f.rowid = c.rowid",
         "   WHERE chunks_fts MATCH ''term''') v",
-        "JOIN messages m ON v.id = m.id",
+        "JOIN chunks c ON v.id = c.id",
         "ORDER BY v.score DESC LIMIT 10",
         "```",
         "",
         "**Hub navigation** (most connected sessions):",
         "```sql",
         "SELECT v.id, v.score, s.title, s.centrality",
-        "FROM vec_ops('_raw_chunks', 'YOUR TOPIC') v",
-        "JOIN messages m ON v.id = m.id",
-        "JOIN sessions s ON m.session_id = s.session_id",
+        "FROM vec_ops('similar:YOUR TOPIC') v",
+        "JOIN chunks c ON v.id = c.id",
+        "JOIN sessions s ON c.session_id = s.session_id",
         "WHERE s.is_hub = 1",
         "ORDER BY s.centrality DESC LIMIT 5",
         "```",
         "",
+        "**File search** (find files by path, search file content):",
+        "```sql",
+        "-- Find files by path pattern (exact — no embeddings needed)",
+        "SELECT file, section, ext, substr(content, 1, 200)",
+        "FROM chunks WHERE type = 'file' AND file LIKE '%/changes/code/2603%'",
+        "ORDER BY created_at DESC LIMIT 10",
+        "```",
+        "```sql",
+        "-- Semantic search within files only",
+        "SELECT v.id, v.score, c.file, c.section, substr(c.content, 1, 200)",
+        "FROM vec_ops('similar:authentication middleware', 'SELECT id FROM chunks WHERE type = ''file''') v",
+        "JOIN chunks c ON v.id = c.id",
+        "ORDER BY v.score DESC LIMIT 10",
+        "```",
+        "```sql",
+        "-- File keyword search (exact term in file bodies)",
+        "SELECT k.id, k.rank, c.file, c.section",
+        "FROM keyword('def ingest_catalog') k",
+        "JOIN chunks c ON k.id = c.id",
+        "WHERE c.type = 'file'",
+        "ORDER BY k.rank DESC LIMIT 10",
+        "```",
+        "",
         "**One-liners:**",
-        "- Filter by session: `WHERE m.session_id LIKE 'd332a1a0%'`",
-        "- File dedup (SOMA): `GROUP BY COALESCE(json_extract(m.file_uuids, '$[0]'), m.target_file)`",
+        "- Filter by session: `WHERE c.session_id LIKE 'd332a1a0%'`",
+        "- Filter by type: `WHERE c.type = 'file'`  or `'user_prompt'` or `'tool_call'`",
+        "- Filter by file extension: `WHERE c.ext = 'py'`",
         "- Session drill-down: `@story session=d332a1a0`",
         "",
         "# METHODOLOGY",
+        "",
+        "**Choose the right mode for the task:**",
+        "- Known path/name? → `WHERE file LIKE '%pattern%'` (structural SQL, no embeddings)",
+        "- Known exact term? → `keyword('term')` (FTS5)",
+        "- Conceptual/fuzzy? → `vec_ops('similar:...')` (semantic)",
+        "- Don't reach for semantic search when structural SQL or keyword search will do.",
         "",
         "Start with `@orient`. Every cell describes itself \u2014 shape, schema, views, communities, hubs, presets.",
         "",
@@ -827,260 +878,14 @@ async def handle_call_tool(
 
 
 # ============================================================
-# HTTP Mode (streamable HTTP for Claude Code, claude.ai, Cursor)
+# Backward compat: python -m flex.mcp_server still works
 # ============================================================
-
-def run_http_server(port: int = 7134):
-    from mcp.server.streamable_http_manager import StreamableHTTPSessionManager
-    from starlette.applications import Starlette
-    from starlette.routing import Route, Mount
-    from starlette.requests import Request
-    from starlette.responses import JSONResponse
-    import uvicorn
-
-    session_manager = StreamableHTTPSessionManager(
-        app=server,
-        json_response=True,
-        stateless=True,
-    )
-
-    async def handle_mcp(scope, receive, send):
-        await session_manager.handle_request(scope, receive, send)
-
-    async def health(request: Request) -> JSONResponse:
-        return JSONResponse({
-            "status": "ok",
-            "cells": sorted(_known_cells),
-            "on_disk": discover_cells(),
-            "vec_cached": {k: list(v['caches'].keys()) for k, v in _vec_state.items()},
-        })
-
-    from contextlib import asynccontextmanager
-
-    @asynccontextmanager
-    async def lifespan(app):
-        # Start relay client in background if machine_id exists
-        task = None
-        if _machine_id():
-            task = asyncio.create_task(_run_relay_client())
-        async with session_manager.run():
-            yield
-        if task:
-            task.cancel()
-
-    app = Starlette(
-        debug=False,
-        lifespan=lifespan,
-        routes=[
-            Route("/health", health),
-            Mount("/mcp", app=handle_mcp),
-        ],
-    )
-
-    print(f"[flex-mcp] streamable-http on port {port}", file=sys.stderr)
-    uvicorn.run(app, host="127.0.0.1", port=port)
-
-
-# ============================================================
-# Relay Client (outbound WS to getflex.dev)
-# ============================================================
-
-def _machine_id() -> str | None:
-    """Read $FLEX_HOME/machine_id — generated by flex init. 8-char hex."""
-    from flex.registry import FLEX_HOME
-    p = FLEX_HOME / "machine_id"
-    return p.read_text().strip() if p.exists() else None
-
-
-async def _run_relay_client():
-    """
-    Maintain outbound WebSocket to the relay DO.
-
-    Bridges MCP protocol over the WS:
-      relay → ws.recv() → anyio read_stream → server.run()
-      server.run() → anyio write_stream → ws.send() → relay → claude.ai SSE
-
-    Reconnects automatically on disconnect.
-    """
-    import anyio
-    import websockets
-    from mcp.types import JSONRPCMessage
-    from mcp.shared.session import SessionMessage
-
-    machine_id = _machine_id()
-    if not machine_id:
-        print("[flex-mcp] No machine_id — relay disabled", file=sys.stderr)
-        return
-
-    url = f"wss://{machine_id}.getflex.dev/connect"
-    print(f"[flex-mcp] Relay: {machine_id[:8]}...getflex.dev", file=sys.stderr)
-
-    while True:
-        try:
-            async with websockets.connect(
-                url,
-                ping_interval=20,
-                ping_timeout=30,
-                open_timeout=10,
-            ) as ws:
-                print("[flex-mcp] Relay connected", file=sys.stderr)
-
-                # anyio memory streams — MCP server reads/writes these
-                read_send,  read_recv  = anyio.create_memory_object_stream(max_buffer_size=64)
-                write_send, write_recv = anyio.create_memory_object_stream(max_buffer_size=64)
-
-                async def ws_to_server():
-                    """Relay → server: parse JSON-RPC, put in read stream."""
-                    try:
-                        async for raw in ws:
-                            try:
-                                msg = JSONRPCMessage.model_validate_json(raw)
-                                await read_send.send(SessionMessage(message=msg))
-                            except Exception as e:
-                                print(f"[flex-mcp] Relay parse error: {e}", file=sys.stderr)
-                    finally:
-                        await read_send.aclose()
-
-                async def server_to_ws():
-                    """Server → relay: serialize JSON-RPC, send over WS."""
-                    async with write_recv:
-                        async for session_msg in write_recv:
-                            try:
-                                msg = session_msg.message if isinstance(session_msg, SessionMessage) else session_msg
-                                await ws.send(
-                                    msg.model_dump_json(by_alias=True, exclude_none=True)
-                                )
-                            except Exception:
-                                break
-
-                async with anyio.create_task_group() as tg:
-                    tg.start_soon(ws_to_server)
-                    tg.start_soon(server_to_ws)
-                    tg.start_soon(
-                        server.run,
-                        read_recv,
-                        write_send,
-                        server.create_initialization_options(),
-                    )
-
-        except Exception as e:
-            print(f"[flex-mcp] Relay disconnected ({e}), retrying in 5s", file=sys.stderr)
-            await asyncio.sleep(5)
-
-
-# ============================================================
-# Main
-# ============================================================
-
-def main():
-    import argparse
-
-    parser = argparse.ArgumentParser(description="Flex MCP server")
-    parser.add_argument("--cell", action="append", default=[],
-                        help="Cell names to load (repeatable)")
-    parser.add_argument("--no-embed", action="store_true",
-                        help="Skip loading embeddings/VectorCache")
-    parser.add_argument("--http", action="store_true",
-                        help="Run as streamable HTTP server")
-    parser.add_argument("--port", type=int, default=7134,
-                        help="HTTP port (default: 7134)")
-    args = parser.parse_args()
-
-    global _no_embed
-    _no_embed = args.no_embed
-
-    # Discover cells: --cell flags override, otherwise scan filesystem
-    if args.cell:
-        cell_names = args.cell
-    else:
-        cell_names = discover_cells()
-        print(f"[flex-mcp] Discovered {len(cell_names)} cells: {cell_names}", file=sys.stderr)
-
-    _known_cells.update(cell_names)
-
-    # Pre-warm VectorCaches (connections are ephemeral, caches persist)
-    if not _no_embed:
-        print(f"[flex-mcp] Warming VectorCaches...", file=sys.stderr)
-        warm_all(cell_names)
-    else:
-        print("[flex-mcp] Skipping embeddings", file=sys.stderr)
-
-    # Set instructions directly on the server — no private API access
-    server.instructions = build_instructions()
-
-    print(f"[flex-mcp] Ready — {len(_known_cells)} cells, {len(_vec_state)} cached", file=sys.stderr)
-
-    if args.http:
-        run_http_server(args.port)
-    else:
-        asyncio.run(_run_stdio())
-
-
-async def _background_indexer():
-    """Background task: scans for changed sessions and runs enrichment in stdio mode.
-
-    Defense-in-depth. On platforms with a daemon (systemd/launchd), this
-    finds nothing new. On platforms without a daemon (Windows, broken
-    installs), this is the only thing keeping the cell fresh.
-    """
-    if not HAS_ENGINE:
-        return
-
-    from flex.registry import resolve_cell
-
-    ENRICH_INTERVAL = 30 * 60  # 30 minutes
-    POLL_INTERVAL = 2
-
-    # Wait for cell to exist
-    cell_path = None
-    while cell_path is None:
-        try:
-            cell_path = resolve_cell("claude_code")
-        except Exception:
-            pass
-        if cell_path is None or not cell_path.exists():
-            cell_path = None
-            await asyncio.sleep(5)
-
-    print("[flex-mcp] Background indexer started", file=sys.stderr)
-
-    loop = asyncio.get_running_loop()
-    last_enrich = 0
-
-    while True:
-        try:
-            # Drain queue
-            await loop.run_in_executor(None, drain_queue, cell_path)
-
-            # Enrichment every 30 minutes
-            now = time.monotonic()
-            if now - last_enrich >= ENRICH_INTERVAL:
-                await loop.run_in_executor(None, run_enrichment, cell_path)
-                last_enrich = now
-
-            await asyncio.sleep(POLL_INTERVAL)
-        except asyncio.CancelledError:
-            break
-        except Exception as e:
-            print(f"[flex-mcp] bg indexer error: {e}", file=sys.stderr)
-            await asyncio.sleep(POLL_INTERVAL)
-
-
-async def _run_stdio():
-    """Run the server over stdio transport with background indexer."""
-    bg_task = asyncio.create_task(_background_indexer())
-    try:
-        async with stdio_server() as (read_stream, write_stream):
-            await server.run(
-                read_stream, write_stream, server.create_initialization_options()
-            )
-    finally:
-        bg_task.cancel()
-        try:
-            await bg_task
-        except asyncio.CancelledError:
-            pass
-
 
 if __name__ == "__main__":
+    from flex.serve import main
     main()
+
+
+# ============================================================
+# REMOVED: HTTP, relay, background indexer, main() moved to serve.py
+# ============================================================

@@ -38,6 +38,8 @@ _MIGRATIONS = [
     "ALTER TABLE cells ADD COLUMN id TEXT",
     "ALTER TABLE cells ADD COLUMN corpus_path TEXT",
     "ALTER TABLE cells ADD COLUMN unlisted INTEGER DEFAULT 0",
+    "ALTER TABLE cells ADD COLUMN source_url TEXT",
+    "ALTER TABLE cells ADD COLUMN checksum TEXT",
 ]
 
 
@@ -59,6 +61,24 @@ def _open_registry() -> sqlite3.Connection:
     return db
 
 
+# Dict-driven type detection: _types_* table name → cell_type.
+# First match wins. Order matters for cells with multiple _types_ tables
+# (e.g. claude_code has _types_message, _types_file_body, _types_source_warmup).
+_TYPE_TABLE_MAP = {
+    '_types_message':   'claude_code',
+    '_types_docpac':    'docpac',
+    '_types_reddit':    'reddit',
+    '_types_hn':        'hn',
+    '_types_bluesky':   'bluesky',
+    '_types_lobsters':  'lobsters',
+    '_types_devto':     'devto',
+    '_types_x':         'x',
+    '_types_arxiv':     'arxiv',
+    '_types_people':    'people',
+    '_types_skills':    'skills',
+}
+
+
 def _auto_detect(path_str: str) -> tuple[str | None, str | None]:
     """Auto-detect cell_type and description from a cell's schema/meta."""
     cell_type = None
@@ -72,18 +92,14 @@ def _auto_detect(path_str: str) -> tuple[str | None, str | None]:
             if row:
                 description = row[0]
 
-            # Type from _types_* tables
+            # Type from _types_* tables — dict-driven, first match wins
             tables = {r[0] for r in cell_db.execute(
                 "SELECT name FROM sqlite_master WHERE type='table'"
             ).fetchall()}
-            if '_types_message' in tables:
-                cell_type = 'claude-code'
-            elif '_types_docpac' in tables:
-                cell_type = 'docpac'
-            elif '_types_reddit' in tables:
-                cell_type = 'reddit'
-            elif '_types_x' in tables:
-                cell_type = 'x'
+            for table_name, detected_type in _TYPE_TABLE_MAP.items():
+                if table_name in tables:
+                    cell_type = detected_type
+                    break
     except Exception:
         pass
     return cell_type, description
@@ -95,6 +111,8 @@ def register_cell(
     cell_type: str | None = None,
     description: str | None = None,
     corpus_path: str | Path | None = None,
+    source_url: str | None = None,
+    checksum: str | None = None,
 ) -> str:
     """Register or update a cell in the registry.
 
@@ -122,16 +140,19 @@ def register_cell(
 
     db.execute("""
         INSERT INTO cells (id, name, path, corpus_path, cell_type, description,
-                           created_at, updated_at)
-        VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+                           source_url, checksum, created_at, updated_at)
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
         ON CONFLICT(name) DO UPDATE SET
             id = COALESCE(cells.id, excluded.id),
             path = excluded.path,
             corpus_path = COALESCE(excluded.corpus_path, cells.corpus_path),
             cell_type = COALESCE(excluded.cell_type, cells.cell_type),
             description = COALESCE(excluded.description, cells.description),
+            source_url = COALESCE(excluded.source_url, cells.source_url),
+            checksum = COALESCE(excluded.checksum, cells.checksum),
             updated_at = excluded.updated_at
-    """, (cell_id, name, path_str, corpus_str, cell_type, description, now, now))
+    """, (cell_id, name, path_str, corpus_str, cell_type, description,
+          source_url, checksum, now, now))
     db.commit()
     db.close()
     return cell_id
@@ -200,6 +221,7 @@ def list_cells() -> list[dict]:
         db = _open_registry()
         rows = db.execute(
             "SELECT id, name, path, corpus_path, cell_type, description, "
+            "source_url, checksum, "
             "created_at, updated_at, COALESCE(unlisted, 0) as unlisted "
             "FROM cells ORDER BY name"
         ).fetchall()

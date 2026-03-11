@@ -1,148 +1,92 @@
+<p align="center">
+  <img src="assets/banner.png" alt="flex" width="100%">
+</p>
+
 # flex
 
-Your Claude Code sessions, searchable.
+AI was trained on SQL — it doesn't need another retrieval API.
 
-You've built more than you remember. Flex compiles every session into one SQLite file — then Claude queries it directly.
+flex compiles your session history, memory and knowledge into SQLite. Your AI agent connects, discovers the schema, and starts querying. The fastest way to make your structured data searchable.
 
 ```bash
 curl -sSL https://getflex.dev/install.sh | bash
 ```
 
-<details><summary>other install methods</summary>
+## How it works
 
-```bash
-python -m flex init                       # if GNU flex shadows the binary
-```
-</details>
+Flex compiles your data into a SQLite file called a cell — chunks, embeddings, graph intelligence, full-text index. Your AI agent connects via MCP, discovers the schema, and writes SQL.
 
-One command. No API keys. No cloud. Indexes your full history on first run, then stays current automatically.
+Every query runs three phases. **SQL pre-filter** narrows what enters scoring — by date, project, message type, or any SQL expression. **Modulation** reshapes results — suppress a topic, weight by recency, diversify across subtopics. **SQL compose** joins scored results back to metadata, graph intelligence, and any table in the database.
 
----
+In one statement:
 
-## what can you ask?
-
-### weekly digest
-
-```
-"Use flex: what did we build this week?"
-```
-
-Sessions grouped by project, files that got the most edits, key decisions. A weekly digest runs about 16 queries behind the scenes.
-
-### file lineage
-
-```
-"Use flex: what's the history of worker.py?"
+```sql
+SELECT v.id, v.score, c.content
+FROM vec_ops(
+    'similar:authentication patterns
+     diverse suppress:deployment suppress:testing',
+    'SELECT id FROM chunks WHERE length(content) > 200') v
+JOIN chunks c ON v.id = c.id
+ORDER BY v.score DESC LIMIT 10
 ```
 
-Every session that touched the file — who created it, why, what changed, what it became. Tracks files across renames automatically.
+This searches for "authentication patterns," spreads results across subtopics (`diverse`), pushes deployment and testing content out of the results (`suppress:`), and only scores chunks longer than 200 characters.
 
-### decision archaeology
+## Modulation tokens
 
-```
-"Use flex: how did we create the curl install script?"
-```
+Tokens reshape how search results are scored. They compose freely.
 
-The hardest question in software: *why was it done this way?* Flex finds the session where the decision happened and reconstructs the path — which approaches were considered, which failed, and why you landed here.
-
-### semantic search
-
-```
-"Use flex: 5 things we talked about this week outside the main project"
-```
-
-Search by meaning, not keywords. Modulation tokens reshape the search per query — `diverse` spreads across subtopics, `unlike:oauth` suppresses a dominant theme, `recent:7` weights toward last week.
-
----
-
-## what happens when you install
+| token | what it does |
+|---|---|
+| `suppress:TEXT` | push a topic out of results |
+| `diverse` | spread results across subtopics instead of clustering on the strongest match |
+| `decay:N` | weight recent content — N-day half-life |
+| `centroid:id1,id2` | "more like these" — search from the average of example chunks |
+| `from:T to:T` | find content along a conceptual direction (e.g. `from:prototype to:production`) |
 
 ```
-Claude Code tool use
-       ↓
-  [hooks]  notify on every prompt and tool call
-       ↓
-  [worker]  parses, embeds, writes to cell — 2s latency
-       ↓
-  ~/.flex/cells/claude_code.db
-       ↓
-  [MCP server]  Claude writes SQL against your history
+'diverse suppress:oauth decay:7'
 ```
 
-`flex init` scans your existing sessions (~2-20 min depending on history size), downloads an 87 MB embedding model, and installs hooks + services. After that, everything is automatic. Restart Claude Code, type `/mcp` to verify.
+Three operations, one query. They compose freely.
 
----
+## Cells
 
-## presets
+Each knowledge domain gets its own SQLite file called a cell. The schema is the protocol — ATTACH any two cells and JOIN them.
 
-Claude discovers these automatically via `@orient` — you rarely need to name them directly.
+| cell | what's in it |
+|---|---|
+| [`claude_code`](flex/modules/claude_code/) | Every coding session — decisions, tool calls, file operations, agent delegations |
+| `reddit` | Community activity — posts, comments, signal scoring |
+| `arxiv` | Paper corpus with semantic retrieval over the research landscape |
+| `project-docs` | Your documentation corpus — specs, changelogs, design docs |
+| yours | anything — one compile adapter, two tables |
+
+## Presets
+
+Named queries stored in the database. The agent discovers them via `@orient`.
 
 ```
 @orient          schema, views, presets, graph topology
 @digest          multi-day activity summary
 @file            every session that touched a file, across renames
 @story           session narrative — timeline, artifacts, agents
-@sprints         work sprints detected by time gaps
 @genealogy       trace a concept's lineage across sessions
-@health          pipeline freshness, embedding coverage
 ```
 
----
+## Local-first
 
-## local-first
-
-Your entire knowledge base is one file on your machine.
+Your knowledge base is one file on your machine.
 
 ```bash
 ls ~/.flex/cells/
 claude_code.db    284M
 
-# back it up
-rsync -av ~/.flex/cells/ backup:~/
-
-# query it directly — open format
 sqlite3 claude_code.db "SELECT COUNT(*) FROM sessions"
 3337
 ```
 
-No cloud. No vendor. No rate limits.
-
----
-
-## under the hood
-
-Flex keeps embeddings you can modulate — diverse, contrastive, trajectory, temporal decay — operations on the embedding space itself. Every query runs three phases:
-
-```
-SQL pre-filter  →  Vector Operations  →  SQL compose
-```
-
-The agent writes the full query. Pre-filter narrows the corpus with SQL, vector ops scores with embeddings + modulation tokens, SQL compose joins back to views with graph intelligence.
-
----
-
-## ecosystem
-
-Each knowledge domain gets its own cell. The schema is the protocol — ATTACH any two cells and JOIN them directly.
-
-| cell | what's in it |
-|---|---|
-| `claude_code` | Every coding session — decisions, bugs, architecture choices |
-| `reddit` | Community pulse — r/ClaudeCode, r/Python, r/LocalLLaMA, and more |
-| `project-docs` | Your documentation corpus — specs, changelogs, design docs |
-| yours | anything — one compile adapter, two tables |
-
----
-
-## terminal access
-
-Query without Claude:
-
-```bash
-flex search "@digest days=3"
-flex search "@file path=src/worker.py"
-flex search "SELECT COUNT(*) FROM sessions WHERE project = 'myapp'"
-```
+No cloud. No vendor. No rate limits. Back up with `cp`. Ship with `scp`. Inspect with any SQLite client.
 
 ---
 
@@ -150,4 +94,6 @@ flex search "SELECT COUNT(*) FROM sessions WHERE project = 'myapp'"
 curl -sSL https://getflex.dev/install.sh | bash
 ```
 
-MIT · Python 3.12 · SQLite · ONNX · [getflex.dev](https://getflex.dev) · [github](https://github.com/damiandelmas/flex) · [x](https://x.com/damian_delmas)
+MIT · Python 3.12 · SQLite · numpy · ONNX · NetworkX
+
+[getflex.dev](https://getflex.dev) · [claude_code module](flex/modules/claude_code/) · [x](https://x.com/damian_delmas)
