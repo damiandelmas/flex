@@ -8,37 +8,58 @@
 [![License: MIT](https://img.shields.io/badge/License-MIT-blue.svg)](LICENSE)
 [![Python 3.12+](https://img.shields.io/badge/python-3.12+-blue.svg)](https://www.python.org/)
 
-your claude code sessions are a knowledge base — you just can't search them yet.
-
-install flex and immediately get an MCP tool for claude code to search and retrieve information from all of your conversations. index any local folder too with `flex index`.
+Vector and hybrid retrieval for structured data. Flex compiles any data source into a SQLite database with embeddings, knowledge graphs, and structured views. Installing flex registers an MCP endpoint with a single tool — the AI agent reads the schema and writes SQL against the database.
 
 ```bash
-curl -sSL https://getflex.dev/install.sh | bash
+pip install getflex
 ```
+
+## what's inside
+
+- **[flexvec](https://github.com/damiandelmas/flexvec)** — SQL vector retrieval kernel. suppress, diversify, decay, trajectory — composable operations on the score array before selection. [paper](https://arxiv.org/abs/2603.22587).
+- **MCP server** — a single read-only tool (`flex_search`). The agent discovers the schema at runtime and writes SQL.
+- **worker** — a background service that detects new data and embeds it within seconds.
+- **modules** — data source adapters. `claude_code` ships built-in.
+
+## claude code
+
+The claude_code module indexes your entire Claude Code session history — file lineage, decision archaeology, weekly digests. One install command.
+
+```bash
+curl -sSL https://getflex.dev/install.sh | bash -s -- claude-code
+```
+
+The installer scans existing sessions, embeds everything, starts a background worker, and registers the MCP server.
+
+```
+"Use flex: what's the history of worker.py?"
+"Use flex: what did we build this week?"
+"Use flex: how did we create the curl install script?"
+```
+
+→ [claude code docs](docs/claude_code/)
 
 ## how it works
 
-1. **index your data**
-
-- `flex init` for claude code sessions
-- `flex index ./docs` for local files
-
-flex builds a SQLite database with your messages, embeddings, and structured views.
-
-2. **query it**
-
-- ask your agent via MCP
-- or use CLI:
-
-```bash
-flex search --cell claude_code "@digest"
+```
+data source
+       │
+  [compile]  parse → chunks + metadata + embeddings
+       │
+       ▼
+  SQLite database
+       │
+  [manage]  knowledge graph, fingerprints, project attribution
+       │
+  [MCP server]  read-only SQL surface
+       │
+       ▼
+  AI agent writes SQL
 ```
 
-queries are just SQL or presets.
+Each database is a single `.db` file with the same schema — chunks, edges, enrichments, and views. The database describes itself; the agent discovers what's available at query time.
 
 ## local-first
-
-your entire knowledge base is one file on your machine.
 
 ```bash
 ls ~/.flex/cells/
@@ -48,7 +69,7 @@ sqlite3 claude_code.db "SELECT COUNT(*) FROM sessions"
 4547
 ```
 
-no servers to manage, no external services required. everything runs locally.
+Everything runs in-process. No external services, no cloud dependency.
 
 ---
 
@@ -56,6 +77,4 @@ no servers to manage, no external services required. everything runs locally.
 curl -sSL https://getflex.dev/install.sh | bash
 ```
 
-MIT · Python 3.12 · SQLite
-
-[getflex.dev](https://getflex.dev) · [x](https://x.com/damian_delmas)
+MIT · Python 3.12 · SQLite · [getflex.dev](https://getflex.dev) · [paper](https://arxiv.org/abs/2603.22587) · [x](https://x.com/damian_delmas)
