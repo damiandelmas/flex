@@ -1,9 +1,67 @@
 [project]
-name = "flex"
-version = "0.9.0"
-description = "SQLite knowledge engine for AI Agents"
+name = "getflex"
+version = "0.10.0"
+description = "Knowledge engine for AI agents. Compile any data source into a queryable SQLite cell with embeddings, graph intelligence, and full-text search."
 license = { text = "MIT" }
 readme = "README.md"
+requires-python = ">=3.12"
+keywords = ["vector-search", "sql", "embeddings", "ai-agents", "mcp", "sqlite", "knowledge-base", "retrieval", "semantic-search"]
+dependencies = [
+    "numpy>=2.0,<3",
+    "networkx>=3.0,<4",
+    "scikit-learn>=1.5,<2",
+    "onnxruntime>=1.17,<2",
+    "tokenizers>=0.19,<1",
+    "pyyaml>=6.0,<7",
+    "rich>=13.0,<14",
+    "tzlocal>=5.0,<6",
+    "mcp>=1.0,<2",
+    "starlette>=0.49.1,<1",
+    "uvicorn>=0.30,<1",
+]
 
-# This package is not installable via pip.
-# Install flex via: curl -sSL https://getflex.dev/install.sh | bash
+[project.optional-dependencies]
+
+[project.urls]
+Homepage = "https://getflex.dev"
+Repository = "https://github.com/damiandelmas/flex"
+Paper = "https://arxiv.org/abs/2603.22587"
+
+[project.scripts]
+flex = "flex.cli:main"
+
+[tool.setuptools.package-data]
+flex = [
+    "modules/claude_code/**/*.sql",
+    "modules/soma/**/*.sql",
+    "retrieve/presets/general/*.sql",
+    "onnx/*.json",
+    "onnx/vocab.txt",
+    "ai/agents/trace.md",
+    "ai/commands/flex/agent.md",
+    "ai/commands/flex/search.md",
+    "ai/skills/flex/**/*",
+]
+
+[tool.setuptools.exclude-package-data]
+flex = ["onnx/model.onnx", "onnx/model.onnx.data"]
+
+[tool.setuptools.packages.find]
+include = ["flex*"]
+exclude = ["flex_embed*"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+markers = [
+    "unit: In-memory SQLite, no external deps",
+    "pipeline: Needs ONNX model on disk",
+    "security: Authorizer and input validation",
+    "vec_ops: Vector operations and search",
+    "enrichment: Graph, fingerprint, delegation",
+    "sync: Unified sync pipeline",
+    "soma: SOMA identity module",
+]
+
+[build-system]
+requires = ["setuptools>=68.0"]
+build-backend = "setuptools.build_meta"

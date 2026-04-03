@@ -8,11 +8,12 @@ vec_ops registered as a function for semantic queries.
 Usage:
     python -m flex.serve                               # stdio (Claude Code)
     python -m flex.serve --http --port 7134             # streamable HTTP
-    python -m flex.serve --cell claude_code --cell qmem # multi-cell
+    python -m flex.serve --cell claude_code --cell my_data # multi-cell
 """
 
 import asyncio
 import json
+import os
 import sqlite3
 import sys
 import threading
@@ -81,10 +82,16 @@ def _search_authorizer(action, arg1, arg2, db_name, trigger_name):
 # VectorCache state — long-lived embedding matrices, independent of connections.
 # {cell_name: {'caches': {table: VectorCache}, 'config': dict, 'mtime': float}}
 _vec_state: dict = {}
-_vec_lock = threading.Lock()  # protects _vec_state writes in HTTP mode
+_vec_locks: dict[str, threading.Lock] = {}  # per-cell locks (avoids global serialization)
+_vec_locks_guard = threading.Lock()  # protects _vec_locks dict creation only
+
+# Debounce VectorCache rebuilds — daemon writes every 2s but embeddings change
+# much less often. Only rebuild if mtime is stale by more than this threshold.
+_VEC_REBUILD_DEBOUNCE_S = 60
 
 # Known cells (just names, for instructions). Populated at startup + lazily.
 _known_cells: set[str] = set()
+_explicit_cells: set[str] = set()  # cells explicitly requested via --cell
 
 
 def discover_cells() -> list[str]:
@@ -113,6 +120,11 @@ def get_cell(name: str):
     Fresh connection every call = always see latest data.
     Usage: with get_cell('claude_code') as db: ...
     """
+    # If cells were explicitly selected, reject requests for other cells
+    if _explicit_cells and name not in _explicit_cells:
+        yield None
+        return
+
     p = _db_path(name)
     if not p.exists():
         yield None
@@ -130,7 +142,10 @@ def get_cell(name: str):
             except Exception:
                 pass  # server may not be initialized yet during startup
 
-        # Check if VectorCache needs warming or refreshing
+        # Check if VectorCache needs warming or refreshing.
+        # The daemon writes to cell .db every ~2s (mtime changes), but embedding
+        # rows change much less often. Debounce: only rebuild if mtime drifted
+        # by more than _VEC_REBUILD_DEBOUNCE_S, or if no cache exists yet (warmup).
         current_mtime = p.stat().st_mtime
         state = _vec_state.get(name)
 
@@ -138,19 +153,30 @@ def get_cell(name: str):
             # Cache is fresh — just register UDF on this connection
             register_vec_udf(db, state)
         elif HAS_ENGINE and not _no_embed:
-            # Cache missing or stale — rebuild (locked for HTTP concurrency)
-            with _vec_lock:
-                # Re-check after acquiring lock (another thread may have built it)
-                state = _vec_state.get(name)
-                if state and state['mtime'] == current_mtime:
-                    register_vec_udf(db, state)
-                else:
-                    new_state = _engine_build_vec_state(name, db, current_mtime)
-                    if new_state:
-                        _vec_state[name] = new_state
-                        register_vec_udf(db, new_state)
-                        print(f"[flex-mcp]   {name}: vec_cache {'refreshed' if state else 'warmed'}"
-                              f" ({list(new_state['caches'].keys())})", file=sys.stderr)
+            # Debounce: if cache exists and mtime drift is small, reuse stale cache.
+            # Embeddings are append-only — a slightly stale cache misses new rows
+            # but doesn't return wrong results. First warmup (state is None) always runs.
+            if state and (current_mtime - state['mtime']) < _VEC_REBUILD_DEBOUNCE_S:
+                register_vec_udf(db, state)
+            else:
+                # Per-cell lock — rebuilding one cell doesn't block queries on others
+                with _vec_locks_guard:
+                    if name not in _vec_locks:
+                        _vec_locks[name] = threading.Lock()
+                    cell_lock = _vec_locks[name]
+
+                with cell_lock:
+                    # Re-check after acquiring lock (another thread may have built it)
+                    state = _vec_state.get(name)
+                    if state and (current_mtime - state['mtime']) < _VEC_REBUILD_DEBOUNCE_S:
+                        register_vec_udf(db, state)
+                    else:
+                        new_state = _engine_build_vec_state(name, db, current_mtime)
+                        if new_state:
+                            _vec_state[name] = new_state
+                            register_vec_udf(db, new_state)
+                            print(f"[flex-mcp]   {name}: vec_cache {'refreshed' if state else 'warmed'}"
+                                  f" ({list(new_state['caches'].keys())})", file=sys.stderr)
 
         yield db
     finally:
@@ -160,19 +186,26 @@ def get_cell(name: str):
 _no_embed = False
 
 
-def init(cell_names: list[str], no_embed: bool = False):
+def init(cell_names: list[str], active_names: list[str] | None = None, no_embed: bool = False):
     """Initialize the server: discover cells, warm caches, set instructions.
 
     Called by serve.py (the entrypoint) before transport starts.
+    cell_names: all discoverable cells (appear in tool enum, queryable).
+    active_names: subset to pre-warm VectorCaches at startup. Inactive cells
+                  (in cell_names but not active_names) are lazy-loaded on first query.
     """
     global _no_embed
     _no_embed = no_embed
 
+    if active_names is None:
+        active_names = cell_names  # backward compat: activate everything
+
     _known_cells.update(cell_names)
+    _explicit_cells.update(cell_names)
 
     if not no_embed:
-        print(f"[flex-mcp] Warming VectorCaches...", file=sys.stderr)
-        _warm_all(cell_names)
+        print(f"[flex-mcp] Warming {len(active_names)} of {len(cell_names)} cells...", file=sys.stderr)
+        _warm_all(active_names)
     else:
         print("[flex-mcp] Skipping embeddings", file=sys.stderr)
 
@@ -222,13 +255,17 @@ def _execute_attaches(db: sqlite3.Connection, sql: str) -> tuple[str, str | None
         return sql, None
 
     for cell_name, alias in matches:
+        if _explicit_cells and cell_name not in _explicit_cells:
+            return sql, f"Cell not allowed by --cell: '{cell_name}'. Allowed: {sorted(_explicit_cells)}"
         path = resolve_cell(cell_name)
         if path is None:
             return sql, f"Unknown cell: '{cell_name}'. Available: {sorted(_known_cells)}"
         if not path.exists():
             return sql, f"Cell path not found on disk: {path}"
         try:
-            db.execute(f"ATTACH DATABASE '{path}' AS \"{alias}\"")
+            # Parameterize path to prevent SQL injection. Alias is validated
+            # as \w+ by the regex pattern (alphanumeric only).
+            db.execute(f"ATTACH DATABASE ? AS \"{alias}\"", (str(path),))
         except sqlite3.OperationalError as e:
             return sql, f"ATTACH failed for '{cell_name}': {e}"
 
@@ -314,15 +351,27 @@ def execute_query(db: sqlite3.Connection, query: str) -> str:
 # ============================================================
 
 def build_instructions() -> str:
-    """Build server instructions. The cell describes itself via @orient."""
-    parts = [
-        "Flex indexes the USERS conversations and knowledge bases. "
+    """Build server instructions — identity only.
+
+    Query docs moved to the query parameter description to avoid
+    the 2KB server-instructions cap (v2.1.84).
+    """
+    return (
+        "Flex indexes the user's conversations and knowledge bases. "
         "Each cell is a self-describing SQLite database with chunks, embeddings, "
-        "and graph intelligence. When the USER asks to 'flex' or flex search their "
-        "conversations, memories, changes, documentation or knowledge they are "
-        "referring to this tool.",
-        "",
-        "Read-only SQL on knowledge cells.",
+        "and graph intelligence. Use when the user asks to 'flex' or search their "
+        "conversations, memories, changes, documentation, or knowledge."
+    )
+
+
+def _build_query_description() -> str:
+    """Build the query parameter description — carries ALL retrieval docs.
+
+    Moved here from server instructions to avoid the 2KB server-instructions cap
+    (v2.1.84). Parameter descriptions are uncapped.
+    """
+    parts = [
+        "SQL query, @preset name, or vec_ops expression.",
         "",
         "CELLS:",
     ]
@@ -355,132 +404,121 @@ def build_instructions() -> str:
         cell_list = ', '.join(cells)
         parts.append(f"  {view_list}:  {cell_list}")
 
-    # --- Query-writer instructions (synced with context/assets/mcp-instructions-i1.md) ---
+    # --- Query-writer instructions ---
     parts.extend([
         "",
         "# RETRIEVAL",
         "",
-        "Flex offers a single endpoint for all operations: mcp__flex__flex_search. Two parameters:",
-        "query (SQL or @preset) and cell (cell name). You compose queries using the views, columns,",
-        "and graph columns available for that cell.",
+        "Single endpoint: mcp__flex__flex_search. Two params: query (SQL or @preset), cell (cell name).",
+        "Every query must be valid SQL or a @preset. Plain text is not accepted — wrap in keyword() or vec_ops().",
         "",
-        "The retrieval pipeline for each query is SQL \u2192 vec_ops \u2192 SQL. Phase one narrows the corpus with SQL. Phase two scores it with embeddings. Phase three composes the final result with SQL.",
+        "Pipeline: SQL → vec_ops → SQL. Phase 1 narrows with SQL. Phase 2 scores with embeddings. Phase 3 composes with SQL.",
+        "",
+        "Scores are ordinal within a query. Do not compare scores across queries with different tokens.",
         "",
         "## PHASE 1: SQL PRE-FILTER",
         "",
-        "**Phase 1 narrows the candidate set before any vector operations occur.** If you know you are looking for user messages or a date, for instance, you can filter for that. Push known constraints here, not into a WHERE clause after vector operations.",
+        "The second argument to vec_ops narrows candidates **before** scoring. Push every known constraint here.",
+        "A WHERE clause after vec_ops filters **after** the pool is filled — sparse post-filters (hitting <5% of chunks) cause pool starvation",
+        "(e.g. 500 candidates scored, then WHERE drops 498). Pre-filter prevents this.",
         "",
         "```sql",
-        "SELECT id FROM messages WHERE type = 'user_prompt'",
-        "SELECT id FROM messages WHERE session_id LIKE 'abc123%'",
-        "SELECT id FROM messages WHERE tool_name = 'Edit'",
-        "SELECT id FROM messages WHERE type = 'user_prompt'",
-        "  AND session_id IN (SELECT session_id FROM sessions WHERE community_id = 29)",
+        "SELECT id FROM chunks WHERE type = 'user_prompt'",
+        "SELECT id FROM chunks WHERE session_id LIKE 'abc123%'",
+        "SELECT id FROM chunks WHERE tool_name = 'Edit'",
+        "SELECT id FROM chunks WHERE created_at >= date('now', '-7 days')",
+        "SELECT id FROM chunks WHERE type = 'user_prompt'",
         "```",
         "",
         "## PHASE 2: VECTOR OPERATIONS (vec_ops)",
         "",
-        "Phase 2 scores the candidate set from Phase 1 using embeddings. By default this is vanilla cosine similarity \u2014 however **tokens let you reshape the scoring before selection**. You can spread results across subtopics, suppress a dominant theme, weight toward recency, search from example chunks, or trace a direction through embedding space. Tokens are independent operations that compose freely and stack into one pass.",
-        "",
-        "This phase returns (id, score) pairs that Phase 3 joins, boosts, filters, and paginates.",
+        "Scores candidates using embeddings. Tokens reshape scoring before selection — spread across subtopics,",
+        "suppress a dominant theme, weight recency, search from examples, or trace a direction.",
+        "Tokens compose freely in one pass. Returns (id, score) pairs for Phase 3.",
         "",
         "`vec_ops('similar:query_text tokens', 'pre_filter_sql')`",
         "",
-        "**IMPORTANT:** vec_ops is a table source \u2014 always use after FROM or JOIN:",
+        "**IMPORTANT:** vec_ops is a table source — always after FROM or JOIN:",
         "```sql",
-        "FROM vec_ops('similar:query') v",
+        "FROM vec_ops('similar:how the authentication system evolved over time diverse decay:7') v",
         "```",
+        "",
+        "The similar: text is embedded. Bare keywords cast a wide net; natural language (5-15 words) narrows focus.",
         "",
         "### Modulation Tokens",
         "",
-        "Tokens compose freely: `'similar:auth diverse suppress:jwt decay:7'`",
+        "Tokens compose: `'similar:how we handle auth and token refresh diverse suppress:JWT rotation boilerplate decay:7'`",
         "",
         "#### diverse",
-        "",
-        "MMR \u2014 each successive result is penalized for similarity to already-selected results. Use when you want breadth across subtopics rather than 10 variations of the same answer.",
+        "MMR — penalizes similarity to already-selected results. Use for breadth across subtopics.",
         "",
         "#### suppress:TEXT",
-        "",
-        "Contrastive search. Embeds TEXT separately, demotes chunks similar to it. The dominant signal gets suppressed \u2014 what surfaces are the edges that a normal query drowns out.",
+        "Embeds TEXT, demotes chunks similar to it. Suppresses the dominant signal so edges surface.",
+        "Stack multiple: `suppress:deployment pipeline suppress:CI/CD configuration`.",
+        "Aim at the dominant cluster theme, not the whole topic.",
         "",
         "#### decay:N",
-        "",
-        "Temporal decay with N-day half-life. A chunk from N days ago scores 50% of an identical chunk from today. Omit N for gentle decay. `decay:1` is aggressive \u2014 yesterday is half-weighted.",
+        "Temporal decay. N-day half-life. `decay:7` = weekly. `decay:1` = aggressive. `decay:0` = disabled.",
         "",
         "#### centroid:id1,id2,...",
-        "",
-        "Centroid search. Computes the mean embedding of the given chunk IDs, then searches from that synthetic vantage point. Use when you found a good result and want more like it, or when 2-3 examples define a concept better than words can.",
+        "Mean embedding of given chunk IDs as query. Use when examples define a concept better than words.",
         "",
         "#### from:TEXT to:TEXT",
-        "",
-        "Trajectory \u2014 a direction vector through embedding space. Finds content along the conceptual arc from one idea to another. Not \"search for X then Y\" \u2014 it's the delta between two concepts applied as a lens.",
+        "Direction vector through embedding space. Finds content along the conceptual arc between two ideas.",
+        "Anchors should be contrasting concepts: `from:quick hacky prototype to:principled production system`.",
         "",
         "#### pool:N",
+        "Candidate pool size (default 500). Increase if post-filter WHERE is sparse: `pool:2000`.",
         "",
-        "Candidate pool size (default 500).",
+        "### Examples",
         "",
-        "### Token Examples",
-        "",
-        "Broad survey with recency bias:",
+        "Broad survey with recency:",
         "```sql",
         "SELECT v.id, v.score, c.content, c.session_id",
-        "FROM vec_ops('similar:decisions and tradeoffs diverse decay:7',",
+        "FROM vec_ops('similar:key decisions tradeoffs and design choices we made this week diverse decay:7',",
         "  'SELECT id FROM chunks WHERE type = ''user_prompt''') v",
         "JOIN chunks c ON v.id = c.id",
         "ORDER BY v.score DESC LIMIT 15",
         "```",
         "",
-        "Contrastive \u2014 suppress a dominant theme:",
+        "Suppress dominant theme to find edges:",
         "```sql",
         "SELECT v.id, v.score, c.content",
-        "FROM vec_ops('similar:architecture design diverse suppress:deployment pipeline shipping') v",
+        "FROM vec_ops('similar:what else happened beyond the main refactor this week diverse suppress:deployment pipeline suppress:CI configuration',",
+        "  'SELECT id FROM chunks WHERE created_at >= date(''now'', ''-7 days'')') v",
         "JOIN chunks c ON v.id = c.id",
         "ORDER BY v.score DESC LIMIT 10",
         "```",
         "",
-        "Trajectory \u2014 evolution from one concept to another:",
+        "Trajectory — conceptual evolution:",
         "```sql",
         "SELECT v.id, v.score, c.content",
-        "FROM vec_ops('similar:architecture design from:single file monolith to:modular cell-based system') v",
+        "FROM vec_ops('similar:how the system architecture evolved from:monolithic worker to:cell-based design') v",
         "JOIN chunks c ON v.id = c.id",
         "ORDER BY v.score DESC LIMIT 10",
         "```",
         "",
         "### Edge Cases",
         "",
-        "- `diverse` is boolean \u2014 `diverse:0.5` has no effect, just use `diverse`",
-        "- `decay:0` disables temporal decay (not 'zero days')",
-        "- `pool:0` falls back to default (500), not zero results",
-        "- Only ONE vec_ops per query \u2014 for multiple, use CTEs:",
-        "  `WITH a AS (SELECT * FROM vec_ops(...) v) SELECT * FROM a`",
-        "- Some sessions have NULL centrality/community \u2014 use COALESCE or LEFT JOIN.",
+        "- `diverse` is boolean — no parameter",
+        "- `decay:0` disables decay, `pool:0` falls back to default (500)",
+        "- One vec_ops per query — for multiple, use CTEs: `WITH a AS (SELECT * FROM vec_ops(...) v) SELECT * FROM a`",
+        "- Some sessions have NULL graph columns (centrality, community) — enrichment runs every 30 min. Use COALESCE.",
         "",
         "## PHASE 3: SQL COMPOSITION",
         "",
-        "Phase 3 takes the scored results from vec_ops and composes the final output with full SQL. This is where you join back to views, boost scores with graph metadata, group by community or project, filter on columns that only exist in the views, and paginate. Hub/bridge reranking and graph arithmetic live here.",
+        "Join scored results back to views, boost with graph metadata, group, filter, paginate.",
         "",
         "```sql",
         "SELECT v.id, v.score, c.content",
-        "FROM vec_ops('similar:authentication') v",
+        "FROM vec_ops('similar:authentication patterns and middleware design') v",
         "JOIN chunks c ON v.id = c.id",
-        "ORDER BY v.score DESC",
-        "LIMIT 10",
-        "```",
-        "",
-        "### Structure Tokens",
-        "",
-        "`communities` \u2014 per-query Louvain, adds `_community` column to candidates:",
-        "",
-        "```sql",
-        "SELECT _community, COUNT(*) as n, MIN(c.content) as sample",
-        "FROM vec_ops('similar:authentication communities') v",
-        "JOIN chunks c ON v.id = c.id",
-        "GROUP BY _community",
+        "ORDER BY v.score DESC LIMIT 10",
         "```",
         "",
         "# RECIPES",
         "",
-        "**Structural** (no embeddings):",
+        "**Structural** (no embeddings — free):",
         "```sql",
         "SELECT project, COUNT(*) as sessions",
         "FROM sessions GROUP BY project ORDER BY sessions DESC",
@@ -489,46 +527,54 @@ def build_instructions() -> str:
         "**Semantic search** (the skeleton):",
         "```sql",
         "SELECT v.id, v.score, c.content",
-        "FROM vec_ops('similar:YOUR TOPIC TOKENS', 'PRE_FILTER') v",
+        "FROM vec_ops('similar:YOUR TOPIC IN NATURAL LANGUAGE', 'PRE_FILTER') v",
         "JOIN chunks c ON v.id = c.id",
         "ORDER BY v.score DESC LIMIT 10",
         "```",
         "",
-        "Narrow the search with a pre-filter:",
+        "Pre-filter examples:",
         "- Session scope: `'SELECT id FROM chunks WHERE session_id LIKE ''abc%'''`",
-        "- Human voice only: `'SELECT id FROM chunks WHERE type = ''user_prompt'''`",
-        "- Date range: `'SELECT id FROM chunks WHERE created_at >= ''2026-02-22'''`",
-        "- By project: `'SELECT id FROM chunks WHERE session_id IN (SELECT session_id FROM sessions WHERE project = ''flexsearch'')'''`",
+        "- User messages: `'SELECT id FROM chunks WHERE type = ''user_prompt'''`",
+        "- Recent: `'SELECT id FROM chunks WHERE created_at >= date(''now'', ''-7 days'')'`",
+        "- By project: `'SELECT id FROM chunks WHERE session_id IN (SELECT session_id FROM sessions WHERE project = ''myapp'')'`",
         "- Files only: `'SELECT id FROM chunks WHERE type = ''file'''`",
         "- No filter: omit or `''`",
         "",
-        "**Exact term** (FTS5 \u2014 domain name, filename, error, UUID):",
+        "**Exact term** (FTS5 — filename, error, function name, UUID):",
         "```sql",
         "SELECT k.id, k.rank, k.snippet, c.content",
         "FROM keyword('term') k",
         "JOIN chunks c ON k.id = c.id",
         "ORDER BY k.rank DESC LIMIT 10",
-        "-- keyword() is a table source \u2014 always use after FROM or JOIN.",
-        "-- Returns (id, rank, snippet). rank is positive \u2014 higher = better.",
-        "-- Special chars (dots, operators) handled automatically via fallback quoting.",
+        "-- keyword() is a table source — always after FROM or JOIN.",
+        "-- Returns (id, rank, snippet). rank is positive — higher = better.",
         "```",
         "",
-        "**Hybrid intersection** (only chunks matching BOTH keyword and semantic):",
+        "**Scoped keyword** (pre-filter restricts which chunks BM25 ranks — prevents pool starvation):",
+        "```sql",
+        "SELECT k.id, k.rank, k.snippet, c.content",
+        "FROM keyword('authentication', 'SELECT id FROM chunks WHERE type = ''user_prompt''') k",
+        "JOIN chunks c ON k.id = c.id",
+        "ORDER BY k.rank DESC LIMIT 10",
+        "-- 2nd arg = pre-filter SQL (must start with SELECT). Same pattern as vec_ops.",
+        "-- Without pre-filter, BM25 ranks globally — scoped post-filters starve the pool.",
+        "```",
+        "",
+        "**Hybrid intersection** (BOTH keyword and semantic — empty results mean no overlap, not broken syntax):",
         "```sql",
         "SELECT k.id, k.rank, v.score, c.content",
-        "FROM keyword('auth') k",
-        "JOIN vec_ops('similar:authentication patterns') v ON k.id = v.id",
+        "FROM keyword('sdk') k",
+        "JOIN vec_ops('similar:cell creation pipeline and programmatic ingest workflow') v ON k.id = v.id",
         "JOIN chunks c ON k.id = c.id",
-        "ORDER BY k.rank + v.score DESC",
-        "LIMIT 10",
+        "ORDER BY v.score DESC LIMIT 10",
         "```",
         "",
-        "**FTS as pre-filter** (all semantic results, scoped to keyword matches):",
+        "**FTS as pre-filter** (semantic results scoped to keyword matches):",
         "```sql",
         "SELECT v.id, v.score, c.content",
-        "FROM vec_ops('similar:YOUR TOPIC',",
+        "FROM vec_ops('similar:error handling and retry patterns',",
         "  'SELECT c.id FROM chunks_fts f JOIN _raw_chunks c ON f.rowid = c.rowid",
-        "   WHERE chunks_fts MATCH ''term''') v",
+        "   WHERE chunks_fts MATCH ''timeout''') v",
         "JOIN chunks c ON v.id = c.id",
         "ORDER BY v.score DESC LIMIT 10",
         "```",
@@ -536,77 +582,63 @@ def build_instructions() -> str:
         "**Hub navigation** (most connected sessions):",
         "```sql",
         "SELECT v.id, v.score, s.title, s.centrality",
-        "FROM vec_ops('similar:YOUR TOPIC') v",
+        "FROM vec_ops('similar:the main architectural decisions and system design') v",
         "JOIN chunks c ON v.id = c.id",
         "JOIN sessions s ON c.session_id = s.session_id",
         "WHERE s.is_hub = 1",
         "ORDER BY s.centrality DESC LIMIT 5",
         "```",
         "",
-        "**File search** (find files by path, search file content):",
+        "**File search:**",
         "```sql",
-        "-- Find files by path pattern (exact — no embeddings needed)",
+        "-- By path (structural, no embeddings)",
         "SELECT file, section, ext, substr(content, 1, 200)",
         "FROM chunks WHERE type = 'file' AND file LIKE '%/changes/code/2603%'",
         "ORDER BY created_at DESC LIMIT 10",
         "```",
         "```sql",
-        "-- Semantic search within files only",
+        "-- Semantic within files",
         "SELECT v.id, v.score, c.file, c.section, substr(c.content, 1, 200)",
-        "FROM vec_ops('similar:authentication middleware', 'SELECT id FROM chunks WHERE type = ''file''') v",
+        "FROM vec_ops('similar:how authentication middleware validates tokens', 'SELECT id FROM chunks WHERE type = ''file''') v",
         "JOIN chunks c ON v.id = c.id",
         "ORDER BY v.score DESC LIMIT 10",
         "```",
-        "```sql",
-        "-- File keyword search (exact term in file bodies)",
-        "SELECT k.id, k.rank, c.file, c.section",
-        "FROM keyword('def ingest_catalog') k",
-        "JOIN chunks c ON k.id = c.id",
-        "WHERE c.type = 'file'",
-        "ORDER BY k.rank DESC LIMIT 10",
-        "```",
         "",
         "**One-liners:**",
-        "- Filter by session: `WHERE c.session_id LIKE 'd332a1a0%'`",
-        "- Filter by type: `WHERE c.type = 'file'`  or `'user_prompt'` or `'tool_call'`",
-        "- Filter by file extension: `WHERE c.ext = 'py'`",
-        "- Session drill-down: `@story session=d332a1a0`",
+        "- Session: `WHERE session_id LIKE 'd332a1a0%'`",
+        "- Type: `WHERE type = 'file'` / `'user_prompt'` / `'tool_call'`",
+        "- Extension: `WHERE ext = 'py'`",
+        "- Drill-down: `@story session=d332a1a0`",
         "",
         "# METHODOLOGY",
         "",
-        "**Choose the right mode for the task:**",
-        "- Known path/name? → `WHERE file LIKE '%pattern%'` (structural SQL, no embeddings)",
-        "- Known exact term? → `keyword('term')` (FTS5)",
-        "- Conceptual/fuzzy? → `vec_ops('similar:...')` (semantic)",
-        "- Don't reach for semantic search when structural SQL or keyword search will do.",
+        "**Right mode for the task:**",
+        "- Known path/name → `WHERE file LIKE '%pattern%'` (structural, free)",
+        "- Known exact term → `keyword('term')` (FTS5)",
+        "- Conceptual/fuzzy → `vec_ops('similar:...')` (semantic)",
         "",
-        "Start with `@orient`. Every cell describes itself \u2014 shape, schema, views, communities, hubs, presets.",
+        "Start with `@orient`. Then `PRAGMA table_info(chunks)` to discover columns — they differ per cell.",
         "",
-        "**Feel the data** before writing complex queries.",
-        "What projects exist? What date range? How many sessions?",
-        "`GROUP BY` / `COUNT(*)` / `SELECT DISTINCT` is free \u2014 no embeddings.",
+        "**Structural first.** `GROUP BY` / `COUNT(*)` / `DISTINCT` cost nothing. Get the shape before going semantic.",
         "",
-        "**Discover then narrow.**",
-        "Broad vec_ops \u2192 discover themes \u2192 pre-filter the next query with what you found.",
-        "Push known constraints (date, session, type, community) into the pre-filter, not WHERE.",
+        "**Discover then narrow.** Broad vec_ops → find themes → pre-filter next query with findings.",
+        "Push constraints into the pre-filter (2nd arg), not WHERE after vec_ops.",
         "",
-        "**Pivot when the mode shifts.**",
-        "Found a theme? Count it. Group it. Quantify.",
-        "Found an ID? Switch to exact retrieval \u2014 JOIN and ORDER BY position.",
+        "**Pivot on mode shift.** Theme → quantify with GROUP BY. ID → exact retrieval with JOIN + ORDER BY position.",
         "",
-        "**Cross-cell** when one cell isn't enough.",
-        "Cells have different temporal coverage. Check date ranges before assuming a cell has recent data.",
+        "**Cross-cell** when needed. Different cells have different columns and date ranges.",
+        "Column names vary: `created_at` (claude_code), `timestamp`, `file_date` (other cells). Always PRAGMA first.",
         "",
         "# PRESETS",
         "",
-        "Use presets when possible. Compose SQL for everything else. You may need both.",
+        "Use presets when possible. `@name` as the query. `@orient` discovers all presets per cell.",
+        "Positional args: `@story session=abc123`, `@digest days=14`.",
         "",
-        "Pass `@name` as the query parameter. Run `@orient` to discover all presets per cell.",
-        "Presets accept positional args: `@story session=abc123`, `@digest days=14`.",
+        "# EXTREMELY IMPORTANT: ALWAYS START WITH @orient FOR THE REQUESTED CELL",
         "",
-        "# EXTREMELY IMPORTANT",
+        "**`query=\"@orient\"`, `cell=\"cell_name\"`**",
         "",
-        "**ALWAYS START WITH: `query=\"@orient\"` BEFORE RUNNING ANY QUERIES. THIS GIVES YOU UP TO DATE INFORMATION ON: cell schema, views, communities, hubs, and presets.**",
+        "Returns cell schema, views, communities, hubs, presets. Do this BEFORE any other queries.",
         "",
     ])
     return "\n".join(parts)
@@ -617,23 +649,22 @@ def build_instructions() -> str:
 # ============================================================
 
 def _build_tool_description() -> str:
-    """Build tool description. Instructions carry the real context."""
+    """Build tool description — one-liner for the 2KB tool description cap."""
     return (
-        "Flex indexes the user's conversations and knowledge bases. "
-        "Each cell is a self-describing SQLite database "
-        "with chunks, embeddings, and graph intelligence."
+        "Read-only SQL on knowledge cells. Single endpoint for semantic search, "
+        "keyword search, and structural queries across all cells."
     )
 
 
 def _build_tool_schema() -> dict:
-    """Build JSON Schema — lean interface contract. Instructions do the teaching."""
+    """Build JSON Schema. The query parameter description carries ALL retrieval docs."""
     cell_list = sorted(_known_cells)
     return {
         "type": "object",
         "properties": {
             "query": {
                 "type": "string",
-                "description": "SQL query, @preset name, or vec_ops expression",
+                "description": _build_query_description(),
             },
             "cell": {
                 "type": "string",
@@ -658,11 +689,18 @@ def _build_tool_schema() -> dict:
 server = Server("flex")
 
 
+_LOG_MAX_BYTES = 50 * 1024 * 1024  # 50MB per history file
+_LOG_MAX_AGE_DAYS = 7
+
+
 def _log_query(cell: str, query: str, result_json: str, elapsed_ms: float):
-    """Append query to cell's history JSONL. Fire-and-forget."""
+    """Append query to cell's history JSONL. Fire-and-forget.
+
+    Rotation: if the file exceeds 50MB or the oldest entry is >7 days old,
+    rotate to {stem}-history.{date}.jsonl and start fresh.
+    """
     try:
         cell_path = _db_path(cell)
-        # History file sits alongside the cell .db: {uuid}-history.jsonl
         history_path = cell_path.parent / f"{cell_path.stem}-history.jsonl"
         parsed = json.loads(result_json)
         if isinstance(parsed, list):
@@ -679,7 +717,33 @@ def _log_query(cell: str, query: str, result_json: str, elapsed_ms: float):
             "elapsed_ms": round(elapsed_ms, 1),
             "result": parsed,
         }
-        with open(history_path, 'a') as f:
+
+        # Rotate if file is too large or too old
+        if history_path.exists():
+            rotate = False
+            if history_path.stat().st_size > _LOG_MAX_BYTES:
+                rotate = True
+            else:
+                # Check age of first line
+                try:
+                    with open(history_path, 'r') as f:
+                        first_line = f.readline()
+                    if first_line:
+                        first_ts = json.loads(first_line).get("timestamp", "")
+                        if first_ts:
+                            from datetime import timedelta
+                            first_dt = datetime.fromisoformat(first_ts)
+                            if datetime.now(timezone.utc) - first_dt > timedelta(days=_LOG_MAX_AGE_DAYS):
+                                rotate = True
+                except Exception:
+                    pass
+            if rotate:
+                rotated = cell_path.parent / f"{cell_path.stem}-history.{datetime.now().strftime('%Y%m%d')}.jsonl"
+                history_path.rename(rotated)
+
+        # Write with restrictive permissions
+        fd = os.open(str(history_path), os.O_WRONLY | os.O_CREAT | os.O_APPEND, 0o600)
+        with os.fdopen(fd, 'a') as f:
             f.write(json.dumps(entry, default=str) + '\n')
     except Exception:
         pass  # never break queries for logging
@@ -727,7 +791,7 @@ def _execute_cell_query(cell: str, query: str) -> str:
             if time.monotonic() > deadline:
                 return 1  # non-zero = abort
             return 0
-        db.set_progress_handler(_check_timeout, 10000)  # check every 10K opcodes
+        db.set_progress_handler(_check_timeout, 1000)  # check every 1K opcodes
 
         try:
             start = time.monotonic()
@@ -839,6 +903,8 @@ async def handle_call_tool(
         return [types.TextContent(type="text", text=json.dumps({"error": "Missing required argument: query"}))]
 
     query = arguments["query"]
+    if len(query) > 1_000_000:
+        return [types.TextContent(type="text", text=json.dumps({"error": "Query too large (max 1MB)"}))]
     cell = arguments.get("cell", "claude_code")
 
     # Merge external params dict into preset query string.
@@ -887,5 +953,5 @@ if __name__ == "__main__":
 
 
 # ============================================================
-# REMOVED: HTTP, relay, background indexer, main() moved to serve.py
+# Transport and lifecycle moved to serve.py
 # ============================================================

@@ -11,7 +11,7 @@
 Vector and hybrid retrieval for structured data. Flex compiles any data source into a SQLite database with embeddings, knowledge graphs, and structured views. Installing flex registers an MCP endpoint with a single tool — the AI agent reads the schema and writes SQL against the database.
 
 ```bash
-pip install getflex
+curl -sSL https://getflex.dev/install.sh | bash
 ```
 
 ## what's inside
@@ -37,7 +37,7 @@ The installer scans existing sessions, embeds everything, starts a background wo
 "Use flex: how did we create the curl install script?"
 ```
 
-→ [claude code docs](docs/claude_code/)
+→ [claude code docs](flex/modules/claude_code/)
 
 ## how it works
 

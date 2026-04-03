@@ -1,26 +1,20 @@
 """
 Unified flex daemon — single process for all cell lifecycle.
 
-Threads:
-  - main:           2s local cell scan (claude_code, claude_chat, docpac)
-                    + 30min enrichment cycle + 24h SOMA heal
-  - remote-poll:    60s manifest poll, re-download stale published cells
-  - remote-refresh: 30min remote-pull cell refresh (reddit, hn, skills, etc.)
-                    + optional auto-push to R2
-
 No cron needed. One systemd service does everything.
 
 Usage:
     python -m flex.daemon                   # foreground
     python -m flex.daemon --interval 5      # custom local scan interval
-    python -m flex.daemon --no-remote-poll  # disable manifest polling
-    python -m flex.daemon --no-refresh      # disable remote-pull refresh
+    python -m flex.daemon --no-background  # disable background tasks
+    python -m flex.daemon --no-refresh      # disable refresh cycle
 
 Systemd:
     ExecStart=/path/to/venv/bin/python -m flex.daemon
 """
 
 import argparse
+import os
 import sys
 import threading
 import time
@@ -28,10 +22,17 @@ import time
 
 def _load_secrets():
     """Load ~/.flex/secrets into environment (KEY=VALUE format)."""
-    import os
+    import os, stat
     from pathlib import Path
     secrets_path = Path(os.environ.get("FLEX_HOME", Path.home() / ".flex")) / "secrets"
     if secrets_path.exists():
+        # Fix permissions if world-readable (should be 600)
+        mode = secrets_path.stat().st_mode
+        if mode & (stat.S_IRGRP | stat.S_IROTH):
+            try:
+                secrets_path.chmod(0o600)
+            except OSError:
+                pass
         for line in secrets_path.read_text().splitlines():
             line = line.strip()
             if '=' in line and not line.startswith('#'):
@@ -39,104 +40,53 @@ def _load_secrets():
                 os.environ.setdefault(key.strip(), val.strip())
 
 
-def _remote_poll_loop(interval: int = 60):
-    """Poll manifest, re-download stale remote cells.
-
-    Only acts if there are installed remote cells (source_url IS NOT NULL).
-    Failures are logged but never crash the daemon.
-    """
+def _background_tick_loop(interval: int = 60):
+    """Background task loop. Hook-driven — no-op if no hook registered."""
     while True:
         try:
-            from flex.registry import list_cells, register_cell, CELLS_DIR
-            from flex.distribute.manifest import fetch_manifest, diff_manifest, download_cell
-
-            local = list_cells()
-            installed_remote = [c for c in local if c.get("source_url")]
-
-            if not installed_remote:
-                time.sleep(interval)
-                continue
-
-            remote = fetch_manifest()
-            diffs = diff_manifest(remote, installed_remote)
-
-            for name, status in diffs.items():
-                if status == "stale":
-                    entry = remote.get(name)
-                    if not entry:
-                        continue
-                    try:
-                        dest = download_cell(entry, CELLS_DIR)
-                        register_cell(
-                            name=name,
-                            path=str(dest),
-                            checksum=entry.checksum,
-                            source_url=entry.url,
-                        )
-                        print(f"[remote-poll] Updated {name}", file=sys.stderr)
-                    except Exception as e:
-                        print(f"[remote-poll] Failed {name}: {e}", file=sys.stderr)
-
+            from flex.registry import get_hook
+            _poll = get_hook("daemon_tick")
+            if _poll:
+                _poll()
         except Exception as e:
-            print(f"[remote-poll] Error: {e}", file=sys.stderr)
-
+            print(f"[background] Error: {e}", file=sys.stderr)
         time.sleep(interval)
 
 
-def _remote_refresh_loop(interval: int = 1800):
-    """Refresh remote-pull cells (reddit, hn, skills, etc.) on a timer.
+def _refresh_loop(interval: int = 60):
+    """Refresh cells on a timer. Reads the registry, runs what's due.
 
-    Replaces the cron-based flex.refresh invocation.
-    Runs all discovered remote-pull cells, then optionally pushes to R2.
+    Ticks every `interval` seconds (default 60). Each tick calls
+    run_due_refreshes() which checks per-cell intervals and only
+    runs cells that are actually due.
     """
     # Wait 30s on startup to let the local scan get ahead
     time.sleep(30)
 
     while True:
         try:
-            from flex.refresh import discover_cells, refresh_cell, _should_push
+            from flex.refresh import run_due_refreshes
 
-            cell_names = discover_cells()
-            if not cell_names:
-                time.sleep(interval)
-                continue
+            results = run_due_refreshes()
 
-            print(f"[refresh] Starting refresh for {len(cell_names)} cells: "
-                  f"{', '.join(cell_names)}", file=sys.stderr)
+            if results:
+                ok = sum(1 for v in results.values() if v == 'ok')
+                errors = sum(1 for v in results.values() if v.startswith('error'))
+                print(f"[refresh] {ok} ok, {errors} errors: "
+                      f"{', '.join(results.keys())}", file=sys.stderr)
 
-            t0 = time.time()
-            any_pushed = False
-
-            for cell_name in cell_names:
-                try:
-                    stats = refresh_cell(cell_name)
-                    if stats and stats.get('pushed'):
-                        any_pushed = True
-                except Exception as e:
-                    print(f"[refresh] {cell_name} error: {e}", file=sys.stderr)
-
-            # Push updated manifest after all cells refreshed
-            if any_pushed:
-                try:
-                    from flex.distribute.manifest import fetch_manifest
-                    from flex.distribute.push import push_manifest
-                    remote = fetch_manifest()
-                    manifest_data = {}
-                    for n, entry in remote.items():
-                        manifest_data[n] = {
-                            "url": entry.url, "checksum": entry.checksum,
-                            "size": entry.size, "updated_at": entry.updated_at,
-                            "description": entry.description, "cell_type": entry.cell_type,
-                            "freshness": entry.freshness,
-                            "chunk_count": entry.chunk_count,
-                            "source_count": entry.source_count,
-                        }
-                    push_manifest(manifest_data)
-                except Exception as e:
-                    print(f"[refresh] Manifest push failed: {e}", file=sys.stderr)
-
-            elapsed = time.time() - t0
-            print(f"[refresh] Done in {elapsed:.1f}s", file=sys.stderr)
+                # Post-refresh sync hook
+                any_hooked = any(
+                    'hooked' in str(v) for v in results.values()
+                )
+                if any_hooked:
+                    from flex.registry import get_hook
+                    _sync = get_hook("post_refresh_hook")
+                    if _sync:
+                        try:
+                            _sync()
+                        except Exception as e:
+                            print(f"[refresh] Post-refresh hook failed: {e}", file=sys.stderr)
 
         except Exception as e:
             print(f"[refresh] Error: {e}", file=sys.stderr)
@@ -146,54 +96,70 @@ def _remote_refresh_loop(interval: int = 1800):
 
 def main():
     _load_secrets()
+    from flex.registry import load_plugins
+    load_plugins()
+
+    # Prevent duplicate daemon instances
+    import fcntl
+    from pathlib import Path as _Path
+    _lock_path = _Path(os.environ.get("FLEX_HOME", _Path.home() / ".flex")) / "daemon.lock"
+    _lock_path.parent.mkdir(parents=True, exist_ok=True)
+    _lock_fd = open(_lock_path, 'w')
+    try:
+        fcntl.flock(_lock_fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+    except BlockingIOError:
+        print("[flex-daemon] Another instance is already running. Exiting.", file=sys.stderr)
+        sys.exit(1)
 
     parser = argparse.ArgumentParser(description="Flex daemon — unified cell lifecycle")
     parser.add_argument("--interval", type=int, default=2,
                         help="Local cell scan interval in seconds (default: 2)")
     parser.add_argument("--remote-interval", type=int, default=60,
-                        help="Remote manifest poll interval in seconds (default: 60)")
+                        help="Remote poll interval in seconds (default: 60)")
     parser.add_argument("--refresh-interval", type=int, default=1800,
                         help="Remote-pull refresh interval in seconds (default: 1800 = 30min)")
-    parser.add_argument("--no-remote-poll", action="store_true",
-                        help="Disable background remote cell polling")
+    parser.add_argument("--no-background", action="store_true",
+                        help="Disable background tasks")
     parser.add_argument("--no-refresh", action="store_true",
-                        help="Disable background remote-pull refresh")
+                        help="Disable refresh cycle")
     args = parser.parse_args()
 
     print("[flex-daemon] Starting unified daemon", file=sys.stderr)
     print(f"  Local scan:      {args.interval}s", file=sys.stderr)
-    print(f"  Manifest poll:   {'disabled' if args.no_remote_poll else f'{args.remote_interval}s'}",
+    print(f"  Background:      {'disabled' if args.no_background else f'{args.remote_interval}s'}",
           file=sys.stderr)
-    print(f"  Remote refresh:  {'disabled' if args.no_refresh else f'{args.refresh_interval}s'}",
+    print(f"  Refresh:         {'disabled' if args.no_refresh else f'{args.refresh_interval}s'}",
           file=sys.stderr)
 
-    # Thread 1: remote manifest poll (downloaded cell freshness)
-    if not args.no_remote_poll:
+    # Thread 1: background tasks (plugin-driven)
+    if not args.no_background:
         t = threading.Thread(
-            target=_remote_poll_loop,
+            target=_background_tick_loop,
             kwargs={"interval": args.remote_interval},
             daemon=True,
         )
         t.start()
 
-    # Thread 2: remote-pull refresh (API pulls for reddit, hn, etc.)
+    # Thread 2: refresh cycle (installed modules)
     if not args.no_refresh:
         t = threading.Thread(
-            target=_remote_refresh_loop,
+            target=_refresh_loop,
             kwargs={"interval": args.refresh_interval},
             daemon=True,
         )
         t.start()
 
-    # Main thread: local cell scan (blocks)
+    # Main thread: local cell scan (blocks if module available)
     try:
         from flex.modules.claude_code.compile.worker import daemon_loop
-    except ImportError as e:
-        print(f"[flex-daemon] Import error: {e}", file=sys.stderr)
-        print("[flex-daemon] Is the flex engine installed?", file=sys.stderr)
-        sys.exit(1)
-
-    daemon_loop(interval=args.interval)
+        daemon_loop(interval=args.interval)
+    except ImportError:
+        print("[flex-daemon] claude_code module not installed — running background services only",
+              file=sys.stderr)
+        # Block main thread so daemon stays alive for background services
+        import time
+        while True:
+            time.sleep(60)
 
 
 if __name__ == "__main__":

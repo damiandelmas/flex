@@ -1,13 +1,20 @@
 #!/bin/bash
 # Flex installer — https://getflex.dev
-# Usage: curl -sSL https://getflex.dev/install.sh | bash
+#
+# Usage:
+#   curl -sSL https://getflex.dev/install.sh | bash                    # base (flex index only)
+#   curl -sSL https://getflex.dev/install.sh | bash -s -- claude-code  # + sessions, worker, MCP
 #
 # Options (via env vars or flags):
-#   FLEX_VERSION=0.5.0    pin a specific version
+#   FLEX_VERSION=0.10.0    pin a specific version
 #   --uninstall           remove flex completely
 #   --reinstall           wipe venv and reinstall from scratch
 #   --no-init             install only, skip flex init
 #   --help                show usage
+#
+# Modules:
+#   claude-code           scan sessions, start worker, register MCP
+#   (default)             base install — flex index, flex search, no module
 
 main() {
     set -eo pipefail
@@ -51,6 +58,7 @@ main() {
     DO_UNINSTALL=false
     DO_REINSTALL=false
     DO_INIT=true
+    MODULE=""
 
     for arg in "$@"; do
         case "$arg" in
@@ -58,7 +66,11 @@ main() {
             --reinstall)  DO_REINSTALL=true ;;
             --no-init)    DO_INIT=false ;;
             --help|-h)
-                echo "Usage: curl -sSL https://getflex.dev/install.sh | bash"
+                echo "Usage: curl -sSL https://getflex.dev/install.sh | bash [-s -- MODULE]"
+                echo ""
+                echo "Modules:"
+                echo "  claude-code     scan sessions, start worker, register MCP"
+                echo "  (none)          base install — flex index, flex search"
                 echo ""
                 echo "Options:"
                 echo "  --uninstall     remove flex (venv + symlink)"
@@ -66,11 +78,15 @@ main() {
                 echo "  --no-init       install only, skip flex init"
                 echo ""
                 echo "Environment:"
-                echo "  FLEX_VERSION    pin a specific version (e.g. 0.5.0)"
+                echo "  FLEX_VERSION    pin a specific version (e.g. 0.10.0)"
                 exit 0
                 ;;
-            *)
+            --*)
                 fail "Unknown option: $arg\n  Run with --help for usage."
+                ;;
+            *)
+                # Positional arg = module name
+                MODULE="$arg"
                 ;;
         esac
     done
@@ -120,6 +136,8 @@ main() {
             major=$(echo "$ver" | cut -d. -f1)
             minor=$(echo "$ver" | cut -d. -f2)
             if [ "$major" -ge 3 ] && [ "$minor" -ge 12 ]; then
+                # Candidate must have working venv + ensurepip (Debian splits these out)
+                "$candidate" -c "import venv, ensurepip" &>/dev/null 2>&1 || continue
                 echo "$candidate"
                 return 0
             fi
@@ -134,7 +152,6 @@ main() {
 
     # ── Check dependencies ───────────────────────────────────────
     need_cmd git "Mac: xcode-select --install  Linux: sudo apt install git"
-    need_cmd jq  "Mac: brew install jq  Linux: sudo apt install jq"
 
     # ── Clean prior package manager installs ─────────────────────
     "$PYTHON" -m pip uninstall -y getflex &>/dev/null || true
@@ -195,7 +212,7 @@ main() {
     fi
 
     # ── Install getflex ──────────────────────────────────────────
-    FLEX_VERSION="${FLEX_VERSION:-0.8.0}"
+    FLEX_VERSION="${FLEX_VERSION:-0.10.0}"
 
     # Skip if already on target version (unless --reinstall)
     local _cur_ver
@@ -206,24 +223,36 @@ main() {
         "${VENV_DIR}/bin/pip" cache remove getflex &>/dev/null || true
         rm -rf ~/.cache/pip/wheels/**/getflex-* 2>/dev/null || true
 
-        local _whl_url="https://github.com/damiandelmas/flex/releases/download/v${FLEX_VERSION}/getflex-${FLEX_VERSION}-py3-none-any.whl"
-        local _whl_tmp="/tmp/getflex-${FLEX_VERSION}-py3-none-any.whl"
+        local _whl_url="https://getflex.dev/releases/getflex-${FLEX_VERSION}-py3-none-any.whl"
+        local _whl_dir
+        _whl_dir=$(mktemp -d /tmp/getflex-XXXXXX)
+        trap "rm -rf '$_whl_dir'" EXIT INT TERM
+        local _whl_tmp="${_whl_dir}/getflex-${FLEX_VERSION}-py3-none-any.whl"
 
         _spin_start "install" "downloading getflex ${FLEX_VERSION}"
-        if ! curl -sSL -o "$_whl_tmp" "$_whl_url" 2>/dev/null; then
-            # Fallback to mirror
-            local _mirror="https://getflex.dev/releases/getflex-${FLEX_VERSION}-py3-none-any.whl"
-            if ! curl -sSL -o "$_whl_tmp" "$_mirror" 2>/dev/null; then
-                _spin_stop
-                fail "Failed to download getflex ${FLEX_VERSION}.\n  URL: ${_whl_url}"
-            fi
+        if ! curl -sSLf -o "$_whl_tmp" "$_whl_url" 2>/dev/null; then
+            _spin_stop
+            fail "Failed to download getflex ${FLEX_VERSION}.\n  URL: ${_whl_url}\n  Check https://getflex.dev for the latest version."
         fi
         _spin_stop
 
         # Validate download is actually a wheel (not an HTML error page)
         if ! file "$_whl_tmp" 2>/dev/null | grep -q "Zip archive"; then
             rm -f "$_whl_tmp"
-            fail "Download failed — got an invalid file instead of a wheel.\n  Your network may block GitHub releases.\n  Try: curl -L -o /tmp/getflex.whl ${_whl_url}\n       ${VENV_DIR}/bin/pip install /tmp/getflex.whl"
+            fail "Download failed — got an invalid file instead of a wheel.\n  Try: curl -L -o /tmp/getflex.whl ${_whl_url}\n       ${VENV_DIR}/bin/pip install /tmp/getflex.whl"
+        fi
+
+        # Verify SHA256 checksum (if sidecar available)
+        local _sha_url="${_whl_url}.sha256"
+        local _sha_tmp="${_whl_dir}/expected.sha256"
+        if curl -sSLf -o "$_sha_tmp" "$_sha_url" 2>/dev/null; then
+            local _expected _actual
+            _expected=$(cat "$_sha_tmp" | tr -d '[:space:]')
+            _actual=$(sha256sum "$_whl_tmp" | cut -d' ' -f1)
+            if [ "$_expected" != "$_actual" ]; then
+                rm -rf "$_whl_dir"
+                fail "Wheel checksum mismatch.\n  Expected: ${_expected}\n  Got:      ${_actual}\n  The download may have been tampered with."
+            fi
         fi
 
         _spin_start "install" "pip install getflex ${FLEX_VERSION}"
@@ -253,6 +282,9 @@ main() {
         ok "install" "getflex ${VER}"
     fi
 
+    # Module code ships in the getflex wheel — no separate download needed.
+    # The module argument is passed to `flex init --module` which handles setup.
+
     # ── Symlink to PATH ──────────────────────────────────────────
     mkdir -p "$BIN_DIR"
 
@@ -276,7 +308,7 @@ main() {
             *)      _profile="${HOME}/.profile" ;;
         esac
 
-        if [ -n "$_profile" ]; then
+        if [ -n "$_profile" ] && ! grep -qF "${BIN_DIR}" "$_profile" 2>/dev/null; then
             case "${SHELL:-}" in
                 */fish)
                     echo "fish_add_path ${BIN_DIR}" >> "$_profile"
@@ -285,8 +317,8 @@ main() {
                     echo "export PATH=\"${BIN_DIR}:\$PATH\"" >> "$_profile"
                     ;;
             esac
-            export PATH="${BIN_DIR}:$PATH"
         fi
+        export PATH="${BIN_DIR}:$PATH"
     fi
 
     # ── Run flex init ────────────────────────────────────────────
@@ -295,12 +327,19 @@ main() {
         info "  Running flex init..."
         echo ""
 
+        local _init_args=""
+        if [ -n "$MODULE" ]; then
+            _init_args="--module $MODULE"
+        fi
+
         # Reconnect /dev/tty so flex init can prompt interactively
-        # even when this script is piped via curl | bash
-        if [ ! -t 0 ] && [ -e /dev/tty ]; then
-            "${VENV_DIR}/bin/flex" init < /dev/tty
+        # even when this script is piped via curl | bash.
+        # Test that /dev/tty is actually openable (Docker containers
+        # have the file but can't open it).
+        if [ ! -t 0 ] && [ -e /dev/tty ] && echo "" > /dev/tty 2>/dev/null; then
+            "${VENV_DIR}/bin/flex" init $_init_args < /dev/tty
         else
-            "${VENV_DIR}/bin/flex" init
+            "${VENV_DIR}/bin/flex" init $_init_args
         fi
     fi
 

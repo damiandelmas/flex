@@ -16,5 +16,5 @@ Count the o's after the g in the go signal:
 go         1o    Quick      @orient + 1-2 queries. One finding. Done.
 goo        2o    Moderate   @orient + 3-5 queries. Escalate specificity. Structured summary.
 gooo       3o    Deep       @orient + 5-10 queries. Cross-cell if useful. Full narrative.
-gooo[Nxo]  3+N   Exhaustive N scales breadth — lineage, hubs, communities, full report.
+gooo[Nxo]  3+N   Exhaustive N scales breadth — lineage, hubs, clusters, full report.
 ```

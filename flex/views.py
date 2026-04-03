@@ -1,17 +1,4 @@
-"""
-Flex Views — self-describing view generation from sqlite_master.
-
-Two tiers:
-- Auto-generated raw views: mechanical LEFT JOIN, column passthrough, no renames
-- Curated views: .sql files installed into _views table, carry domain vocabulary
-
-Rules:
-- Two view levels: chunk (base=_raw_chunks) and source (base=_raw_sources)
-- _edges_source is always the bridge between chunks and sources
-- Only tables with PK on FK (chunk_id or source_id) join views (1:1 rule)
-- _types_* tables discovered alongside _edges_* and _enrich_*
-- Curated views in _views table take precedence over auto-generated
-"""
+"""Self-describing view generation from sqlite_master."""
 
 import re
 import sqlite3
@@ -47,7 +34,7 @@ def regenerate_views(db: sqlite3.Connection, views: dict = None):
     if views is None:
         views = _detect_existing_views(db)
     if not views:
-        views = {'chunks': 'chunk'}
+        views = {'chunks': 'chunk', 'sources': 'source'}
 
     # Skip views owned by _views table (curated takes precedence)
     curated = set()
