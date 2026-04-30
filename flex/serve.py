@@ -15,6 +15,7 @@ Usage:
 """
 
 import asyncio
+import os
 import signal
 import sys
 import time
@@ -32,7 +33,7 @@ async def _background_indexer():
     installs), this is the only thing keeping the cell fresh.
     """
     try:
-        from flex.engine import drain_queue, drain_local_cells, run_enrichment
+        from flex.engine import drain_primary_cell, drain_local_cells, run_enrichment
     except ImportError:
         return
 
@@ -61,7 +62,7 @@ async def _background_indexer():
 
     while True:
         try:
-            await loop.run_in_executor(None, drain_queue, cell_path)
+            await loop.run_in_executor(None, drain_primary_cell, cell_path)
 
             now = time.monotonic()
 
@@ -85,39 +86,51 @@ async def _background_indexer():
 # Stdio Transport
 # ============================================================
 
-async def _run_stdio():
-    """Run the server over stdio transport with background indexer."""
+async def _run_stdio(active_names: list[str] | None = None, no_embed: bool = False):
+    """Run the server over stdio transport."""
     from mcp.server.stdio import stdio_server
-    from flex.mcp_server import get_server
+    from flex.mcp_server import get_server, warm_cells
 
     server = get_server()
-    bg_task = asyncio.create_task(_background_indexer())
+    bg_task = None
+    warm_task = None
     try:
         async with stdio_server() as (read_stream, write_stream):
+            if active_names and not no_embed:
+                warm_task = asyncio.create_task(asyncio.to_thread(warm_cells, active_names))
+            if os.environ.get("FLEX_MCP_ENABLE_STDIO_INDEXER") == "1":
+                bg_task = asyncio.create_task(_background_indexer())
             await server.run(
                 read_stream, write_stream, server.create_initialization_options()
             )
     finally:
-        bg_task.cancel()
-        try:
-            await bg_task
-        except asyncio.CancelledError:
-            pass
+        for task in (bg_task, warm_task):
+            if task:
+                task.cancel()
+                try:
+                    await task
+                except asyncio.CancelledError:
+                    pass
 
 
 # ============================================================
 # HTTP Transport (streamable HTTP for Claude Code, claude.ai, Cursor)
 # ============================================================
 
-def run_http_server(port: int = 7134):
+def run_http_server(port: int = 7134, active_names: list[str] | None = None, no_embed: bool = False):
     from mcp.server.streamable_http_manager import StreamableHTTPSessionManager
     from starlette.applications import Starlette
     from starlette.routing import Route, Mount
     from starlette.requests import Request
     from starlette.responses import JSONResponse
+    from starlette.requests import ClientDisconnect
+    import anyio
     import uvicorn
 
-    from flex.mcp_server import get_server, discover_cells, _vec_state, _known_cells
+    from flex.mcp_server import (
+        get_server, discover_cells, get_warmup_state, warm_cells,
+        _vec_state, _known_cells,
+    )
 
     server = get_server()
 
@@ -128,17 +141,38 @@ def run_http_server(port: int = 7134):
     )
 
     async def handle_mcp(scope, receive, send):
-        await session_manager.handle_request(scope, receive, send)
+        # MCP SDK 1.26.0 raises ExceptionGroup[ClosedResourceError] when the
+        # client drops mid-request (tool timeout, /exit, window switch). The
+        # inner session TaskGroup crashes and tears down the SSE stream.
+        # Swallow these so only the single request dies, not the transport.
+        try:
+            await session_manager.handle_request(scope, receive, send)
+        except* (anyio.ClosedResourceError, ClientDisconnect) as eg:
+            print(
+                f"[flex-mcp] client gone mid-request "
+                f"({len(eg.exceptions)} inner)",
+                file=sys.stderr,
+            )
 
     async def health(request: Request) -> JSONResponse:
+        from flex.health import refresh_summary
+
         all_on_disk = discover_cells()
         # If cells were explicitly selected, only report those
         on_disk = sorted(set(all_on_disk) & _known_cells) if _known_cells != set(all_on_disk) else all_on_disk
+        refresh = refresh_summary()
+        warmup = get_warmup_state()
+        status = "degraded" if (
+            refresh.get("status") == "degraded"
+            or warmup.get("status") == "error"
+        ) else "ok"
         return JSONResponse({
-            "status": "ok",
+            "status": status,
             "cells": sorted(_known_cells),
             "on_disk": on_disk,
             "vec_cached": {k: list(v['caches'].keys()) for k, v in _vec_state.items()},
+            "warmup": warmup,
+            "refresh": refresh,
         })
 
     from contextlib import asynccontextmanager
@@ -146,6 +180,9 @@ def run_http_server(port: int = 7134):
     @asynccontextmanager
     async def lifespan(app):
         task = None
+        warm_task = None
+        if active_names and not no_embed:
+            warm_task = asyncio.create_task(asyncio.to_thread(warm_cells, active_names))
         try:
             from flex.ext import start_background
             task = asyncio.create_task(start_background())
@@ -153,8 +190,9 @@ def run_http_server(port: int = 7134):
             pass
         async with session_manager.run():
             yield
-        if task:
-            task.cancel()
+        for t in (task, warm_task):
+            if t:
+                t.cancel()
 
     from starlette.middleware.cors import CORSMiddleware
 
@@ -175,8 +213,6 @@ def run_http_server(port: int = 7134):
     # uvicorn exit 255 when SSE connections don't close cleanly.
     # This prevents systemd from logging "Failed with result 'exit-code'"
     # on every restart and keeps the MCP transport stable.
-    _shutdown_event = asyncio.Event()
-
     def _handle_sigterm(signum, frame):
         print("[flex-mcp] SIGTERM received, shutting down gracefully", file=sys.stderr)
         raise SystemExit(0)
@@ -188,9 +224,9 @@ def run_http_server(port: int = 7134):
             app,
             host="127.0.0.1",
             port=port,
-            timeout_keep_alive=300,
+            timeout_keep_alive=120,
+            timeout_graceful_shutdown=1,
             limit_concurrency=20,
-            limit_max_requests=10000,
         )
     except SystemExit as e:
         code = e.code if e.code is not None else 0
@@ -232,14 +268,14 @@ def main():
         if inactive_names:
             print(f"[flex-mcp] Inactive (lazy-load): {inactive_names}", file=sys.stderr)
 
-    init(cell_names, active_names=active_names, no_embed=args.no_embed)
+    init(cell_names, active_names=active_names, no_embed=args.no_embed, warm=False)
 
     print(f"[flex-mcp] Ready", file=sys.stderr)
 
     if args.http:
-        run_http_server(args.port)
+        run_http_server(args.port, active_names=active_names, no_embed=args.no_embed)
     else:
-        asyncio.run(_run_stdio())
+        asyncio.run(_run_stdio(active_names=active_names, no_embed=args.no_embed))
 
 
 if __name__ == "__main__":

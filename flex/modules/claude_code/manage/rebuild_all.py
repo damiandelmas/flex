@@ -241,6 +241,12 @@ _LABEL_STOPWORDS = {
     'column', 'columns', 'cell', 'cells', 'agent', 'agents',
     'claude', 'data', 'code', 'file', 'files', 'table', 'tables',
     'result', 'results', 'model', 'value', 'index', 'build',
+    'home', 'path', 'paths', 'project', 'projects', 'directory',
+    'workspace', 'repo', 'repository', 'context',
+    'wall', 'time', 'seconds', 'second', 'output', 'outputs',
+    'token', 'tokens', 'original', 'process', 'exited', 'running',
+    'elapsed', 'stdout', 'stderr', 'command', 'commands', 'venv',
+    'window', 'fixed', 'prompt', 'prompts',
 
     # SQL / Python keywords
     'null', 'true', 'false', 'none', 'self', 'return', 'print',
@@ -318,19 +324,53 @@ def rebuild_community_labels(db):
 
     dominant_project = {}
     for community_id, project, _ in project_rows:
+        if not any(ch.isalpha() for ch in project):
+            continue
         if community_id not in dominant_project:
             dominant_project[community_id] = project
 
-    # Top 5 hub fingerprints per community for keyword extraction
-    fp_rows = db.execute("""
-        SELECT g.community_id, ess.fingerprint_index
-        FROM _enrich_source_graph g
-        JOIN _enrich_session_summary ess ON g.source_id = ess.source_id
-        WHERE g.community_id IS NOT NULL
-          AND g.is_hub = 1
-          AND ess.fingerprint_index IS NOT NULL
-        ORDER BY g.community_id, g.centrality DESC
-    """).fetchall()
+    has_key_chunks = db.execute("""
+        SELECT 1 FROM sqlite_master
+        WHERE type = 'view' AND name = 'agent_key_chunks'
+    """).fetchone() is not None
+
+    if has_key_chunks:
+        # Prefer agent intent labels over fingerprint excerpts. Fingerprints are
+        # navigation aids; key chunks/titles are better community naming input.
+        fp_rows = db.execute("""
+            WITH ranked_key AS (
+                SELECT
+                    session_id,
+                    content,
+                    ROW_NUMBER() OVER (
+                        PARTITION BY session_id
+                        ORDER BY key_weight DESC, position ASC
+                    ) AS rn
+                FROM agent_key_chunks
+                WHERE length(trim(content)) > 20
+            )
+            SELECT g.community_id,
+                   COALESCE(k.content, rs.title, ess.fingerprint_index) AS label_text
+            FROM _enrich_source_graph g
+            JOIN _raw_sources rs ON g.source_id = rs.source_id
+            LEFT JOIN ranked_key k ON k.session_id = g.source_id AND k.rn = 1
+            LEFT JOIN _enrich_session_summary ess ON g.source_id = ess.source_id
+            WHERE g.community_id IS NOT NULL
+              AND g.is_hub = 1
+              AND COALESCE(k.content, rs.title, ess.fingerprint_index) IS NOT NULL
+            ORDER BY g.community_id, g.centrality DESC
+        """).fetchall()
+    else:
+        # Top 5 hub fingerprints per community for keyword extraction.
+        fp_rows = db.execute("""
+            SELECT g.community_id, ess.fingerprint_index
+            FROM _enrich_source_graph g
+            JOIN _enrich_session_summary ess ON g.source_id = ess.source_id
+            WHERE g.community_id IS NOT NULL
+              AND g.is_hub = 1
+              AND ess.fingerprint_index IS NOT NULL
+            ORDER BY g.community_id, g.centrality DESC
+        """).fetchall()
 
     community_texts = defaultdict(list)
     for community_id, fingerprint in fp_rows:

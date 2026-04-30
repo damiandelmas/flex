@@ -36,8 +36,20 @@ def get_hook(name: str):
 
 _plugins_loaded = False
 
+# H4 — plugin module names must match ^flex(\.[a-zA-Z0-9_]+)+$.
+# Each segment must be a valid Python identifier, preventing consecutive
+# dots and arbitrary code execution via a poisoned plugins.txt.
+import re as _re
+_PLUGIN_NAME_RE = _re.compile(r'^flex(\.[a-zA-Z0-9_]+)+$')
+
+
 def load_plugins():
-    """Load optional plugins listed in ~/.flex/plugins.txt (one module per line)."""
+    """Load optional plugins listed in ~/.flex/plugins.txt (one module per line).
+
+    Each line must be a ``flex.*`` importable module — anything else is
+    rejected with a stderr warning and skipped. Comments (``#``) and blank
+    lines are allowed.
+    """
     global _plugins_loaded
     if _plugins_loaded:
         return
@@ -49,6 +61,10 @@ def load_plugins():
     for line in plugins_file.read_text().splitlines():
         line = line.strip()
         if not line or line.startswith("#"):
+            continue
+        if '..' in line or not _PLUGIN_NAME_RE.match(line):
+            import sys as _sys
+            print(f"[plugins] Invalid module name: {line!r} (must match flex.*)", file=_sys.stderr)
             continue
         try:
             importlib.import_module(line)
@@ -128,11 +144,41 @@ def _open_registry() -> sqlite3.Connection:
     return db
 
 
-# Dict-driven type detection: _types_* table name → cell_type.
-# First match wins. Order matters for cells with multiple _types_ tables
-# (e.g. claude_code has _types_message, _types_file_body, _types_source_warmup).
+def _open_registry_readonly() -> sqlite3.Connection:
+    """Open registry.db for reads without requiring directory write access.
+
+    MCP clients can run under a filesystem sandbox where ``~/.flex`` is
+    readable but not writable. A normal sqlite open still tries to create
+    lock/journal side files, so read-only discovery must fall back to an
+    immutable URI instead of reporting an empty registry.
+    """
+    try:
+        db = sqlite3.connect(f"file:{REGISTRY_DB}?mode=ro", uri=True, timeout=5)
+        db.execute("PRAGMA schema_version").fetchone()
+    except sqlite3.OperationalError:
+        try:
+            db.close()
+        except Exception:
+            pass
+        db = sqlite3.connect(
+            f"file:{REGISTRY_DB}?mode=ro&immutable=1",
+            uri=True,
+            timeout=5,
+        )
+        db.execute("PRAGMA schema_version").fetchone()
+    db.row_factory = sqlite3.Row
+    return db
+
+
+# Dict-driven legacy type detection: _types_* table name → cell_type.
+# First match wins. Order matters for shared-substrate cells with multiple
+# _types_ tables (e.g. claude_code has _types_message, _types_file_body,
+# _types_source_warmup). New cells should write _meta.cell_type instead of
+# extending this map.
 _TYPE_TABLE_MAP = {
+    '_types_codex_turn': 'codex',
     '_types_message':   'claude_code',
+    '_types_markdown':  'markdown',
 }
 
 try:
@@ -142,27 +188,55 @@ except ImportError:
     pass
 
 
+_TYPE_TABLE_RE = _re.compile(r'^_types_([a-zA-Z0-9_]+)$')
+
+
+def _meta_value(cell_db: sqlite3.Connection, key: str) -> str | None:
+    row = cell_db.execute(
+        "SELECT value FROM _meta WHERE key = ?", (key,)
+    ).fetchone()
+    return str(row[0]) if row and row[0] is not None else None
+
+
+def _generic_type_from_tables(tables: set[str]) -> str | None:
+    """Infer a cell type only when exactly one unknown _types_* table exists."""
+    unknown_types = []
+    for table_name in sorted(tables):
+        if table_name in _TYPE_TABLE_MAP:
+            continue
+        match = _TYPE_TABLE_RE.match(table_name)
+        if match:
+            unknown_types.append(match.group(1))
+    return unknown_types[0] if len(unknown_types) == 1 else None
+
+
 def _auto_detect(path_str: str) -> tuple[str | None, str | None]:
-    """Auto-detect cell_type and description from a cell's schema/meta."""
+    """Auto-detect cell_type and description from a cell's schema/meta.
+
+    Metadata is the primary extension mechanism. Table sniffing remains only
+    for legacy cells and simple ad-hoc cells that have one obvious _types_ table.
+    """
     cell_type = None
     description = None
     try:
         with sqlite3.connect(path_str, timeout=5) as cell_db:
-            # Description from _meta
-            row = cell_db.execute(
-                "SELECT value FROM _meta WHERE key = 'description'"
-            ).fetchone()
-            if row:
-                description = row[0]
-
-            # Type from _types_* tables — dict-driven, first match wins
             tables = {r[0] for r in cell_db.execute(
                 "SELECT name FROM sqlite_master WHERE type='table'"
             ).fetchall()}
+
+            # Metadata first. This lets new cells become live/queryable without
+            # registry.py edits for every new module or runtime.
+            if "_meta" in tables:
+                description = _meta_value(cell_db, "description")
+                cell_type = _meta_value(cell_db, "cell_type")
+
+            # Legacy/shared-substrate fallback — explicit map first.
             for table_name, detected_type in _TYPE_TABLE_MAP.items():
-                if table_name in tables:
+                if cell_type is None and table_name in tables:
                     cell_type = detected_type
                     break
+            if cell_type is None:
+                cell_type = _generic_type_from_tables(tables)
     except Exception:
         pass
     return cell_type, description
@@ -234,7 +308,11 @@ def register_cell(
             source_url = COALESCE(excluded.source_url, cells.source_url),
             checksum = COALESCE(excluded.checksum, cells.checksum),
             lifecycle = COALESCE(excluded.lifecycle, cells.lifecycle),
-            refresh_interval = COALESCE(excluded.refresh_interval, cells.refresh_interval),
+            refresh_interval = CASE
+                WHEN excluded.lifecycle IS NOT NULL AND excluded.lifecycle != 'refresh'
+                    THEN excluded.refresh_interval
+                ELSE COALESCE(excluded.refresh_interval, cells.refresh_interval)
+            END,
             refresh_script = COALESCE(excluded.refresh_script, cells.refresh_script),
             refresh_module = COALESCE(excluded.refresh_module, cells.refresh_module),
             watch_path = COALESCE(excluded.watch_path, cells.watch_path),
@@ -282,7 +360,7 @@ def resolve_cell(name: str) -> Optional[Path]:
     """
     # 1. Try registry
     try:
-        db = _open_registry()
+        db = _open_registry_readonly()
         row = db.execute(
             "SELECT path FROM cells WHERE name = ?", (name,)
         ).fetchone()
@@ -305,7 +383,7 @@ def resolve_cell_for_path(file_path: str | Path) -> tuple[str, Path] | None:
     """
     file_str = str(Path(file_path).resolve())
     try:
-        db = _open_registry()
+        db = _open_registry_readonly()
         row = db.execute("""
             SELECT name, path FROM cells
             WHERE corpus_path IS NOT NULL AND ? LIKE corpus_path || '%'
@@ -325,7 +403,7 @@ def resolve_cell_for_path(file_path: str | Path) -> tuple[str, Path] | None:
 def list_cells() -> list[dict]:
     """List all registered cells with metadata."""
     try:
-        db = _open_registry()
+        db = _open_registry_readonly()
         rows = db.execute(
             "SELECT id, name, path, corpus_path, cell_type, description, "
             "source_url, checksum, "
@@ -396,6 +474,100 @@ def set_active(name: str, active: bool) -> bool:
     return updated
 
 
+def _parse_registry_ts(value: object) -> datetime | None:
+    """Parse registry ISO timestamps, tolerating trailing Z."""
+    if not value:
+        return None
+    try:
+        text = str(value)
+        if text.endswith("Z"):
+            text = text[:-1] + "+00:00"
+        dt = datetime.fromisoformat(text)
+        if dt.tzinfo is None:
+            dt = dt.replace(tzinfo=timezone.utc)
+        return dt
+    except (TypeError, ValueError):
+        return None
+
+
+def classify_refresh_state(cell: dict, now: datetime | None = None) -> dict:
+    """Return derived lifecycle status for a registry cell.
+
+    Registry fields store only the last transition. This helper turns those
+    raw fields into operational state for status displays and refresh policy:
+    due, running age, and stale-running detection.
+    """
+    now = now or datetime.now(timezone.utc)
+    if now.tzinfo is None:
+        now = now.replace(tzinfo=timezone.utc)
+
+    lifecycle = cell.get('lifecycle') or 'static'
+    status = cell.get('refresh_status')
+    interval = cell.get('refresh_interval') or 0
+    try:
+        interval_s = int(interval or 0)
+    except (TypeError, ValueError):
+        interval_s = 0
+
+    last_dt = _parse_registry_ts(cell.get('last_refresh_at'))
+    age_s = None
+    if last_dt:
+        age_s = max(0, int((now - last_dt).total_seconds()))
+
+    # Give a running refresh at least 10 minutes, and otherwise two full
+    # intervals, before declaring the registry state stale.
+    stale_after_s = max(interval_s * 2, 600) if interval_s else 600
+    is_running = status == 'running'
+    is_error = (status or '').startswith('error')
+    stale_running = bool(is_running and age_s is not None and age_s > stale_after_s)
+
+    due = False
+    if lifecycle == 'refresh':
+        if stale_running:
+            due = True
+        elif is_running:
+            due = False
+        elif not last_dt:
+            due = True
+        elif interval_s:
+            due = age_s is not None and age_s >= interval_s
+
+    overdue = bool(
+        lifecycle == 'refresh'
+        and due
+        and last_dt is not None
+        and not is_running
+        and not is_error
+    )
+    never_run = bool(
+        lifecycle == 'refresh'
+        and due
+        and last_dt is None
+        and not is_running
+        and not is_error
+    )
+
+    if stale_running:
+        effective_status = 'stale-running'
+    elif overdue:
+        effective_status = 'overdue'
+    elif never_run:
+        effective_status = 'never-run'
+    else:
+        effective_status = status or 'idle'
+
+    return {
+        'effective_refresh_status': effective_status,
+        'refresh_due': due,
+        'refresh_stale': stale_running,
+        'refresh_overdue': overdue,
+        'refresh_never_run': never_run,
+        'refresh_age_s': age_s,
+        'refresh_stale_after_s': stale_after_s if is_running else None,
+        'refresh_running_for_s': age_s if is_running else None,
+    }
+
+
 def discover_refreshable() -> list[dict]:
     """Discover cells that need periodic refresh.
 
@@ -406,12 +578,16 @@ def discover_refreshable() -> list[dict]:
     try:
         db = _open_registry()
         rows = db.execute("""
-            SELECT name, path, refresh_script, refresh_module, refresh_interval,
-                   last_refresh_at
+            SELECT name, path, lifecycle, refresh_script, refresh_module,
+                   refresh_interval, last_refresh_at, refresh_status,
+                   COALESCE(unlisted, 0) as unlisted,
+                   COALESCE(active, 1) as active
             FROM cells
             WHERE lifecycle = 'refresh'
               AND refresh_interval IS NOT NULL
               AND (refresh_script IS NOT NULL OR refresh_module IS NOT NULL)
+              AND COALESCE(active, 1) = 1
+              AND COALESCE(unlisted, 0) = 0
         """).fetchall()
         db.close()
         for r in rows:
@@ -433,10 +609,15 @@ def discover_watched() -> list[dict]:
     try:
         db = _open_registry()
         rows = db.execute("""
-            SELECT name, path, watch_path, watch_pattern
+            SELECT name, path, cell_type, refresh_module, refresh_script,
+                   watch_path, watch_pattern,
+                   COALESCE(unlisted, 0) as unlisted,
+                   COALESCE(active, 1) as active
             FROM cells
             WHERE lifecycle = 'watch'
               AND watch_path IS NOT NULL
+              AND COALESCE(active, 1) = 1
+              AND COALESCE(unlisted, 0) = 0
         """).fetchall()
         db.close()
         for r in rows:

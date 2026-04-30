@@ -21,6 +21,7 @@ SELECT 'view' as kind, m.name as name, GROUP_CONCAT(p.name, ', ') as columns,
     CASE m.name
         WHEN 'chunks' THEN 'UNIFIED surface — all chunks (messages + files). type: user_prompt|assistant|tool_call|file. Narrow via pre-filter: SELECT id FROM chunks WHERE type = ''file''. Default vec_ops target.'
         WHEN 'messages' THEN 'Message chunks only (no file body sub-chunks). Tool ops, identity, delegation. Use chunks view for unified search.'
+        WHEN 'agent_key_chunks' THEN 'High-signal agent timeline: prompts, plans, edits, delegation, failed tools, summaries/gaps. Best pre-filter for intent/state queries.'
         WHEN 'files' THEN 'File body sub-chunks only. file, section, ext columns. Use chunks view for unified search.'
         WHEN 'sessions' THEN 'Sources with graph intelligence, fingerprints'
         ELSE ''
@@ -46,13 +47,25 @@ ORDER BY kind, name;
 
 
 -- @query: hubs
+WITH ranked_key AS (
+    SELECT
+        session_id,
+        substr(content, 1, 160) AS key_label,
+        ROW_NUMBER() OVER (
+            PARTITION BY session_id
+            ORDER BY key_weight DESC, position ASC
+        ) AS rn
+    FROM agent_key_chunks
+    WHERE length(trim(content)) > 20
+)
 SELECT g.source_id AS session_id,
-    COALESCE(substr(ess.fingerprint_index, 1, 120), src.title) as label,
+    COALESCE(k.key_label, NULLIF(substr(src.title, 1, 160), ''), substr(ess.fingerprint_index, 1, 160)) as label,
     ROUND(g.centrality, 4) as centrality,
     substr(g.community_label, 1, instr(g.community_label || ' ·', ' ·') - 1) AS community
 FROM _enrich_source_graph g
 JOIN _raw_sources src ON g.source_id = src.source_id
 LEFT JOIN _enrich_session_summary ess ON g.source_id = ess.source_id
+LEFT JOIN ranked_key k ON k.session_id = g.source_id AND k.rn = 1
 WHERE g.is_hub = 1
 ORDER BY g.centrality DESC LIMIT 10;
 
@@ -80,33 +93,55 @@ SELECT name, description, params FROM _presets ORDER BY name;
 -- @query: coverage
 -- Identity edges are PARTIAL BY DESIGN. <100% is normal.
 -- Only count applicable chunks (e.g. file_uuid only applies to file tools).
+WITH file_applicable AS (
+    SELECT DISTINCT chunk_id
+    FROM _edges_tool_ops
+    WHERE tool_name IN ('Write','Edit','MultiEdit','Read','Glob','Grep')
+      AND target_file IS NOT NULL
+      AND target_file NOT LIKE '/tmp/%'
+),
+target_applicable AS (
+    SELECT DISTINCT chunk_id
+    FROM _edges_tool_ops
+    WHERE target_file IS NOT NULL
+      AND target_file NOT LIKE '/tmp/%'
+),
+mutation_applicable AS (
+    SELECT DISTINCT chunk_id
+    FROM _edges_tool_ops
+    WHERE tool_name IN ('Write','Edit','MultiEdit')
+      AND target_file IS NOT NULL
+),
+webfetch_applicable AS (
+    SELECT DISTINCT chunk_id
+    FROM _edges_tool_ops
+    WHERE tool_name = 'WebFetch'
+)
 SELECT 'file_uuid' as field,
-    ROUND(100.0 * COUNT(DISTINCT fi.chunk_id) / MAX(COUNT(DISTINCT t.chunk_id), 1), 1) || '%' as coverage,
+    ROUND(100.0 * COUNT(DISTINCT fi.chunk_id) / MAX((SELECT COUNT(*) FROM file_applicable), 1), 1) || '%' as coverage,
     'File tools only. Excludes /tmp/.' as note
-FROM _edges_tool_ops t
-LEFT JOIN _edges_file_identity fi ON t.chunk_id = fi.chunk_id
-WHERE t.tool_name IN ('Write','Edit','MultiEdit','Read','Glob','Grep')
-  AND t.target_file NOT LIKE '/tmp/%'
+FROM file_applicable a
+LEFT JOIN _edges_file_identity fi ON a.chunk_id = fi.chunk_id
 UNION ALL
 SELECT 'repo_root',
     ROUND(100.0 *
-      (SELECT COUNT(DISTINCT ri.chunk_id) FROM _edges_repo_identity ri) /
-      MAX((SELECT COUNT(DISTINCT t2.chunk_id) FROM _edges_tool_ops t2
-       WHERE t2.target_file IS NOT NULL AND t2.target_file NOT LIKE '/tmp/%'), 1), 1) || '%',
+      (SELECT COUNT(DISTINCT ri.chunk_id) FROM _edges_repo_identity ri
+       JOIN target_applicable a ON a.chunk_id = ri.chunk_id) /
+      MAX((SELECT COUNT(*) FROM target_applicable), 1), 1) || '%',
     'Files outside git repos have no repo_root.'
 UNION ALL
 SELECT 'content_hash',
     ROUND(100.0 *
-      (SELECT COUNT(DISTINCT ci.chunk_id) FROM _edges_content_identity ci) /
-      MAX((SELECT COUNT(DISTINCT t3.chunk_id) FROM _edges_tool_ops t3
-       WHERE t3.tool_name IN ('Write','Edit','MultiEdit') AND t3.target_file IS NOT NULL), 1), 1) || '%',
+      (SELECT COUNT(DISTINCT ci.chunk_id) FROM _edges_content_identity ci
+       JOIN mutation_applicable a ON a.chunk_id = ci.chunk_id) /
+      MAX((SELECT COUNT(*) FROM mutation_applicable), 1), 1) || '%',
     'Mutations only. File must exist at capture time.'
 UNION ALL
 SELECT 'url_uuid',
     ROUND(100.0 *
-      (SELECT COUNT(DISTINCT ui.chunk_id) FROM _edges_url_identity ui) /
-      MAX((SELECT COUNT(DISTINCT t4.chunk_id) FROM _edges_tool_ops t4
-       WHERE t4.tool_name = 'WebFetch'), 1), 1) || '%',
+      (SELECT COUNT(DISTINCT ui.chunk_id) FROM _edges_url_identity ui
+       JOIN webfetch_applicable a ON a.chunk_id = ui.chunk_id) /
+      MAX((SELECT COUNT(*) FROM webfetch_applicable), 1), 1) || '%',
     'WebFetch only.'
 UNION ALL
 SELECT 'parent_uuid',
@@ -120,5 +155,7 @@ SELECT 'raw_content',
     'Tool inputs/outputs. JOIN via _edges_raw_content.';
 
 -- @query: sample
-SELECT substr(content, 1, 150) as preview FROM _raw_chunks
-WHERE length(content) > 100 ORDER BY RANDOM() LIMIT 3;
+SELECT key_reason, substr(content, 1, 180) as preview
+FROM agent_key_chunks
+WHERE length(content) > 100
+ORDER BY RANDOM() LIMIT 3;

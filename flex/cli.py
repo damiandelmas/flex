@@ -14,6 +14,7 @@ import shutil
 import subprocess
 import sys
 import time
+from datetime import datetime, timezone
 from pathlib import Path
 
 FLEX_HOME = Path(os.environ.get("FLEX_HOME", Path.home() / ".flex"))
@@ -21,6 +22,12 @@ CLAUDE_DIR = Path.home() / ".claude"
 CLAUDE_JSON = Path.home() / ".claude.json"
 SYSTEMD_DIR = Path.home() / ".config" / "systemd" / "user"
 LAUNCHD_DIR = Path.home() / "Library" / "LaunchAgents"
+WORKER_DAEMON_ARGS = ["-m", "flex.daemon", "--no-refresh", "--no-background"]
+REFRESH_DAEMON_ARGS = ["-m", "flex.refresh"]
+
+
+def _python_command(args: list[str]) -> str:
+    return " ".join([sys.executable, *args])
 
 
 def _safe_write(path: Path, content: str):
@@ -33,25 +40,103 @@ def _safe_write(path: Path, content: str):
 # Package data locations (relative to this file)
 PKG_ROOT = Path(__file__).parent
 
+
+def _discover_install_modules() -> dict[str, dict]:
+    """Discover packaged and user-installed flex modules.
+
+    Packaged modules live under flex/modules. User modules live under
+    ~/.flex/modules or any directory listed in FLEX_MODULE_PATH.
+    """
+    from flex.modules.specs import discover_install_modules
+    return discover_install_modules()
+
+
+def _git_value(args: list[str], cwd: Path) -> str | None:
+    try:
+        result = subprocess.run(
+            ["git", *args],
+            cwd=cwd,
+            capture_output=True,
+            text=True,
+            timeout=5,
+        )
+    except Exception:
+        return None
+    if result.returncode != 0:
+        return None
+    value = result.stdout.strip()
+    return value or None
+
+
+def _git_tags_at_head(src: Path) -> list[str]:
+    tags = _git_value(["tag", "--points-at", "HEAD"], src)
+    if not tags:
+        return []
+    return [tag for tag in tags.splitlines() if tag]
+
+
+def _module_tag_for_name(tags: list[str], name: str) -> str | None:
+    normalized = name.replace("_", "-").lower()
+    matches = [
+        tag for tag in tags
+        if tag.lower() == normalized or tag.lower().startswith(f"{normalized}-")
+    ]
+    return matches[0] if len(matches) == 1 else None
+
+
+def _module_provenance(src: Path, dest: Path, name: str, mode: str) -> dict:
+    """Build install provenance for a copied or editable external module."""
+    repo_root = _git_value(["rev-parse", "--show-toplevel"], src)
+    git_head = _git_value(["rev-parse", "HEAD"], src)
+    git_tags = _git_tags_at_head(src)
+    git_ref = _module_tag_for_name(git_tags, name)
+    git_dirty = None
+    source_subdir = None
+    if repo_root:
+        try:
+            source_subdir = str(src.resolve().relative_to(Path(repo_root).resolve()))
+        except ValueError:
+            source_subdir = None
+        dirty = _git_value(["status", "--short"], src)
+        git_dirty = bool(dirty)
+    return {
+        "schema": "flex.module.install.v1",
+        "name": name,
+        "install_mode": mode,
+        "source_path": str(src),
+        "source_subdir": source_subdir,
+        "installed_path": str(dest),
+        "installed_at": datetime.now(timezone.utc).isoformat(),
+        "git_repo": repo_root,
+        "git_head": git_head,
+        "git_ref": git_ref,
+        "git_tags": git_tags,
+        "git_dirty": git_dirty,
+    }
+
+
+def _write_module_provenance(dest: Path, provenance: dict) -> None:
+    meta_path = dest / ".flex-module.json"
+    meta_path.write_text(json.dumps(provenance, indent=2, sort_keys=True) + "\n")
+    try:
+        os.chmod(meta_path, 0o600)
+    except OSError:
+        pass
+
+
 # ============================================================
 # flex init
 # ============================================================
 
 
 def _install_claude_assets():
-    """Copy agents, commands, and skills from package ai/ dir to ~/.claude/."""
+    """Copy public Flex skill assets from package ai/ dir to ~/.claude/."""
     _INSTALL_FILES = {
-        "agents/trace.md",
-        "commands/flex/agent.md",
-        "commands/flex/search.md",
-        "skills/flex/",                 # session history search skill
+        "skills/flex/",
     }
 
     # Subordinate: what we actually want to install right now
     _INSTALL_ASSETS = [
-        "agents/trace.md",
-        "commands/flex/agent.md",
-        "commands/flex/search.md",
         "skills/flex/",
     ]
 
@@ -115,15 +200,17 @@ def _install_systemd():
 
     SYSTEMD_DIR.mkdir(parents=True, exist_ok=True)
     python = sys.executable
+    worker_cmd = _python_command(WORKER_DAEMON_ARGS)
+    refresh_cmd = _python_command(REFRESH_DAEMON_ARGS)
 
     _SYSTEMD_UNITS = {
         "flex-worker.service": (
             "[Unit]\n"
-            "Description=Flex Live Capture Worker\n"
+            "Description=Flex Local Capture Worker\n"
             "After=network.target\n\n"
             "[Service]\n"
             "Type=simple\n"
-            f"ExecStart={python} -m flex.daemon\n"
+            f"ExecStart={worker_cmd}\n"
             "Restart=on-failure\n"
             "RestartSec=5\n"
             "Environment=PYTHONUNBUFFERED=1\n\n"
@@ -139,9 +226,40 @@ def _install_systemd():
             f"ExecStart={python} -m flex.serve --http --port 7134\n"
             "Restart=always\n"
             "RestartSec=5\n"
-            "Environment=PYTHONUNBUFFERED=1\n\n"
+            "Environment=PYTHONUNBUFFERED=1\n"
+            # KillMode=mixed: SIGTERM to main only, then SIGKILL the whole
+            # cgroup after TimeoutStopSec. Ensures python children get
+            # reaped cleanly on restart.
+            "KillMode=mixed\n"
+            "TimeoutStopSec=10\n"
+            # Belt-and-suspenders: hunt for any stragglers left behind by
+            # an earlier _start_services_direct() invocation that escaped
+            # its caller's process group via start_new_session=True.
+            # Leading '-' tells systemd not to fail the service if pkill
+            # returns nonzero (no matches = exit 1, which is expected).
+            "ExecStopPost=-/usr/bin/pkill -f 'flex\\.mcp_server.*--port 7134'\n\n"
             "[Install]\n"
             "WantedBy=default.target\n"
+        ),
+        "flex-refresh.service": (
+            "[Unit]\n"
+            "Description=Flex Registry Refresh Runner\n"
+            "After=network.target\n\n"
+            "[Service]\n"
+            "Type=oneshot\n"
+            f"ExecStart={refresh_cmd}\n"
+            "Environment=PYTHONUNBUFFERED=1\n"
+        ),
+        "flex-refresh.timer": (
+            "[Unit]\n"
+            "Description=Flex Registry Refresh Timer\n\n"
+            "[Timer]\n"
+            "OnActiveSec=30min\n"
+            "OnUnitActiveSec=30min\n"
+            "RandomizedDelaySec=2min\n"
+            "Unit=flex-refresh.service\n\n"
+            "[Install]\n"
+            "WantedBy=timers.target\n"
         ),
     }
     for service_name, content in _SYSTEMD_UNITS.items():
@@ -149,7 +267,7 @@ def _install_systemd():
 
     for cmd, label in [
         (["systemctl", "--user", "daemon-reload"], "daemon-reload"),
-        (["systemctl", "--user", "enable", "--now", "flex-worker", "flex-mcp"], "enable services"),
+        (["systemctl", "--user", "enable", "--now", "flex-worker", "flex-mcp", "flex-refresh.timer"], "enable services"),
     ]:
         try:
             subprocess.run(cmd, check=True, capture_output=True, timeout=15)
@@ -182,6 +300,8 @@ def _install_launchd():
         <string>{python}</string>
         <string>-m</string>
         <string>flex.daemon</string>
+        <string>--no-refresh</string>
+        <string>--no-background</string>
     </array>
     <key>RunAtLoad</key>
     <true/>
@@ -228,6 +348,33 @@ def _install_launchd():
     </dict>
 </dict>
 </plist>""",
+        "dev.getflex.refresh.plist": f"""<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+    <key>Label</key>
+    <string>dev.getflex.refresh</string>
+    <key>ProgramArguments</key>
+    <array>
+        <string>{python}</string>
+        <string>-m</string>
+        <string>flex.refresh</string>
+    </array>
+    <key>StartInterval</key>
+    <integer>1800</integer>
+    <key>RunAtLoad</key>
+    <false/>
+    <key>StandardOutPath</key>
+    <string>{FLEX_HOME / "logs" / "refresh.log"}</string>
+    <key>StandardErrorPath</key>
+    <string>{FLEX_HOME / "logs" / "refresh.err"}</string>
+    <key>EnvironmentVariables</key>
+    <dict>
+        <key>PYTHONUNBUFFERED</key>
+        <string>1</string>
+    </dict>
+</dict>
+</plist>""",
     }
 
     (FLEX_HOME / "logs").mkdir(exist_ok=True)
@@ -245,10 +392,11 @@ def _install_launchd():
         if already_loaded:
             # Update plist in place, kickstart to pick up changes
             plist_path.write_text(content)
-            subprocess.run(
-                ["launchctl", "kickstart", "-k", f"user/{uid}/{label}"],
-                capture_output=True, timeout=10,
-            )
+            if label != "dev.getflex.refresh":
+                subprocess.run(
+                    ["launchctl", "kickstart", "-k", f"user/{uid}/{label}"],
+                    capture_output=True, timeout=10,
+                )
         else:
             plist_path.write_text(content)
             result = subprocess.run(
@@ -328,7 +476,7 @@ def _start_services_direct():
 
     if not _is_worker_alive():
         _start("worker",
-               [python, "-m", "flex.daemon"],
+               [python, *WORKER_DAEMON_ARGS],
                FLEX_HOME / "worker.pid", log_dir / "worker.log")
 
     if not _is_port_open(7134):
@@ -338,10 +486,25 @@ def _start_services_direct():
 
 
 def _kill_pid_services():
-    """Kill any directly-started services by PID file. Ensures clean handoff to service manager."""
+    """Stop any directly-started services and reap stragglers.
+
+    Three-step cleanup so the next startup binds cleanly:
+
+    1. SIGTERM via PID file (the happy path)
+    2. ``pkill -f`` against our known command-line patterns, covering
+       orphans adopted by init after the CLI process exited, stale PID
+       files, and children that escaped their caller's process group
+       via ``start_new_session=True``
+    3. Poll port 7134 for release before returning, so callers don't
+       race a still-closing socket
+
+    Idempotent — safe to call when nothing is running.
+    """
     if sys.platform == "win32":
         return
     import signal
+
+    # 1. PID file kill (the happy path)
     for pid_name in ["worker.pid", "mcp.pid"]:
         pid_file = FLEX_HOME / pid_name
         if pid_file.exists():
@@ -351,6 +514,32 @@ def _kill_pid_services():
             except (ValueError, OSError):
                 pass
             pid_file.unlink(missing_ok=True)
+
+    # 2. Pattern scan — catches escaped children and init-adopted orphans.
+    # Patterns are scoped to the exact invocations we start, so this never
+    # catches unrelated processes. Silent failure is fine: pkill exits 1
+    # when nothing matches, which is the normal idle case.
+    patterns = [
+        "flex\\.mcp_server.*--port 7134",
+        "flex\\.serve.*--port 7134",
+        "flex\\.daemon",
+    ]
+    for pattern in patterns:
+        try:
+            subprocess.run(
+                ["pkill", "-f", pattern],
+                capture_output=True,
+                timeout=5,
+            )
+        except (FileNotFoundError, subprocess.TimeoutExpired):
+            pass
+
+    # 3. Wait for port 7134 to actually release (up to 5s). Prevents
+    # EADDRINUSE on the next start when uvicorn is still unbinding.
+    for _ in range(10):
+        if not _is_port_open(7134):
+            return
+        time.sleep(0.5)
 
 
 def _patch_claude_json():
@@ -424,9 +613,8 @@ def _run_enrichment_quiet(conn, progress_cb=None) -> tuple[int, list[str]]:
         try:
             # Use existing conn directly to avoid a second connection fighting for
             # the write lock while conn is still open.
-            from flex.manage.install_presets import install_presets
-            from flex.manage.install_presets import GENERAL_DIR, MODULE_PRESETS, MODULE_ROOT
-            for pd in [GENERAL_DIR] + MODULE_PRESETS.get('claude-code', []):
+            from flex.manage.install_presets import install_presets, _preset_dirs_for
+            for pd in _preset_dirs_for('claude-code'):
                 if pd.exists():
                     install_presets(conn, pd)
             conn.commit()
@@ -439,8 +627,7 @@ def _run_enrichment_quiet(conn, progress_cb=None) -> tuple[int, list[str]]:
         if progress_cb:
             progress_cb("views")
         try:
-            view_dir = _find_view_dir('claude_code', 'claude-code')
-            if view_dir:
+            for view_dir in _find_view_dirs('claude_code', 'claude-code'):
                 install_views(conn, view_dir)
             regenerate_views(conn)
             conn.commit()
@@ -460,24 +647,19 @@ def _run_enrichment_quiet(conn, progress_cb=None) -> tuple[int, list[str]]:
 
 
 def cmd_init(args):
-    """Initialize flex. With --module claude-code, also indexes sessions and starts services."""
+    """Initialize flex. Dispatches to the requested module's install hook."""
     import io
     import contextlib
     from rich.console import Console
-    from rich.progress import (
-        Progress, TextColumn, BarColumn, TimeElapsedColumn, SpinnerColumn,
-    )
     from rich.panel import Panel
     from rich.text import Text
-    import sqlite3 as _sqlite3
 
     console = Console()
-    _warnings: list[str] = []  # accumulate phase failures for exit code
+    _warnings: list[str] = []
     _module = getattr(args, 'module', None)
-    _is_claude_code = _module == 'claude-code'
 
-    # Stop running worker/MCP before init to avoid DB lock contention
-    if _is_claude_code:
+    # Stop running worker/MCP before install to avoid DB lock contention
+    if _module:
         _kill_pid_services()
 
     console.print()
@@ -524,8 +706,7 @@ def cmd_init(args):
     # 2. Model
     from flex.onnx.fetch import download_model, model_ready
     _model_ok = True
-    _model_valid = model_ready()
-    if not _model_valid:
+    if not model_ready():
         console.print("  model               downloading")
         try:
             download_model()
@@ -538,14 +719,11 @@ def cmd_init(args):
     if _model_ok:
         console.print("  model               [green]ok[/green]")
 
-    # 3. Claude assets (claude-code only)
-    if _is_claude_code:
-        _install_claude_assets()
-        console.print("  capture             [green]ok[/green]")
-    console.print()
+    # Pass model state down to the module hook
+    args._model_ok = _model_ok
 
-    if not _is_claude_code:
-        # Base install done — no MCP wiring (no cell/service to serve)
+    # 3. Dispatch to module hook (or print base panel)
+    if not _module:
         console.print()
         panel_content = Text()
         panel_content.append("Flex is ready.\n\n", style="cyan")
@@ -557,275 +735,152 @@ def cmd_init(args):
         console.print()
         return
 
-    # 4. Sessions (claude-code only)
+    modules = _discover_install_modules()
+    if _module not in modules:
+        console.print(f"  [red]Unknown module: {_module}[/red]")
+        if modules:
+            console.print(f"  Available: {', '.join(sorted(modules.keys()))}")
+        else:
+            console.print("  No modules installed.")
+        console.print()
+        sys.exit(1)
+
+    entry = modules[_module]
+    mod = entry['module']
     try:
-        from flex.modules.claude_code.compile.worker import (
-            bootstrap_claude_code_cell, initial_backfill, CLAUDE_PROJECTS,
-        )
+        mod.run(args, console)
+    except Exception as e:
+        console.print(f"  [red]Install failed: {e}[/red]")
+        raise
+
+
+
+
+# ============================================================
+# flex relay
+# ============================================================
+
+def cmd_relay(args):
+    """Toggle cloud access via the getflex.dev tunnel.
+
+    Creates or removes ``~/.flex/machine_id`` and restarts services so the
+    MCP server picks up the new state. The MCP server reads this file on
+    startup and opens an outbound WebSocket to the relay Durable Object
+    when present, exposing a stable ``https://{id}.getflex.dev/sse``
+    endpoint that claude.ai and other MCP clients can connect to.
+    """
+    from rich.console import Console
+    from rich.panel import Panel
+    from rich.text import Text
+
+    console = Console()
+
+    # Dependency check — websockets is an optional extra
+    try:
+        import websockets  # noqa: F401
     except ImportError:
-        console.print("[yellow]Claude Code module not available. Skipping session setup.[/yellow]")
+        console.print("  [red]relay requires the websockets package.[/red]")
+        console.print("  Install: [bold]pip install 'getflex\\[relay]'[/bold]")
         return
 
-    jsonls = list(CLAUDE_PROJECTS.rglob("*.jsonl"))
-    _enrich_failures: list[str] = []
+    if sys.platform == "win32":
+        console.print("  [yellow]Relay not supported on Windows yet.[/yellow]")
+        console.print("  [dim]Windows uses per-session stdio MCP transport — no persistent service to tunnel.[/dim]")
+        return
 
-    # Always bootstrap cell (even if empty) so flex search works immediately
-    cell_path = bootstrap_claude_code_cell()
+    machine_id_path = FLEX_HOME / "machine_id"
+    flag_path = FLEX_HOME / "relay_enabled"
 
-    # Install enrichment stubs + views on every init (even empty cells)
-    _stub_conn = _sqlite3.connect(str(cell_path), timeout=30.0)
+    # Inline relay-state check keeps this command self-contained.
+    def _enabled() -> bool:
+        if flag_path.exists():
+            return True
+        # Migration: old installs used machine_id presence as the signal
+        if machine_id_path.exists():
+            try:
+                flag_path.touch()
+            except OSError:
+                return False
+            return True
+        return False
+
+    # --status: show current state
+    if getattr(args, 'status', False):
+        if _enabled() and machine_id_path.exists():
+            mid = machine_id_path.read_text().strip()
+            console.print(f"  Relay [green]active[/green]")
+            console.print(f"  Endpoint: https://{mid}.getflex.dev/sse")
+        else:
+            console.print("  Relay [dim]disabled[/dim]")
+        return
+
+    # --stop: drop the flag, preserve machine_id, restart services
+    # machine_id persists so the claude.ai Connector URL stays stable
+    # across toggle cycles.
+    if getattr(args, 'stop', False):
+        if not flag_path.exists():
+            console.print("  Relay already disabled")
+            return
+        flag_path.unlink()
+        _kill_pid_services()
+        _start_services_direct()
+        console.print("  Relay [green]disabled[/green]")
+        console.print("  [dim]Services restarted (localhost-only mode)[/dim]")
+        return
+
+    # Default: enable relay
+    FLEX_HOME.mkdir(parents=True, exist_ok=True)
+    if not machine_id_path.exists():
+        import uuid
+        machine_id_path.write_text(uuid.uuid4().hex[:8])
+    flag_path.touch()
+
+    mid = machine_id_path.read_text().strip()
+    url = f"https://{mid}.getflex.dev/sse"
+
+    # Restart services so MCP picks up the new machine_id and opens the WS
+    _kill_pid_services()
+    _start_services_direct()
+    time.sleep(2)  # allow WS handshake
+
+    # Health check — poll /health endpoint (up to 10s)
+    connected = False
     try:
-        _stub_conn.execute("PRAGMA journal_mode=WAL")
-        _stub_conn.execute("PRAGMA busy_timeout=30000")
-        for ddl in _ENRICHMENT_STUBS.get('claude-code', []):
-            _stub_conn.execute(ddl)
-        _stub_conn.commit()
-        try:
-            from flex.views import install_views as _siv, regenerate_views as _srv
-            from flex.manage.install_presets import install_cell as _sip
-            _svd = _find_view_dir('claude_code', 'claude-code')
-            if _svd:
-                _siv(_stub_conn, _svd)
-            _srv(_stub_conn)
-            _stub_conn.commit()
-            _sip('claude_code')
-        except Exception:
-            pass
-    finally:
-        _stub_conn.close()
-
-    if not jsonls:
-        console.print("  [dim]No Claude Code sessions found yet.[/dim]")
-        console.print("  [dim]Start using Claude Code — sessions index automatically in the background.[/dim]")
-        console.print("  [dim]Ask Claude: [bold]\"Use flex: what did we work on today?\"[/bold][/dim]")
-        console.print()
-    else:
-        console.print(f"  Indexing [bold]{len(jsonls):,}[/bold] sessions")
-        console.print()
-
-        conn = _sqlite3.connect(str(cell_path), timeout=30.0)
-        try:
-            conn.row_factory = _sqlite3.Row
-            conn.execute("PRAGMA journal_mode=WAL")
-            conn.execute("PRAGMA synchronous=NORMAL")
-            conn.execute("PRAGMA busy_timeout=30000")
-
-            # Install enrichment stubs — ensures tables exist even if enrichment fails
-            for ddl in _ENRICHMENT_STUBS.get('claude-code', []):
-                conn.execute(ddl)
-            conn.commit()
-
-            # Install views + presets early (only need stub tables to exist)
+        import urllib.request
+        deadline = time.time() + 10
+        while time.time() < deadline:
             try:
-                from flex.views import install_views as _iv, regenerate_views as _rv
-                from flex.manage.install_presets import install_cell as _install_presets_cell
-                _vd = _find_view_dir('claude_code', 'claude-code')
-                if _vd:
-                    _iv(conn, _vd)
-                _rv(conn)
-                _install_presets_cell('claude_code')
-                conn.commit()
-            except Exception as e:
-                print(f"[init] Views/presets install failed: {e}", file=sys.stderr)
-                _warnings.append(f"Views/presets: {e}")
-
-            # Seed from existing cell for resume display — show resume hint
-            _already = conn.execute("SELECT COUNT(*) FROM _raw_sources").fetchone()[0]
-            if _already > 0:
-                console.print(f"  [dim]({_already:,} already indexed, resuming)[/dim]")
-                console.print()
-            _existing_chunks = conn.execute("SELECT COUNT(*) FROM _raw_chunks").fetchone()[0]
-            _already_embedded = conn.execute(
-                "SELECT COUNT(*) FROM _raw_chunks WHERE embedding IS NOT NULL"
-            ).fetchone()[0]
-            _phase = {"sessions": _already, "chunks": _existing_chunks}
-
-            # Embedding uses flex-embed (Rust) or Python ONNX fallback.
-            # No cloud API needed.
-
-            with Progress(
-                TextColumn("  {task.description:<20}"),
-                SpinnerColumn(spinner_name="dots", style="white", finished_text="[green]✓[/green]"),
-                BarColumn(bar_width=20, complete_style="white", finished_style="green"),
-                TextColumn("{task.fields[info]}"),
-                console=console,
-                transient=False,
-            ) as progress:
-                t_read  = progress.add_task("Scanning sessions", total=len(jsonls), info="",
-                                            completed=_already)
-                t_index = progress.add_task("Building vectors",  total=None,        info="", visible=False)
-                t_graph = progress.add_task("Building graph",    total=None,        info="", visible=False)
-
-                _scan_start = [None]
-
-                def _eta_str(done, total, start):
-                    if start is None or done < 1:
-                        return "calculating..."
-                    rate = done / (time.time() - start)
-                    if rate <= 0:
-                        return "calculating..."
-                    secs = (total - done) / rate
-                    if secs < 60:
-                        return f"~{secs:.0f}s left"
-                    elif secs < 3600:
-                        return f"~{secs/60:.0f}m left"
-                    else:
-                        return f"~{secs/3600:.1f}h left"
-
-                def _progress(i, total, sessions, chunks, elapsed):
-                    if _scan_start[0] is None:
-                        _scan_start[0] = time.time()
-                    eta = _eta_str(_already + i, len(jsonls), _scan_start[0]) if i >= 5 else "calculating..."
-                    progress.update(t_read, completed=_already + i,
-                                    info=f"{_already + i:,} / {len(jsonls):,} sessions   {eta}")
-                    _phase["sessions"] = sessions
-                    _phase["chunks"]   = chunks
-
-                def _phase2(sessions, chunks, elapsed):
-                    progress.update(t_read, completed=len(jsonls),
-                                    info=f"{len(jsonls):,} sessions scanned")
-                    _phase["sessions"] = sessions
-                    _phase["chunks"]   = chunks
-
-                    progress.update(t_index, visible=True,
-                                    completed=_already_embedded, total=_existing_chunks,
-                                    info=f"{_already_embedded:,} / {_existing_chunks:,} chunks   calculating...")
-
-                _embed_start = [None]
-
-                def _embed_progress(done, total):
-                    if _embed_start[0] is None and done > 0:
-                        _embed_start[0] = time.time()
-                    abs_done  = _already_embedded + done
-                    abs_total = _already_embedded + total
-                    if _embed_start[0] and (time.time() - _embed_start[0]) >= 15:
-                        eta = _eta_str(done, total, _embed_start[0])
-                    else:
-                        eta = "calculating..."
-                    progress.update(t_index, completed=abs_done, total=abs_total,
-                                    info=f"{abs_done:,} / {abs_total:,} chunks   {eta}")
-
-                buf2 = io.StringIO()
-                with contextlib.redirect_stderr(buf2):
-                    try:
-                        stats = initial_backfill(conn, progress_cb=_progress, phase2_cb=_phase2,
-                                                 quiet_embed=True, embed_progress_cb=_embed_progress,
-                                                 skip_embed=not _model_ok)
-                    except Exception as e:
-                        console.print(f"  [yellow]Backfill error: {e}[/yellow]")
-                        _warnings.append(f"Backfill: {e}")
-                        stats = {'sessions': _phase.get('sessions', 0),
-                                 'chunks': _phase.get('chunks', 0),
-                                 'elapsed': 0, 'embed_ok': False}
-
-                if not stats.get('embed_ok', True):
-                    _warnings.append("Embedding incomplete — vec_ops disabled until re-embedded")
-                    progress.update(t_index, completed=stats['chunks'], total=stats['chunks'],
-                                    info=f"{stats['chunks']:,} chunks (embedding skipped)")
-                else:
-                    progress.update(t_index, completed=stats['chunks'], total=stats['chunks'],
-                                    info=f"{stats['chunks']:,} chunks embedded")
-
-                # Graph + enrichment (spinner, fully silent)
-                progress.update(t_graph, visible=True, info="analyzing")
-                def _graph_cb(label):
-                    progress.update(t_graph, info=label)
-                try:
-                    n_clusters, _enrich_failures = _run_enrichment_quiet(conn, progress_cb=_graph_cb)
-                except Exception as e:
-                    console.print(f"  [yellow]Enrichment error: {e}[/yellow]")
-                    _warnings.append(f"Enrichment: {e}")
-                    n_clusters, _enrich_failures = 0, []
-                cluster_info = f"{n_clusters} topic clusters found" if n_clusters else "done"
-                progress.update(t_graph, total=1, completed=1, info=cluster_info)
-
-            console.print()
-            console.print(
-                f"  [bold]{stats['sessions']:,} sessions[/bold] · "
-                f"[bold]{stats['chunks']:,} chunks[/bold]"
-                + (f" · [bold]{n_clusters}[/bold] topic clusters" if n_clusters else "")
-            )
-            if _enrich_failures:
-                for _f in _enrich_failures:
-                    _warnings.append(f"Enrichment: {_f} skipped")
-            console.print()
-            try:
-                from flex.core import log_op
-                log_op(conn, 'init_complete', 'claude_code', rows_affected=stats['chunks'])
-            except Exception as e:
-                print(f"[init] log_op: {e}", file=sys.stderr)
-
-            try:
-                from tzlocal import get_localzone
-                _tz = str(get_localzone())
+                with urllib.request.urlopen(
+                    f"https://{mid}.getflex.dev/health", timeout=3
+                ) as resp:
+                    data = json.loads(resp.read())
+                    if data.get("flex_connected", False):
+                        connected = True
+                        break
             except Exception:
-                import datetime as _dt
-                _tz = _dt.datetime.now().astimezone().tzname() or 'UTC'
-            conn.execute("INSERT OR REPLACE INTO _meta(key, value) VALUES ('timezone', ?)", [_tz])
-            conn.commit()
-        finally:
-            conn.close()
-
-    # 5. Services (skip on Windows — stdio MCP transport handles it per-session)
-    if sys.platform != "win32":
-        _install_systemd() or _install_launchd()
-        time.sleep(1)  # give service manager a moment
-        worker_ok, mcp_ok = _verify_services()
-        if not worker_ok or not mcp_ok:
-            _start_services_direct()
+                pass
             time.sleep(1)
-            worker_ok, mcp_ok = _verify_services()
-        _status = lambda ok: "[green]running[/green]" if ok else "[red]failed[/red]"
-        console.print(f"  worker             {_status(worker_ok)}")
-        console.print(f"  MCP                {_status(mcp_ok)}")
+    except Exception:
+        pass
 
-    # 6. Claude Code wiring — streamable HTTP to localhost:7134
-    _patch_claude_json()
-    console.print()
+    status_line = Text()
+    if connected:
+        status_line.append("connected", style="green")
+    else:
+        status_line.append("waiting for connection...", style="yellow")
 
-    # Final box
     panel_content = Text()
-    panel_content.append("Flex is ready.\n\n", style="cyan")
-    panel_content.append("Claude Code            ")
-    panel_content.append("MCP server installed\n", style="green")
-    panel_content.append("restart or open a new session to connect\n\n", style="dim")
-    panel_content.append("MCP Server Endpoint    ")
-    panel_content.append("http://localhost:7134/mcp\n", style="green")
-    panel_content.append("use with claude.ai, Cursor, or any MCP client", style="dim")
+    panel_content.append("Cloud access enabled\n\n", style="cyan")
+    panel_content.append(f"Endpoint    {url}\n", style="bold")
+    panel_content.append("Status      ")
+    panel_content.append_text(status_line)
+    panel_content.append("\n\n")
+    panel_content.append("Paste into claude.ai → Settings → MCP:\n", style="dim")
+    panel_content.append(f"  {url}\n", style="bold")
+    panel_content.append("\nDisable: ", style="dim")
+    panel_content.append("flex relay --stop", style="dim")
     console.print(Panel(panel_content, padding=(1, 2), highlight=False))
     console.print()
-    console.print("  Ask:", highlight=False)
-    console.print('    "Use flex: What did we accomplish today?"', highlight=False)
-    console.print('    "Use flex: What\'s the lineage of this file?"', highlight=False)
-    console.print()
-    console.print("  Agent:", highlight=False)
-    console.print('    "Use trace: What projects am I working on?"', highlight=False)
-    console.print("    [dim]Spawns a dedicated retrieval sub-agent for deeper searches.[/dim]")
-    console.print()
-    console.print("  Slash commands:", highlight=False)
-    console.print("    /flex:local — search with the current agent", highlight=False)
-    console.print("    /flex:agent — delegate to trace", highlight=False)
-    console.print()
-    console.print("  Control depth by ending your slash command with:", highlight=False)
-    console.print("    go           quick", highlight=False)
-    console.print("    goo          moderate", highlight=False)
-    console.print("    gooo         deep", highlight=False)
-    console.print("    goooooooo    exhaustive", highlight=False)
-    console.print()
-
-    # Exit code: 0 = success (possibly with soft warnings), 1 = hard failure
-    _soft_prefixes = ("Model download:", "Embedding incomplete")
-    _hard = [w for w in _warnings if not any(w.startswith(p) for p in _soft_prefixes)]
-    if _warnings:
-        console.print(f"  [yellow]Completed with {len(_warnings)} warning(s):[/yellow]")
-        for w in _warnings:
-            console.print(f"    [dim]- {w}[/dim]")
-        console.print()
-        console.print("  [dim]Run[/dim] [bold]flex sync[/bold] [dim]to repair, or[/dim] [bold]flex init[/bold] [dim]to retry.[/dim]")
-        console.print()
-        if _hard:
-            sys.exit(1)
-
 
 
 # ============================================================
@@ -835,7 +890,7 @@ def cmd_init(args):
 def _open_cell_for_search(cell_name: str):
     """Open a cell with vec_ops UDF registered. Returns (db, cleanup) or exits."""
     from flex.registry import resolve_cell
-    from flex.core import open_cell
+    from flex.core import open_cell_readonly
 
     path = resolve_cell(cell_name)
     if path is None:
@@ -843,7 +898,7 @@ def _open_cell_for_search(cell_name: str):
         print("Run 'flex init' first, then use Claude Code to build your index.", file=sys.stderr)
         sys.exit(1)
 
-    db = open_cell(str(path))
+    db = open_cell_readonly(path)
 
     # Try to register vec_ops (needs ONNX + embeddings)
     try:
@@ -927,7 +982,10 @@ def cmd_search(args):
 
     db = _open_cell_for_search(args.cell)
     try:
-        result = execute_query(db, args.query)
+        query = args.query
+        if query.startswith('!'):
+            query = query[1:].lstrip()
+        result = execute_query(db, query)
         print(result)
     finally:
         db.close()
@@ -937,10 +995,7 @@ def cmd_search(args):
 # flex sync
 # ============================================================
 
-# Normalize cell_type aliases to module directory names
-_TYPE_TO_MODULE = {
-    'claude-code': 'claude_code',
-}
+from flex.modules.specs import asset_modules_for, enrichment_stubs_from, normalize_cell_type, stock_subdirs
 
 
 def _find_view_dir(cell_name: str, cell_type: str | None) -> Path | None:
@@ -951,52 +1006,51 @@ def _find_view_dir(cell_name: str, cell_type: str | None) -> Path | None:
     No hardcoded module list — any module with stock/views/ is found.
     """
     key = cell_type or cell_name
-    # Normalize aliases (e.g. 'claude-code' → 'claude_code')
-    module_name = _TYPE_TO_MODULE.get(key, key)
+    for module_name in asset_modules_for(key, "views_from") or [normalize_cell_type(key) or key]:
+        user_dir = Path.home() / '.flex' / 'views' / module_name
+        if user_dir.exists() and any(user_dir.glob('*.sql')):
+            return user_dir
 
-    # User library takes precedence
-    user_dir = Path.home() / '.flex' / 'views' / module_name
-    if user_dir.exists() and any(user_dir.glob('*.sql')):
-        return user_dir
-
-    # Stock library fallback — auto-discover from module directory
-    stock = PKG_ROOT / 'modules' / module_name / 'stock' / 'views'
-    if stock.exists() and any(stock.glob('*.sql')):
-        return stock
+        stock_dirs = stock_subdirs(module_name, "views_from", "views")
+        stock = stock_dirs[0] if stock_dirs else None
+        if stock is not None:
+            return stock
 
     return None
 
 
-# Enrichment stub DDL — curated views LEFT JOIN these tables.
-# Empty stubs let views work before enrichments run.
-_ENRICHMENT_STUBS = {
-    'claude-code': [
-        """CREATE TABLE IF NOT EXISTS _enrich_source_graph (
-            source_id TEXT PRIMARY KEY, centrality REAL, is_hub INTEGER DEFAULT 0,
-            is_bridge INTEGER DEFAULT 0, community_id INTEGER, community_label TEXT)""",
-        """CREATE TABLE IF NOT EXISTS _types_source_warmup (
-            source_id TEXT PRIMARY KEY, is_warmup_only INTEGER DEFAULT 0)""",
-        """CREATE TABLE IF NOT EXISTS _enrich_session_summary (
-            source_id TEXT PRIMARY KEY, fingerprint_index TEXT)""",
-        """CREATE TABLE IF NOT EXISTS _enrich_repo_identity (
-            repo_root TEXT PRIMARY KEY, repo_path TEXT, project TEXT, git_remote TEXT)""",
-        """CREATE TABLE IF NOT EXISTS _enrich_file_graph (
-            source_id TEXT PRIMARY KEY, file_community_id INTEGER, file_centrality REAL,
-            file_is_hub INTEGER DEFAULT 0, shared_file_count INTEGER)""",
-        """CREATE TABLE IF NOT EXISTS _enrich_delegation_graph (
-            source_id TEXT PRIMARY KEY, agents_spawned INTEGER,
-            is_orchestrator INTEGER DEFAULT 0, delegation_depth INTEGER,
-            parent_session TEXT)""",
-        """CREATE TABLE IF NOT EXISTS _ops (
-            id INTEGER PRIMARY KEY AUTOINCREMENT,
-            timestamp INTEGER DEFAULT (strftime('%s','now')),
-            operation TEXT, target TEXT, sql TEXT, params TEXT,
-            rows_affected INTEGER, source TEXT)""",
-        """CREATE TABLE IF NOT EXISTS _views (
-            name TEXT PRIMARY KEY, sql TEXT NOT NULL,
-            description TEXT, created_at INTEGER)""",
-    ],
-}
+def _find_view_dirs(cell_name: str, cell_type: str | None) -> list[Path]:
+    """Resolve view directories in install order: stock base, then user overrides."""
+    key = cell_type or cell_name
+    dirs: list[Path] = []
+    modules = asset_modules_for(key, "views_from") or [normalize_cell_type(key) or key]
+    for module_name in modules:
+        dirs.extend(stock_subdirs(module_name, "views_from", "views"))
+
+        user_dir = Path.home() / '.flex' / 'views' / module_name
+        if user_dir.exists() and any(user_dir.glob('*.sql')):
+            dirs.append(user_dir)
+
+    return dirs
+
+
+# Stub list lives in flex.modules.claude_code (single source of truth for the
+# coding-agent substrate). Specs declare which substrate they borrow from.
+from flex.modules.claude_code import ENRICHMENT_STUBS as _CC_ENRICHMENT_STUBS
+
+
+class _EnrichmentStubMap(dict):
+    def get(self, key, default=None):
+        source = enrichment_stubs_from(key)
+        if source in ("claude_code", "claude-code"):
+            return _CC_ENRICHMENT_STUBS
+        return super().get(key, default)
+
+
+_ENRICHMENT_STUBS = _EnrichmentStubMap({
+    'claude_code': _CC_ENRICHMENT_STUBS,
+    'claude-code': _CC_ENRICHMENT_STUBS,
+})
 
 
 
@@ -1080,8 +1134,7 @@ def cmd_sync(args):
             conn.commit()
 
             # Curated views
-            view_dir = _find_view_dir(name, cell_type)
-            if view_dir:
+            for view_dir in _find_view_dirs(name, cell_type):
                 install_views(conn, view_dir)
 
             # Auto views
@@ -1115,14 +1168,23 @@ def cmd_sync(args):
     # Install service units if missing (recovery from partial init)
     if sys.platform == "linux":
         worker_unit = SYSTEMD_DIR / "flex-worker.service"
-        if not worker_unit.exists():
+        refresh_timer = SYSTEMD_DIR / "flex-refresh.timer"
+        worker_text = worker_unit.read_text() if worker_unit.exists() else ""
+        custom_worker = worker_unit.exists() and "flex.daemon" not in worker_text
+        if not worker_unit.exists() or (not refresh_timer.exists() and not custom_worker):
             print("  Installing missing systemd units")
             try:
                 _install_systemd()
             except Exception as e:
                 print(f"  systemd install FAILED: {e}")
-        elif "flex.daemon" not in worker_unit.read_text():
+        elif custom_worker:
             pass  # custom unit — don't overwrite
+        elif "flex.daemon" in worker_text and "--no-refresh" not in worker_text:
+            print("  Updating systemd units for local-only worker")
+            try:
+                _install_systemd()
+            except Exception as e:
+                print(f"  systemd update FAILED: {e}")
 
         for service in ["flex-worker", "flex-mcp"]:
             try:
@@ -1133,17 +1195,30 @@ def cmd_sync(args):
                 print(f"  {service}: restarted")
             except subprocess.CalledProcessError as e:
                 print(f"  {service}: FAILED ({e.stderr.decode().strip()})")
+            except subprocess.TimeoutExpired:
+                print(f"  {service}: restart timed out")
             except FileNotFoundError:
                 print(f"  {service}: SKIP (systemctl not found)")
 
     elif sys.platform == "darwin":
         worker_plist = LAUNCHD_DIR / "dev.getflex.worker.plist"
-        if not worker_plist.exists():
+        refresh_plist = LAUNCHD_DIR / "dev.getflex.refresh.plist"
+        worker_text = worker_plist.read_text() if worker_plist.exists() else ""
+        custom_worker = worker_plist.exists() and "flex.daemon" not in worker_text
+        if not worker_plist.exists() or (not refresh_plist.exists() and not custom_worker):
             print("  Installing missing launchd agents")
             try:
                 _install_launchd()
             except Exception as e:
                 print(f"  launchd install FAILED: {e}")
+        elif custom_worker:
+            pass  # custom agent — don't overwrite
+        elif "flex.daemon" in worker_text and "--no-refresh" not in worker_text:
+            print("  Updating launchd agents for local-only worker")
+            try:
+                _install_launchd()
+            except Exception as e:
+                print(f"  launchd update FAILED: {e}")
         else:
             # Kill any PID-managed processes before launchd takes over
             _kill_pid_services()
@@ -1252,10 +1327,161 @@ def cmd_remove(args):
             print(f"  {name}: not found in registry")
 
 
+# ============================================================
+# flex module
+# ============================================================
+
+def _module_install_root() -> Path:
+    from flex.modules.specs import user_modules_root
+    return user_modules_root()
+
+
+def _safe_module_name(name: str) -> str:
+    if not name or name in {".", ".."} or "/" in name or "\\" in name:
+        raise ValueError(f"invalid module name: {name!r}")
+    return name
+
+
+def _module_dest(name: str) -> Path:
+    root = _module_install_root().resolve()
+    dest = root / _safe_module_name(name)
+    try:
+        rel_ok = dest.is_relative_to(root)
+    except AttributeError:
+        rel_ok = str(dest).startswith(str(root))
+    if not rel_ok:
+        raise ValueError(f"module path escapes install root: {name!r}")
+    return dest
+
+
+def cmd_module(args):
+    """Manage local external modules."""
+    action = getattr(args, "module_action", None)
+    if action == "install":
+        return cmd_module_install(args)
+    if action == "list":
+        return cmd_module_list(args)
+    if action == "remove":
+        return cmd_module_remove(args)
+    print("  Expected one of: install, list, remove")
+
+
+def cmd_module_install(args):
+    """Install a local module folder into ~/.flex/modules."""
+    src = Path(args.path).expanduser().resolve()
+    if not src.exists() or not src.is_dir():
+        raise SystemExit(f"module source is not a directory: {src}")
+    if not (src / "install.py").exists():
+        raise SystemExit(f"module source must contain install.py: {src}")
+
+    name = _safe_module_name(args.name or src.name)
+    root = _module_install_root()
+    root.mkdir(parents=True, exist_ok=True)
+    os.chmod(root, 0o700)
+    dest = _module_dest(name)
+    if dest.exists() or dest.is_symlink():
+        if not args.force:
+            raise SystemExit(f"module already installed: {name} ({dest})")
+        if dest.is_symlink() or dest.is_file():
+            dest.unlink()
+        else:
+            shutil.rmtree(dest)
+
+    editable = bool(getattr(args, "editable", False))
+    copy = bool(getattr(args, "copy", False))
+    if editable and copy:
+        raise SystemExit("--editable and --copy are mutually exclusive")
+
+    if editable:
+        dest.symlink_to(src, target_is_directory=True)
+        mode = "linked"
+    else:
+        ignore = shutil.ignore_patterns("__pycache__", "*.pyc", ".pytest_cache")
+        shutil.copytree(src, dest, ignore=ignore)
+        mode = "copied"
+    if not editable:
+        _write_module_provenance(dest, _module_provenance(src, dest, name, mode))
+    print(f"  {name}: {mode} {src} -> {dest}")
+
+
+def cmd_module_list(args):
+    """List modules installed under ~/.flex/modules."""
+    root = _module_install_root()
+    if not root.exists():
+        print("  No external modules installed.")
+        return
+    found = False
+    for path in sorted(root.iterdir()):
+        if path.name.startswith("_"):
+            continue
+        install_py = path / "install.py"
+        if not install_py.exists():
+            continue
+        found = True
+        target = path.resolve() if path.is_symlink() else path
+        suffix = f" -> {target}" if path.is_symlink() else ""
+        if getattr(args, "verbose", False):
+            meta_path = path / ".flex-module.json"
+            if meta_path.exists():
+                try:
+                    meta = json.loads(meta_path.read_text())
+                except Exception:
+                    meta = {}
+                mode = meta.get("install_mode") or ("linked" if path.is_symlink() else "copied")
+                ref = meta.get("git_ref")
+                if not ref and meta.get("git_head"):
+                    ref = meta["git_head"][:12]
+                ref = ref or "unknown"
+                dirty = " dirty" if meta.get("git_dirty") else ""
+                print(f"  {path.name}  {mode}  {ref}{dirty}  {target}")
+            else:
+                mode = "linked" if path.is_symlink() else "copied"
+                print(f"  {path.name}  {mode}  unknown  {target}")
+        else:
+            print(f"  {path.name}{suffix}")
+    if not found:
+        print("  No external modules installed.")
+
+
+def cmd_module_remove(args):
+    """Remove a module installed under ~/.flex/modules."""
+    dest = _module_dest(args.name)
+    if not dest.exists() and not dest.is_symlink():
+        print(f"  {args.name}: not installed")
+        return
+    if dest.is_symlink() or dest.is_file():
+        dest.unlink()
+    else:
+        shutil.rmtree(dest)
+    print(f"  {args.name}: removed")
+
+
 def cmd_status(args):
     """Show cell health, lifecycle, and refresh status."""
-    from flex.registry import list_cells
+    from flex.health import refresh_problems
+    from flex.registry import classify_refresh_state, list_cells
     import sqlite3 as _sqlite3
+
+    def _counts(path):
+        try:
+            db = _sqlite3.connect(path, timeout=5)
+            chunks = db.execute("SELECT COUNT(*) FROM _raw_chunks").fetchone()[0]
+            sources = db.execute("SELECT COUNT(*) FROM _raw_sources").fetchone()[0]
+            db.close()
+            return chunks, sources
+        except Exception:
+            return None, None
+
+    def _fmt_age(seconds):
+        if seconds is None:
+            return "—"
+        if seconds < 60:
+            return f"{seconds}s"
+        if seconds < 3600:
+            return f"{seconds // 60}m"
+        if seconds < 86400:
+            return f"{seconds // 3600}h"
+        return f"{seconds // 86400}d"
 
     cells = list_cells()
     if not cells:
@@ -1266,55 +1492,139 @@ def cmd_status(args):
     if not args.all:
         cells = [c for c in cells if not c.get('unlisted')]
 
+    if getattr(args, 'problems', False):
+        problems = refresh_problems(cells, include_unlisted=True)
+        if args.json:
+            import json
+            print(json.dumps(problems, indent=2))
+            return
+        if not problems:
+            print("No refresh lifecycle problems.")
+            return
+        print(f"{'CELL':<24} {'STATUS':<14} {'SEVERITY':<8} {'AGE':>5} REASON")
+        print("-" * 88)
+        for problem in problems:
+            print(
+                f"{problem['cell'][:23]:<24} {problem['status'][:13]:<14} "
+                f"{problem['severity']:<8} {problem['age']:>5} {problem['reason']}"
+            )
+        print("\nNext:")
+        for problem in problems:
+            print(f"  {problem['cell']}: {problem['next']}")
+        return
+
     if args.json:
         import json
         out = []
         for c in cells:
+            state = classify_refresh_state(c)
+            chunks, sources = _counts(c['path'])
             entry = {
                 'name': c['name'],
                 'cell_type': c.get('cell_type'),
                 'lifecycle': c.get('lifecycle', 'static'),
+                'active': bool(c.get('active', 1)),
+                'unlisted': bool(c.get('unlisted', 0)),
+                'discoverable': not bool(c.get('unlisted', 0)),
+                'warm_on_startup': bool(c.get('active', 1)) and not bool(c.get('unlisted', 0)),
                 'refresh_status': c.get('refresh_status'),
+                'effective_refresh_status': state['effective_refresh_status'],
                 'last_refresh_at': c.get('last_refresh_at'),
                 'refresh_interval': c.get('refresh_interval'),
+                'refresh_due': state['refresh_due'],
+                'refresh_stale': state['refresh_stale'],
+                'refresh_overdue': state['refresh_overdue'],
+                'refresh_never_run': state['refresh_never_run'],
+                'refresh_age_s': state['refresh_age_s'],
+                'refresh_running_for_s': state['refresh_running_for_s'],
+                'path': c.get('path'),
+                'refresh_module': c.get('refresh_module'),
+                'refresh_script': c.get('refresh_script'),
             }
-            try:
-                db = _sqlite3.connect(c['path'], timeout=5)
-                entry['chunks'] = db.execute("SELECT COUNT(*) FROM _raw_chunks").fetchone()[0]
-                entry['sources'] = db.execute("SELECT COUNT(*) FROM _raw_sources").fetchone()[0]
-                db.close()
-            except Exception:
-                entry['chunks'] = entry['sources'] = None
+            entry['chunks'] = chunks
+            entry['sources'] = sources
             out.append(entry)
         print(json.dumps(out, indent=2))
         return
 
     # Table format
-    print(f"{'CELL':<24} {'TYPE':<14} {'LIFECYCLE':<10} {'LAST REFRESH':<22} {'STATUS':<8} {'CHUNKS':>8} {'SOURCES':>8}")
-    print("─" * 104)
+    print(
+        f"{'CELL':<24} {'TYPE':<14} {'FLAGS':<5} {'LIFECYCLE':<10} "
+        f"{'STATUS':<14} {'AGE':>5} {'DUE':<3} {'CHUNKS':>8} {'SOURCES':>8}"
+    )
+    print("-" * 101)
 
     for c in cells:
         name = c['name'][:23]
         ct = (c.get('cell_type') or '—')[:13]
         lc = (c.get('lifecycle') or 'static')[:9]
-        lr = (c.get('last_refresh_at') or '—')[:21]
-        rs = (c.get('refresh_status') or '—')[:7]
+        state = classify_refresh_state(c)
+        rs = state['effective_refresh_status'][:13]
+        age = _fmt_age(state['refresh_age_s'])
+        due = "yes" if state['refresh_due'] else "no"
+        flags = (
+            ("A" if c.get('active', 1) else "I") +
+            ("U" if c.get('unlisted') else "L")
+        )
+        chunks, sources = _counts(c['path'])
+        chunks = '?' if chunks is None else chunks
+        sources = '?' if sources is None else sources
 
-        try:
-            db = _sqlite3.connect(c['path'], timeout=5)
-            chunks = db.execute("SELECT COUNT(*) FROM _raw_chunks").fetchone()[0]
-            sources = db.execute("SELECT COUNT(*) FROM _raw_sources").fetchone()[0]
-            db.close()
-        except Exception:
-            chunks = sources = '?'
-
-        print(f"{name:<24} {ct:<14} {lc:<10} {lr:<22} {rs:<8} {chunks:>8} {sources:>8}")
+        print(
+            f"{name:<24} {ct:<14} {flags:<5} {lc:<10} {rs:<14} "
+            f"{age:>5} {due:<3} {chunks:>8} {sources:>8}"
+        )
 
     # Summary
     total_refresh = sum(1 for c in cells if c.get('lifecycle') == 'refresh')
     total_watch = sum(1 for c in cells if c.get('lifecycle') == 'watch')
     errors = sum(1 for c in cells if (c.get('refresh_status') or '').startswith('error'))
-    print(f"\n{len(cells)} cells ({total_refresh} refresh, {total_watch} watch, {errors} errors)")
+    stale = sum(1 for c in cells if classify_refresh_state(c)['refresh_stale'])
+    overdue = sum(1 for c in cells if classify_refresh_state(c)['refresh_overdue'])
+    due = sum(1 for c in cells if classify_refresh_state(c)['refresh_due'])
+    print(
+        f"\n{len(cells)} cells ({total_refresh} refresh, {total_watch} watch, "
+        f"{due} due, {overdue} overdue, {stale} stale-running, {errors} errors)"
+    )
+
+
+def cmd_health(args):
+    """Show compact operational health."""
+    from flex.health import refresh_problems, refresh_summary
+    from flex.registry import list_cells
+    import json
+
+    cells = list_cells()
+    if not args.all:
+        cells = [c for c in cells if not c.get('unlisted')]
+    refresh = refresh_summary(cells, include_unlisted=True)
+    problems = refresh_problems(cells, include_unlisted=True)
+    summary = {
+        "status": refresh["status"],
+        "refresh": refresh,
+        "problems": problems,
+    }
+
+    if args.json:
+        print(json.dumps(summary, indent=2))
+        return
+
+    print(f"status: {summary['status']}")
+    print(
+        f"refresh: {refresh['refresh_cells']} cells, {refresh['problems']} problems, "
+        f"{refresh['due']} due, {refresh['stale_running']} stale-running, "
+        f"{refresh['overdue']} overdue, {refresh['errors']} errors"
+    )
+    if not problems:
+        return
+    print()
+    print(f"{'CELL':<24} {'STATUS':<14} {'SEVERITY':<8} {'AGE':>5} REASON")
+    print("-" * 88)
+    for problem in problems:
+        print(
+            f"{problem['cell'][:23]:<24} {problem['status'][:13]:<14} "
+            f"{problem['severity']:<8} {problem['age']:>5} {problem['reason']}"
+        )
 
 
 
@@ -1335,7 +1645,11 @@ def _gnu_flex_proxy():
         return  # bare `flex` — ours
 
     # Our commands — definitely not GNU flex
-    our_commands = {"init", "search", "sync", "remove", "status", "-h", "--help"}
+    our_commands = {
+        "init", "search", "sync", "remove", "status", "health",
+        "module", "relay", "index",
+        "-h", "--help",
+    }
     if argv[0] in our_commands:
         return
 
@@ -1415,6 +1729,8 @@ def main():
     _gnu_flex_proxy()
     from flex.registry import load_plugins
     load_plugins()
+    # Register built-in SDK commands such as `flex index` before CLI parsing.
+    import flex.sdk  # noqa: F401
 
     parser = argparse.ArgumentParser(
         prog="flex",
@@ -1422,9 +1738,30 @@ def main():
     )
     sub = parser.add_subparsers(dest="command")
 
-    # flex init
-    init_p = sub.add_parser("init", help="Initialize flex (base or with a module)")
-    init_p.add_argument("--module", default=None, help="Module to install (e.g. claude-code). Without this, installs base flex only.")
+    # flex init — dispatcher; each installable module registers its own flags
+    _install_modules = _discover_install_modules()
+    _module_help_lines = []
+    for _name in sorted(_install_modules):
+        _sum = _install_modules[_name]['summary']
+        _module_help_lines.append(f"{_name}: {_sum}" if _sum else _name)
+    _module_help = "Module to install. Available: " + (
+        ", ".join(sorted(_install_modules)) or "(none)"
+    )
+    init_p = sub.add_parser(
+        "init",
+        help="Initialize flex (base or with a module)",
+        description="Initialize flex. Without --module, installs base flex.\n\n"
+                    "Installable modules:\n  " + "\n  ".join(_module_help_lines),
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+    )
+    init_p.add_argument("--module", default=None, help=_module_help)
+    for _entry in _install_modules.values():
+        _reg = getattr(_entry['module'], 'register_args', None)
+        if callable(_reg):
+            try:
+                _reg(init_p)
+            except Exception as _e:
+                print(f"[cli] register_args({_entry['folder']}) failed: {_e}", file=sys.stderr)
 
     # flex search
     search_p = sub.add_parser("search", help="Search your sessions")
@@ -1437,6 +1774,31 @@ def main():
     sync_p.add_argument("--cell", default=None, help="Sync specific cell only (default: all)")
     sync_p.add_argument("--full", action="store_true", help="Also rebuild enrichments (~2min)")
 
+    # flex module — local external module management
+    module_p = sub.add_parser("module", help="Manage local external modules")
+    module_sub = module_p.add_subparsers(dest="module_action")
+    module_install_p = module_sub.add_parser("install", help="Install a local module folder")
+    module_install_p.add_argument("path", help="Folder containing install.py")
+    module_install_p.add_argument("--name", default=None, help="Installed module name (default: folder name)")
+    install_mode = module_install_p.add_mutually_exclusive_group()
+    install_mode.add_argument("--copy", action="store_true", help="Copy module snapshot (default)")
+    install_mode.add_argument("--editable", action="store_true", help="Symlink module for local development")
+    module_install_p.add_argument("--force", action="store_true", help="Replace an existing installed module")
+    module_list_p = module_sub.add_parser("list", help="List installed external modules")
+    module_list_p.add_argument("--verbose", action="store_true", help="Show install provenance")
+    module_remove_p = module_sub.add_parser("remove", help="Remove an installed external module")
+    module_remove_p.add_argument("name", help="Installed module name")
+
+    # flex relay — toggle getflex.dev cloud tunnel
+    relay_p = sub.add_parser(
+        "relay",
+        help="Enable cloud access via getflex.dev tunnel",
+    )
+    relay_p.add_argument("--stop", action="store_true",
+                         help="Disable relay and restart services")
+    relay_p.add_argument("--status", action="store_true",
+                         help="Show current relay URL if enabled")
+
     # Plugin commands — modules register their own subcommands via hooks
     from flex.registry import get_hook
     _register_commands = get_hook("register_cli_commands")
@@ -1447,6 +1809,12 @@ def main():
     stat_p = sub.add_parser("status", help="Show cell health and refresh status")
     stat_p.add_argument("--json", action="store_true", help="Machine-readable output")
     stat_p.add_argument("--all", action="store_true", help="Include unlisted cells")
+    stat_p.add_argument("--problems", action="store_true", help="Only show refresh lifecycle problems")
+
+    # flex health
+    health_p = sub.add_parser("health", help="Show operational health summary")
+    health_p.add_argument("--json", action="store_true", help="Machine-readable output")
+    health_p.add_argument("--all", action="store_true", help="Include unlisted cells")
 
     _register_extra = get_hook("register_extra_commands")
     if _register_extra:
@@ -1460,10 +1828,16 @@ def main():
             cmd_search(args)
         elif args.command == "sync":
             cmd_sync(args)
+        elif args.command == "module":
+            cmd_module(args)
         elif args.command == "remove":
             cmd_remove(args)
         elif args.command == "status":
             cmd_status(args)
+        elif args.command == "health":
+            cmd_health(args)
+        elif args.command == "relay":
+            cmd_relay(args)
         elif hasattr(args, 'func'):
             args.func(args)
         else:

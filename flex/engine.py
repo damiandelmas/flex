@@ -178,10 +178,10 @@ def materialize(db: sqlite3.Connection, sql: str) -> str:
 # Background indexer
 # ============================================================
 
-def drain_queue(cell_path: Path):
-    """Drain the compile queue. Synchronous."""
+def drain_primary_cell(cell_path: Path):
+    """Run the primary claude_code stat-scan path once. Synchronous."""
     try:
-        from flex.modules.engines import drain_queue as _drain
+        from flex.modules.engines import drain_primary_cell as _drain
         _drain(cell_path)
     except ImportError:
         pass

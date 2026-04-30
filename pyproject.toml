@@ -1,11 +1,21 @@
 [project]
 name = "getflex"
-version = "0.10.0"
+version = "0.20.0"
 description = "Knowledge engine for AI agents. Compile any data source into a queryable SQLite cell with embeddings, graph intelligence, and full-text search."
-license = { text = "MIT" }
+license = "MIT"
+license-files = ["LICENSE"]
 readme = "README.md"
 requires-python = ">=3.12"
 keywords = ["vector-search", "sql", "embeddings", "ai-agents", "mcp", "sqlite", "knowledge-base", "retrieval", "semantic-search"]
+classifiers = [
+    "Development Status :: 4 - Beta",
+    "Intended Audience :: Developers",
+    "Programming Language :: Python :: 3",
+    "Programming Language :: Python :: 3.12",
+    "Programming Language :: Python :: 3.13",
+    "Topic :: Database",
+    "Topic :: Scientific/Engineering :: Artificial Intelligence",
+]
 dependencies = [
     "numpy>=2.0,<3",
     "networkx>=3.0,<4",
@@ -33,13 +43,11 @@ flex = "flex.cli:main"
 [tool.setuptools.package-data]
 flex = [
     "modules/claude_code/**/*.sql",
+    "modules/markdown/**/*.sql",
     "modules/soma/**/*.sql",
     "retrieve/presets/general/*.sql",
     "onnx/*.json",
     "onnx/vocab.txt",
-    "ai/agents/trace.md",
-    "ai/commands/flex/agent.md",
-    "ai/commands/flex/search.md",
     "ai/skills/flex/**/*",
 ]
 
@@ -63,5 +71,5 @@ markers = [
 ]
 
 [build-system]
-requires = ["setuptools>=68.0"]
+requires = ["setuptools>=77.0"]
 build-backend = "setuptools.build_meta"

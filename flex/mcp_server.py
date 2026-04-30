@@ -25,7 +25,8 @@ from pathlib import Path
 from mcp.server.lowlevel import Server
 import mcp.types as types
 
-from flex.core import open_cell, get_meta
+from flex.core import get_meta, open_cell_readonly
+from flex.mcp_core import execute_query as _execute_mcp_query
 from flex.registry import (
     resolve_cell as registry_resolve,
     discover_cells as registry_discover,
@@ -49,32 +50,6 @@ except ImportError:
 # Configuration
 # ============================================================
 
-# SQLite authorizer for search pipe — whitelist read-only operations.
-# Action codes: https://www.sqlite.org/c3ref/c_alter_table.html
-_SQLITE_OK, _SQLITE_DENY = 0, 1
-_SEARCH_ALLOW = {
-    20,  # SQLITE_READ        — read column value
-    21,  # SQLITE_SELECT      — SELECT statement
-    29,  # SQLITE_CREATE_VTABLE — FTS5 vtable access (read, not create)
-    31,  # SQLITE_FUNCTION    — use SQL function (incl. built-ins)
-    33,  # SQLITE_RECURSIVE   — recursive CTE
-}
-_BLOCKED_PRAGMAS = frozenset({
-    'database_list',      # leaks absolute file paths
-    'wal_checkpoint',     # triggers WAL operations
-    'integrity_check',    # full-DB scan, DoS vector
-    'quick_check',        # same
-    'writable_schema',    # dangerous config toggle
-    'query_only',         # config toggle
-})
-
-
-def _search_authorizer(action, arg1, arg2, db_name, trigger_name):
-    """Authorizer callback for search pipe. Allows reads + safe PRAGMAs only."""
-    if action == 19:  # SQLITE_PRAGMA
-        return _SQLITE_DENY if (arg1 or '').lower() in _BLOCKED_PRAGMAS else _SQLITE_OK
-    return _SQLITE_OK if action in _SEARCH_ALLOW else _SQLITE_DENY
-
 # ============================================================
 # Cell Management
 # ============================================================
@@ -92,6 +67,34 @@ _VEC_REBUILD_DEBOUNCE_S = 60
 # Known cells (just names, for instructions). Populated at startup + lazily.
 _known_cells: set[str] = set()
 _explicit_cells: set[str] = set()  # cells explicitly requested via --cell
+
+_warmup_lock = threading.Lock()
+_warmup_state = {
+    'status': 'idle',
+    'total': 0,
+    'completed': 0,
+    'current': None,
+    'cells': [],
+    'errors': [],
+    'started_at': None,
+    'completed_at': None,
+}
+
+
+def _set_warmup_state(**updates):
+    with _warmup_lock:
+        _warmup_state.update(updates)
+
+
+def get_warmup_state() -> dict:
+    """Return a snapshot of background VectorCache warmup progress."""
+    with _warmup_lock:
+        state = dict(_warmup_state)
+        state['cells'] = list(state.get('cells') or [])
+        state['errors'] = list(state.get('errors') or [])
+    state['vec_cached_cells'] = sorted(_vec_state.keys())
+    state['vec_cached_count'] = len(_vec_state)
+    return state
 
 
 def discover_cells() -> list[str]:
@@ -112,12 +115,19 @@ def _db_mtime(name: str) -> float:
     return p.stat().st_mtime if p.exists() else 0
 
 
+def _open_query_cell(path: Path) -> sqlite3.Connection:
+    """Open a cell for MCP reads, tolerating read-only sandboxes."""
+    return open_cell_readonly(path)
+
+
 @contextmanager
-def get_cell(name: str):
+def get_cell(name: str, warm_vec: bool = True):
     """Open a fresh connection to a cell. Registers vec_ops UDF if cached.
 
     Yields None if cell doesn't exist on disk.
     Fresh connection every call = always see latest data.
+    warm_vec=False is used by MCP schema generation so startup/list_tools can
+    inspect cell metadata without forcing VectorCache construction.
     Usage: with get_cell('claude_code') as db: ...
     """
     # If cells were explicitly selected, reject requests for other cells
@@ -130,7 +140,7 @@ def get_cell(name: str):
         yield None
         return
 
-    db = open_cell(str(p))
+    db = _open_query_cell(p)
     try:
         is_new = name not in _known_cells
         _known_cells.add(name)
@@ -149,7 +159,9 @@ def get_cell(name: str):
         current_mtime = p.stat().st_mtime
         state = _vec_state.get(name)
 
-        if HAS_ENGINE and state and state['mtime'] == current_mtime:
+        if not warm_vec:
+            pass
+        elif HAS_ENGINE and state and state['mtime'] == current_mtime:
             # Cache is fresh — just register UDF on this connection
             register_vec_udf(db, state)
         elif HAS_ENGINE and not _no_embed:
@@ -186,13 +198,20 @@ def get_cell(name: str):
 _no_embed = False
 
 
-def init(cell_names: list[str], active_names: list[str] | None = None, no_embed: bool = False):
-    """Initialize the server: discover cells, warm caches, set instructions.
+def init(
+    cell_names: list[str],
+    active_names: list[str] | None = None,
+    no_embed: bool = False,
+    warm: bool = True,
+):
+    """Initialize the server: discover cells, optionally warm caches, set instructions.
 
     Called by serve.py (the entrypoint) before transport starts.
     cell_names: all discoverable cells (appear in tool enum, queryable).
     active_names: subset to pre-warm VectorCaches at startup. Inactive cells
                   (in cell_names but not active_names) are lazy-loaded on first query.
+    warm: when False, defer VectorCache warmup until after the MCP transport is
+          accepting initialization/list_tools requests.
     """
     global _no_embed
     _no_embed = no_embed
@@ -203,11 +222,33 @@ def init(cell_names: list[str], active_names: list[str] | None = None, no_embed:
     _known_cells.update(cell_names)
     _explicit_cells.update(cell_names)
 
-    if not no_embed:
+    if no_embed:
+        _set_warmup_state(
+            status='skipped',
+            total=0,
+            completed=0,
+            current=None,
+            cells=[],
+            errors=[],
+            started_at=None,
+            completed_at=time.time(),
+        )
+        print("[flex-mcp] Skipping embeddings", file=sys.stderr)
+    elif warm:
         print(f"[flex-mcp] Warming {len(active_names)} of {len(cell_names)} cells...", file=sys.stderr)
         _warm_all(active_names)
     else:
-        print("[flex-mcp] Skipping embeddings", file=sys.stderr)
+        _set_warmup_state(
+            status='deferred',
+            total=len(active_names),
+            completed=0,
+            current=None,
+            cells=list(active_names),
+            errors=[],
+            started_at=None,
+            completed_at=None,
+        )
+        print(f"[flex-mcp] Deferring warmup for {len(active_names)} of {len(cell_names)} cells", file=sys.stderr)
 
     server.instructions = build_instructions()
     print(f"[flex-mcp] {len(_known_cells)} cells, {len(_vec_state)} cached", file=sys.stderr)
@@ -221,12 +262,78 @@ def get_server() -> Server:
 def _warm_all(cell_names: list[str]):
     """Pre-warm VectorCaches and ONNX embedder at startup."""
     if not HAS_ENGINE:
+        _set_warmup_state(
+            status='skipped',
+            total=0,
+            completed=0,
+            current=None,
+            cells=[],
+            errors=[],
+            completed_at=time.time(),
+        )
         print("[flex-mcp] Engine not installed — skipping warmup", file=sys.stderr)
         return
-    warm_embedder()
+    _set_warmup_state(
+        status='running',
+        total=len(cell_names),
+        completed=0,
+        current=None,
+        cells=list(cell_names),
+        errors=[],
+        started_at=time.time(),
+        completed_at=None,
+    )
+    try:
+        warm_embedder()
+    except Exception as e:
+        _set_warmup_state(
+            status='error',
+            current=None,
+            errors=[f"embedder: {e}"],
+            completed_at=time.time(),
+        )
+        raise
+    completed = 0
+    errors = []
     for name in cell_names:
-        with get_cell(name):
-            pass  # just warming the cache, context manager closes connection
+        _set_warmup_state(current=name)
+        try:
+            with get_cell(name):
+                pass  # just warming the cache, context manager closes connection
+        except Exception as e:
+            msg = f"{name}: {e}"
+            errors.append(msg)
+            print(f"[flex-mcp]   {msg}", file=sys.stderr)
+        completed += 1
+        _set_warmup_state(completed=completed, errors=list(errors))
+    _set_warmup_state(
+        status='error' if errors else 'complete',
+        current=None,
+        completed=completed,
+        errors=list(errors),
+        completed_at=time.time(),
+    )
+
+
+def warm_cells(cell_names: list[str]):
+    """Public lifecycle hook for deferred VectorCache warmup."""
+    if not cell_names:
+        return
+    print(f"[flex-mcp] Warming {len(cell_names)} cells in background...", file=sys.stderr)
+    try:
+        _warm_all(cell_names)
+    except Exception as e:
+        print(f"[flex-mcp] background warmup error: {e}", file=sys.stderr)
+        return
+    state = get_warmup_state()
+    if state.get('status') == 'error':
+        print(
+            f"[flex-mcp] Background warmup finished with "
+            f"{len(state.get('errors') or [])} error(s) ({len(_vec_state)} cached)",
+            file=sys.stderr,
+        )
+    else:
+        print(f"[flex-mcp] Background warmup complete ({len(_vec_state)} cached)", file=sys.stderr)
 
 
 def execute_preset(db: sqlite3.Connection, query: str) -> str:
@@ -274,76 +381,23 @@ def _execute_attaches(db: sqlite3.Connection, sql: str) -> tuple[str, str | None
     return remaining, None
 
 
-def _is_bare_text(query: str) -> bool:
-    """Detect bare text queries that aren't SQL or presets."""
-    q = query.strip()
-    if q.startswith('@'):
-        return False
-    upper = q.upper().lstrip()
-    sql_starts = ('SELECT', 'WITH', 'PRAGMA', 'EXPLAIN', 'INSERT', 'DELETE',
-                  'UPDATE', 'DROP', 'CREATE', 'ALTER', 'ATTACH')
-    return not any(upper.startswith(kw) for kw in sql_starts)
-
-
 def execute_query(db: sqlite3.Connection, query: str) -> str:
     """Execute read-only SQL or @preset on a cell. Returns JSON string."""
     sql = query.strip()
 
-    # Preset dispatch — @name [params]
-    if sql.startswith('@'):
-        return execute_preset(db, sql)
-
-    # Detect bare text before executing — surface a helpful error
-    if _is_bare_text(sql):
-        escaped = sql.replace("'", "''")
-        return json.dumps({
-            "error": f"Not valid SQL: \"{sql}\"",
-            "hint": "Use vec_ops() for semantic search, FTS for keyword match, or @preset syntax.",
-            "semantic": (
-                f"SELECT v.id, v.score, c.content "
-                f"FROM vec_ops('similar:{escaped}') v "
-                f"JOIN chunks c ON v.id = c.id "
-                f"ORDER BY v.score DESC LIMIT 10"
-            ),
-            "keyword": (
-                f"SELECT k.id, k.rank, k.snippet, c.content "
-                f"FROM keyword('{escaped}') k "
-                f"JOIN chunks c ON k.id = c.id "
-                f"ORDER BY k.rank DESC LIMIT 10"
-            ),
-        })
-
-    upper = sql.upper()
-
     # Cross-cell ATTACH — resolve cell names to registry paths before blocklist
+    upper = sql.upper()
     if 'ATTACH' in upper:
         sql, err = _execute_attaches(db, sql)
         if err:
             return json.dumps({"error": err})
-        upper = sql.upper()
 
-    # Materialize table sources into temp tables
-    # (runs BEFORE authorizer — trusted code that needs temp table writes)
-    if HAS_ENGINE:
-        sql = _engine_materialize(db, sql)
-        if sql.startswith('{"error"'):
-            return sql
-
-    # Read-only enforcement via SQLite authorizer
-    # Replaces the old startswith keyword check which was bypassable via
-    # CTE prefix (WITH x AS (DELETE ...) SELECT ...) or SQL comments.
-    try:
-        db.set_authorizer(_search_authorizer)
-        rows = db.execute(sql).fetchall()
-        results = [dict(r) for r in rows]
-        return json.dumps(results, indent=2, default=str)
-    except sqlite3.DatabaseError as e:
-        err_str = str(e)
-        if 'not authorized' in err_str.lower():
-            return json.dumps({"error": "Write operations not allowed"})
-        return json.dumps({"error": err_str})
-    finally:
-        db.set_authorizer(None)
+    return _execute_mcp_query(
+        db,
+        sql,
+        preset_executor=execute_preset,
+        materializer=_engine_materialize if HAS_ENGINE else None,
+    )
 
 
 # ============================================================
@@ -379,7 +433,7 @@ def _build_query_description() -> str:
     # --- Generated: cells + descriptions ---
     cell_views = {}  # {name: set of view names}
     for name in sorted(_known_cells):
-        with get_cell(name) as db:
+        with get_cell(name, warm_vec=False) as db:
             if db:
                 desc = get_meta(db, 'description') or f"Cell: {name}"
                 parts.append(f"  {name}: {desc}")
@@ -749,16 +803,127 @@ def _log_query(cell: str, query: str, result_json: str, elapsed_ms: float):
         pass  # never break queries for logging
 
 
+def _relay_tool_available() -> bool:
+    """Only expose flex_relay when the websockets extra is installed."""
+    try:
+        import websockets  # noqa: F401
+        return True
+    except ImportError:
+        return False
+
+
+_RELAY_TOOL = types.Tool(
+    name="flex_relay",
+    description=(
+        "Enable or disable cloud access via the getflex.dev tunnel. "
+        "When enabled, this flex server is reachable via a stable "
+        "https://{id}.getflex.dev/sse endpoint usable from claude.ai "
+        "and any MCP client. Per-machine, opt-in, reversible. "
+        "The MCP service must be restarted (systemctl --user restart "
+        "flex-mcp) for state changes to take effect — the tool returns "
+        "restart_required=true on start/stop."
+    ),
+    inputSchema={
+        "type": "object",
+        "properties": {
+            "action": {
+                "type": "string",
+                "enum": ["start", "stop", "status"],
+                "description": "start = enable relay, stop = disable, status = check current state",
+            },
+        },
+        "required": ["action"],
+    },
+)
+
+
 @server.list_tools()
 async def handle_list_tools() -> list[types.Tool]:
     """Return the flex_search tool with dynamic description and schema."""
-    return [
+    tools = [
         types.Tool(
             name="flex_search",
             description=_build_tool_description(),
             inputSchema=_build_tool_schema(),
         )
     ]
+    if _relay_tool_available():
+        tools.append(_RELAY_TOOL)
+    return tools
+
+
+async def _handle_flex_relay(arguments: dict | None) -> list[types.TextContent]:
+    """Toggle the relay state. Mirrors `flex relay` CLI behavior.
+
+    The MCP server cannot cleanly restart itself from inside a tool handler,
+    so start/stop actions return ``restart_required: true`` and expect the
+    caller to restart flex-mcp out-of-band.
+    """
+    arguments = arguments or {}
+    action = arguments.get("action", "status")
+
+    if not _relay_tool_available():
+        return [types.TextContent(type="text", text=json.dumps({
+            "error": "relay_unavailable",
+            "message": "relay requires the websockets package",
+            "install": "pip install 'getflex[relay]'",
+        }))]
+
+    from flex.registry import FLEX_HOME
+    machine_id_path = FLEX_HOME / "machine_id"
+    flag_path = FLEX_HOME / "relay_enabled"
+
+    # Inline relay-state check keeps the public MCP tool self-contained.
+    def _enabled() -> bool:
+        if flag_path.exists():
+            return True
+        if machine_id_path.exists():
+            try:
+                flag_path.touch()
+            except OSError:
+                return False
+            return True
+        return False
+
+    if action == "status":
+        if _enabled() and machine_id_path.exists():
+            mid = machine_id_path.read_text().strip()
+            return [types.TextContent(type="text", text=json.dumps({
+                "enabled": True,
+                "machine_id": mid,
+                "endpoint": f"https://{mid}.getflex.dev/sse",
+            }))]
+        return [types.TextContent(type="text", text=json.dumps({"enabled": False}))]
+
+    if action == "stop":
+        # Preserve machine_id as persistent identity — just drop the flag.
+        # Keeps the claude.ai Connector URL stable across toggle cycles.
+        if flag_path.exists():
+            flag_path.unlink()
+        return [types.TextContent(type="text", text=json.dumps({
+            "enabled": False,
+            "restart_required": True,
+            "message": "Relay disabled. Restart flex-mcp service for changes to take effect.",
+        }))]
+
+    if action == "start":
+        FLEX_HOME.mkdir(parents=True, exist_ok=True)
+        if not machine_id_path.exists():
+            import uuid
+            machine_id_path.write_text(uuid.uuid4().hex[:8])
+        flag_path.touch()
+        mid = machine_id_path.read_text().strip()
+        return [types.TextContent(type="text", text=json.dumps({
+            "enabled": True,
+            "machine_id": mid,
+            "endpoint": f"https://{mid}.getflex.dev/sse",
+            "restart_required": True,
+            "message": "Relay enabled. Restart flex-mcp service to connect.",
+        }))]
+
+    return [types.TextContent(type="text", text=json.dumps({
+        "error": "unknown_action", "action": action,
+    }))]
 
 
 _QUERY_TIMEOUT_S = 30  # max seconds per query before cancellation
@@ -896,6 +1061,9 @@ async def handle_call_tool(
     name: str, arguments: dict | None
 ) -> list[types.TextContent]:
     """Handle flex tool calls. Runs DB work in executor to avoid blocking."""
+    if name == "flex_relay":
+        return await _handle_flex_relay(arguments)
+
     if name != "flex_search":
         return [types.TextContent(type="text", text=json.dumps({"error": f"Unknown tool: {name}"}))]
 

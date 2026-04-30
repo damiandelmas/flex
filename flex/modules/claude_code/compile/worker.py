@@ -7,6 +7,7 @@ into the claude_code cell, embeds chunks, and runs enrichment.
 """
 
 import hashlib
+import os
 import re
 import sqlite3
 import json
@@ -32,6 +33,22 @@ try:
     from flex.modules.engines import refresh_corpus_graphs as _corpus_graph_refresher
 except ImportError:
     pass
+
+_markdown_scanner = None
+try:
+    from flex.modules.markdown.compile.worker import scan_markdown_cells as _markdown_scanner
+except ImportError:
+    pass
+
+_coding_agent_scanner = None
+try:
+    from flex.modules.claude_code.coding_agent_watch import (
+        scan_coding_agent_cells as _coding_agent_scanner,
+    )
+except ImportError:
+    pass
+
+CODING_AGENT_WATCH_INTERVAL = float(os.environ.get("FLEX_CODING_AGENT_WATCH_INTERVAL_SEC", "30"))
 
 try:
     from flex.modules.soma.compile import enrich as soma_enrich
@@ -68,7 +85,6 @@ except ImportError:
     rebuild_file_graph = None
     rebuild_delegation_graph = None
 
-QUEUE_DB = FLEX_HOME / "queue.db"
 CLAUDE_PROJECTS = Path.home() / ".claude/projects"
 
 # Warmup threshold — imported at module level for fast per-session checks
@@ -664,9 +680,18 @@ def sync_session_messages(session_id: str, conn: sqlite3.Connection,
     """, (session_id,))
     last_num = cur.fetchone()[0]
 
+    # H7 — bound memory on pathological JSONL files. Anything over 512MB
+    # streams line-by-line; smaller files still use readlines() for speed.
+    _MAX_JSONL_BYTES = 512 * 1024 * 1024
     try:
+        _jsize = Path(jsonl_path).stat().st_size
         with open(jsonl_path, 'r') as f:
-            lines = f.readlines()
+            if _jsize > _MAX_JSONL_BYTES:
+                print(f"[worker] {jsonl_path.name}: {_jsize // (1024*1024)}MB — streaming",
+                      file=sys.stderr)
+                lines = list(f)  # iterate file object (one line at a time)
+            else:
+                lines = f.readlines()
     except Exception:
         return 0
 
@@ -730,7 +755,20 @@ def sync_session_messages(session_id: str, conn: sqlite3.Connection,
                     backup_name = info.get('backupFileName', '')
                     if not backup_name:
                         continue
-                    backup_path = Path.home() / '.claude' / 'file-history' / session_id / backup_name
+                    # H1 — strip any directory components from the JSONL-supplied
+                    # backupFileName before using it, and verify the resolved
+                    # path stays inside the per-session backup dir.
+                    _safe_name = Path(backup_name).name
+                    if not _safe_name or _safe_name.startswith('.'):
+                        continue
+                    _backup_root = (Path.home() / '.claude' / 'file-history' / session_id).resolve()
+                    backup_path = (_backup_root / _safe_name).resolve()
+                    try:
+                        _ok_rel = backup_path.is_relative_to(_backup_root)
+                    except AttributeError:
+                        _ok_rel = str(backup_path).startswith(str(_backup_root))
+                    if not _ok_rel:
+                        continue
                     if backup_path.exists():
                         try:
                             content = backup_path.read_bytes()
@@ -1160,8 +1198,8 @@ def sync_session_messages(session_id: str, conn: sqlite3.Connection,
 def scan_sessions(conn: sqlite3.Connection, size_cache: dict) -> dict:
     """Scan all JSONLs by file size, sync only those that grew.
 
-    Replaces both process_queue() and startup_backfill(). No hooks, no queue,
-    no existence check. Pure stat()-based polling — the Filebeat pattern.
+    Replaces the old queue-drain and startup-backfill paths. Pure stat()-based
+    polling — the Filebeat pattern.
 
     Args:
         conn: Open cell connection.
@@ -1207,20 +1245,42 @@ def scan_sessions(conn: sqlite3.Connection, size_cache: dict) -> dict:
     return {'synced': synced, 'chunks': chunks}
 
 
-# Legacy compat — mcp_server._background_indexer imports this
-def process_queue(conn: sqlite3.Connection) -> dict:
-    """Legacy queue drain — delegates to scan_sessions."""
+# Compatibility wrapper for background-indexer callers.
+def scan_primary_cell(conn: sqlite3.Connection) -> dict:
+    """Preserve the historical return shape over stat-based scanning."""
     stats = scan_sessions(conn, _global_size_cache)
     return {'processed': stats['synced'], 'embedded': stats['chunks']}
 
 
-# Global size cache for legacy process_queue() callers (mcp_server)
+# Backward-compatible alias for older callers.
+def process_queue(conn: sqlite3.Connection) -> dict:
+    return scan_primary_cell(conn)
+
+
+# Global size cache for background-indexer callers.
 _global_size_cache: dict = {}
 
 
-def bootstrap_claude_code_cell() -> Path:
-    """Create claude_code cell if not exists. Returns db path."""
-    existing = resolve_cell('claude_code')
+_DEFAULT_CC_DESCRIPTION = (
+    'Claude Code session provenance. Each doc is a session, '
+    'each chunk is a tool call/prompt/response.'
+)
+
+
+def bootstrap_claude_code_cell(
+    name: str = 'claude_code',
+    cell_type: str = 'claude-code',
+    description: str | None = None,
+) -> Path:
+    """Create a coding-agent cell with the CC canonical schema. Idempotent.
+
+    Defaults preserve the original behavior — existing CC callers pass
+    nothing and get a cell named 'claude_code' / cell_type='claude-code'.
+    Compatible coding-agent modules pass their own name/cell_type to reuse
+    the same substrate.
+    """
+    desc = description or _DEFAULT_CC_DESCRIPTION
+    existing = resolve_cell(name)
     if existing and existing.exists():
         return existing
 
@@ -1237,20 +1297,12 @@ def bootstrap_claude_code_cell() -> Path:
     if soma_ensure_tables:
         soma_ensure_tables(conn)
 
-    # Populate _meta
-    conn.execute(
-        "INSERT OR IGNORE INTO _meta VALUES ('description', ?)",
-        ('Claude Code session provenance. Each doc is a session, '
-         'each chunk is a tool call/prompt/response.',)
-    )
-    conn.execute(
-        "INSERT OR IGNORE INTO _meta VALUES ('cell_type', 'claude-code')"
-    )
+    conn.execute("INSERT OR IGNORE INTO _meta VALUES ('description', ?)", (desc,))
+    conn.execute("INSERT OR IGNORE INTO _meta VALUES ('cell_type', ?)", (cell_type,))
     conn.commit()
     conn.close()
 
-    register_cell('claude_code', str(db_path), cell_type='claude-code',
-                   description='Claude Code session provenance')
+    register_cell(name, str(db_path), cell_type=cell_type, description=desc)
     return db_path
 
 
@@ -1636,7 +1688,7 @@ def _run_enrichment_cycle(conn, graph_threshold=50):
 
     Steps: reembed sources (unconditional) → graph (if stale) → community labels
     (after graph) → file graph → delegation graph → fingerprints → repo_project
-    → delegation edge heal → NULL embed sweep → queue snapshot → view sync.
+    → delegation edge heal → NULL embed sweep → view sync.
     """
     t0 = time.time()
 
@@ -1650,7 +1702,7 @@ def _run_enrichment_cycle(conn, graph_threshold=50):
             print(f"[enrich] Reembed error: {e}", file=sys.stderr)
 
     # 2. Warmup rebuild — unconditional, decoupled from graph staleness.
-    # Per-session reactive updates happen in process_queue via _update_warmup(),
+    # Per-session reactive updates happen during scan_sessions() via _update_warmup(),
     # but the batch rebuild catches anything missed (e.g. backfill sessions).
     if rebuild_warmup_types:
         try:
@@ -1718,17 +1770,6 @@ def _run_enrichment_cycle(conn, graph_threshold=50):
     except Exception as e:
         print(f"[enrich] Embed sweep error: {e}", file=sys.stderr)
 
-    # 10. Queue depth snapshot — write to _ops for @health visibility
-    try:
-        qconn = sqlite3.connect(str(QUEUE_DB), timeout=5)
-        cc_depth = qconn.execute("SELECT COUNT(*) FROM claude_code_pending").fetchone()[0]
-        qconn.close()
-        log_op(conn, 'queue_snapshot', 'queue.db',
-               params={'claude_code': cc_depth})
-        conn.commit()
-    except Exception:
-        pass  # non-critical metric
-
     # 10. View auto-sync — install views if .sql files changed since last install
     try:
         _check_and_sync_views(conn)
@@ -1749,7 +1790,6 @@ def daemon_loop(interval=2):
 
     print("[flex-worker] Starting chunk-atom daemon", file=sys.stderr)
     print(f"  Target: {cell_path}", file=sys.stderr)
-    print(f"  Queue: {QUEUE_DB}", file=sys.stderr)
     print(f"  Interval: {interval}s", file=sys.stderr)
 
     # Pre-warm embedder
@@ -1816,6 +1856,27 @@ def daemon_loop(interval=2):
             except Exception as e:
                 print(f"[worker] Secondary cell drain error: {e}", file=sys.stderr)
 
+        # Markdown vault scan (lifecycle='watch' cells)
+        if _markdown_scanner:
+            try:
+                _markdown_scanner()
+            except Exception as e:
+                print(f"[worker] Markdown scan error: {e}", file=sys.stderr)
+
+        # Coding-agent local source scan (lifecycle='watch' + refresh_module)
+        if _coding_agent_scanner:
+            try:
+                watch_stats = _coding_agent_scanner(
+                    min_interval_s=CODING_AGENT_WATCH_INTERVAL
+                )
+                if watch_stats.get("refreshed", 0) > 0:
+                    print(
+                        f"[worker] coding-agent refreshed={watch_stats['refreshed']}",
+                        file=sys.stderr,
+                    )
+            except Exception as e:
+                print(f"[worker] Coding-agent scan error: {e}", file=sys.stderr)
+
         # SOMA identity heal + optional eternity backup (24h cycle)
         if soma_heal and time.time() - last_soma_heal > 24 * 3600:
             try:
@@ -1859,7 +1920,7 @@ if __name__ == "__main__":
     import argparse
     parser = argparse.ArgumentParser()
     parser.add_argument("--daemon", action="store_true", help="Run as daemon")
-    parser.add_argument("--interval", type=int, default=2, help="Queue poll interval")
+    parser.add_argument("--interval", type=int, default=2, help="Scan interval")
     args = parser.parse_args()
 
     if args.daemon:
@@ -1873,6 +1934,6 @@ if __name__ == "__main__":
         conn.execute("PRAGMA journal_mode=WAL")
         conn.execute("PRAGMA busy_timeout=30000")
         _ensure_content_tables(conn)
-        stats = process_queue(conn)
+        stats = scan_primary_cell(conn)
         conn.close()
         print(f"[worker] Done: {stats}")

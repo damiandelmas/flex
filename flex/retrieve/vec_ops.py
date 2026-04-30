@@ -20,6 +20,7 @@ import re
 import sys
 import time
 import uuid
+from datetime import datetime
 
 import numpy as np
 from typing import Optional, List, Dict, Any
@@ -34,6 +35,49 @@ try:
     _EXTRA_BOUNDARIES = registered_token_names()
 except ImportError:
     pass
+
+
+def _registered_token_names():
+    if _TOKEN_RESOLVER is None:
+        return _EXTRA_BOUNDARIES
+    try:
+        from flex.modules.query import registered_token_names
+        return registered_token_names()
+    except ImportError:
+        return _EXTRA_BOUNDARIES
+
+
+def _coerce_timestamp(value) -> Optional[float]:
+    """Best-effort timestamp coercion for mixed-format legacy cells."""
+    if value is None:
+        return None
+    if isinstance(value, (int, float)):
+        return float(value)
+
+    text = str(value).strip()
+    if not text:
+        return None
+
+    try:
+        return float(text)
+    except ValueError:
+        pass
+
+    # Legacy markdown/doc cells sometimes stored human-readable timestamps.
+    cleaned = re.sub(r'\s*\([^)]+\)\s*', ' ', text).strip()
+    for fmt in (
+        "%Y/%m/%d %H:%M",
+        "%Y-%m-%d %H:%M:%S",
+        "%Y-%m-%d %H:%M",
+        "%Y-%m-%dT%H:%M:%S",
+    ):
+        try:
+            return datetime.strptime(cleaned, fmt).timestamp()
+        except ValueError:
+            continue
+
+    print(f"VectorCache: skipping non-epoch timestamp {text!r}", file=sys.stderr)
+    return None
 
 
 class VectorCache:
@@ -130,10 +174,11 @@ class VectorCache:
                 for row in rows:
                     idx = self._id_to_idx.get(row[0])
                     if idx is not None:
-                        self.timestamps[idx] = float(row[1])
+                        ts = _coerce_timestamp(row[1])
+                        if ts is not None:
+                            self.timestamps[idx] = ts
         except Exception as e:
             print(f"VectorCache: timestamps load failed: {e}", file=sys.stderr)
-
 
     def search(self, query_vec: np.ndarray, *, pre_filter_ids: set = None,
                not_like_vec: np.ndarray = None,
@@ -379,7 +424,7 @@ def register_vec_ops(conn, caches: dict, embed_fn, cell_config: dict = None,
             pre_filter_sql = args[1] if len(args) > 1 else None
 
             # Parse tokens to extract query_text from similar: token
-            modifiers_preview = parse_modifiers(token_str, extra_boundaries=_EXTRA_BOUNDARIES)
+            modifiers_preview = parse_modifiers(token_str, extra_boundaries=_registered_token_names())
             query_text = modifiers_preview.get('similar')
             modifier_str = token_str
 
@@ -387,7 +432,7 @@ def register_vec_ops(conn, caches: dict, embed_fn, cell_config: dict = None,
         if cache is None or cache.matrix is None:
             return json.dumps([])
 
-        modifiers = parse_modifiers(modifier_str, extra_boundaries=_EXTRA_BOUNDARIES) if modifier_str else None
+        modifiers = parse_modifiers(modifier_str, extra_boundaries=_registered_token_names()) if modifier_str else None
 
         # SQL pre-filter: execute to get chunk IDs
         # Authorizer whitelist: pure SELECT only (READ=20, SELECT=21, FUNCTION=31, RECURSIVE=33)

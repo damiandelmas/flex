@@ -111,7 +111,8 @@ def _search_batched_numpy(emb_matrix, top_k, threshold, batch_size=2000):
 def build_similarity_graph(db: sqlite3.Connection, table: str = '_raw_sources',
                            id_col: str = 'id', embedding_col: str = 'embedding',
                            threshold: float = 0.5, top_k: int = None,
-                           where: str = None, center: bool = False):
+                           where: str = None, center: bool = False,
+                           extra_edges: list = None):
     """
     Build similarity graph from embeddings.
 
@@ -130,6 +131,10 @@ def build_similarity_graph(db: sqlite3.Connection, table: str = '_raw_sources',
         center: If True, subtract corpus mean before similarity computation.
                 Removes shared embedding direction, making pairwise similarity
                 reflect topical differences rather than shared vocabulary.
+        extra_edges: Optional list of (src_id, dst_id, weight) tuples to inject
+                     into the graph alongside embedding edges. Useful for
+                     pre-existing edge sources (e.g. wikilinks). Max-weight on
+                     collision with embedding edges.
 
     Returns:
         (NetworkX graph, edge_count) or (None, 0)
@@ -201,6 +206,20 @@ def build_similarity_graph(db: sqlite3.Connection, table: str = '_raw_sources',
             seen.add(key)
             G.add_edge(item_ids[i], item_ids[j], weight=sim)
             edge_count += 1
+
+    # Inject caller-provided edges (e.g. wikilinks, citation links)
+    if extra_edges:
+        extra_count = 0
+        for src, dst, weight in extra_edges:
+            if G.has_node(src) and G.has_node(dst) and src != dst:
+                if G.has_edge(src, dst):
+                    G[src][dst]['weight'] = max(G[src][dst]['weight'], weight)
+                else:
+                    G.add_edge(src, dst, weight=weight)
+                    edge_count += 1
+                    extra_count += 1
+        if extra_count:
+            print(f"  +{extra_count} extra edges injected")
 
     print(f"Graph: {G.number_of_nodes()} nodes, {edge_count} edges")
     return G, edge_count

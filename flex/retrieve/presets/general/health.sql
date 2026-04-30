@@ -28,15 +28,6 @@ SELECT
            0
        )) as sources_since_graph;
 
--- @query: queue
-SELECT
-    json_extract(params, '$.claude_code') as claude_code_pending,
-    datetime(timestamp, 'unixepoch', 'localtime') as checked_at
-FROM _ops
-WHERE operation = 'queue_snapshot'
-ORDER BY timestamp DESC
-LIMIT 1;
-
 -- @query: recent_ops
 SELECT operation, target,
     datetime(timestamp, 'unixepoch', 'localtime') as when_run,

@@ -19,10 +19,11 @@ WHERE NOT EXISTS (
 
 -- @query: timeline
 SELECT
+    key_reason,
     tool_name,
     COALESCE(target_file, substr(content, 1, 60)) as target,
     created_at as ts
-FROM messages
+FROM agent_key_chunks
 WHERE session_id LIKE '%' || :session || '%'
 ORDER BY position
 LIMIT 100;

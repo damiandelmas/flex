@@ -404,15 +404,16 @@ def _pass_old_blob_hash(conn, dry_run=False, limit=0):
 
 def main():
     parser = argparse.ArgumentParser(description="SOMA identity heal — backfill missing edges")
+    parser.add_argument("--cell", default="claude_code", help="Cell name to heal (default: claude_code)")
     parser.add_argument("--dry-run", action="store_true", help="Report gaps only")
     parser.add_argument("--limit", type=int, default=0, help="Limit per pass")
     parser.add_argument("--pass", dest="pass_name", choices=["file", "content", "url", "old_blob_hash"],
                         help="Run specific pass only")
     args = parser.parse_args()
 
-    cell_path = resolve_cell('claude_code')
+    cell_path = resolve_cell(args.cell)
     if not cell_path:
-        print("[heal] FATAL: claude_code cell not found", file=sys.stderr)
+        print(f"[heal] FATAL: {args.cell} cell not found", file=sys.stderr)
         sys.exit(1)
 
     conn = sqlite3.connect(str(cell_path), timeout=30.0)
@@ -435,7 +436,10 @@ def main():
     if args.pass_name:
         passes[args.pass_name](conn, dry_run=args.dry_run, limit=args.limit)
     else:
-        for fn in passes.values():
+        for name, fn in passes.items():
+            if name == "old_blob_hash" and args.cell != "claude_code":
+                print("[heal] skipping old_blob_hash pass for non-Claude cell", file=sys.stderr)
+                continue
             fn(conn, dry_run=args.dry_run, limit=args.limit)
 
     elapsed = time.time() - t0

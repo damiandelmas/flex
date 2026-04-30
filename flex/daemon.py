@@ -1,16 +1,16 @@
 """
-Unified flex daemon — single process for all cell lifecycle.
-
-No cron needed. One systemd service does everything.
+Flex daemon — local capture/watch process plus optional background loops.
 
 Usage:
-    python -m flex.daemon                   # foreground
-    python -m flex.daemon --interval 5      # custom local scan interval
-    python -m flex.daemon --no-background  # disable background tasks
-    python -m flex.daemon --no-refresh      # disable refresh cycle
+    python -m flex.daemon                                  # all loops
+    python -m flex.daemon --interval 5                     # custom local scan interval
+    python -m flex.daemon --no-background                  # disable background tasks
+    python -m flex.daemon --no-refresh                     # disable refresh cycle
+    python -m flex.daemon --no-refresh --no-background     # local worker service
 
 Systemd:
-    ExecStart=/path/to/venv/bin/python -m flex.daemon
+    flex-worker.service runs local-only.
+    flex-refresh.timer runs python -m flex.refresh on a schedule.
 """
 
 import argparse
@@ -111,7 +111,7 @@ def main():
         print("[flex-daemon] Another instance is already running. Exiting.", file=sys.stderr)
         sys.exit(1)
 
-    parser = argparse.ArgumentParser(description="Flex daemon — unified cell lifecycle")
+    parser = argparse.ArgumentParser(description="Flex daemon — local capture/watch lifecycle")
     parser.add_argument("--interval", type=int, default=2,
                         help="Local cell scan interval in seconds (default: 2)")
     parser.add_argument("--remote-interval", type=int, default=60,

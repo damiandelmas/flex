@@ -13,6 +13,7 @@ View generation lives in views.py (same package).
 
 import json
 import sqlite3
+from pathlib import Path
 from typing import Optional
 
 # Re-export for backward compatibility — callers can import from either module
@@ -29,6 +30,31 @@ def open_cell(db_path: str) -> sqlite3.Connection:
     db.execute("PRAGMA journal_mode=WAL")
     db.execute("PRAGMA max_page_count=1048576")  # 4GB ceiling (1M × 4KB pages)
     return db
+
+
+def open_cell_readonly(db_path: str | Path) -> sqlite3.Connection:
+    """Open a cell for query reads, falling back to immutable SQLite URI.
+
+    Some sandboxed agent seats can read a cell file but cannot create SQLite
+    lock/journal side files next to it. Normal ``open_cell`` is still the
+    write-capable runtime opener; this read path tolerates those sandboxes.
+    """
+    path = Path(db_path)
+    try:
+        return open_cell(str(path))
+    except sqlite3.OperationalError:
+        db = sqlite3.connect(
+            f"file:{path}?mode=ro&immutable=1",
+            uri=True,
+            check_same_thread=False,
+            timeout=10,
+        )
+        db.execute("PRAGMA schema_version").fetchone()
+        db.row_factory = sqlite3.Row
+        db.execute("PRAGMA query_only=ON")
+        db.execute("PRAGMA cache_size=-20000")
+        db.execute("PRAGMA temp_store=MEMORY")
+        return db
 
 
 def run_sql(db: sqlite3.Connection, query: str,

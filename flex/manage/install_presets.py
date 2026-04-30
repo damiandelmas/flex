@@ -14,6 +14,7 @@ from pathlib import Path
 
 from flex.retrieve.presets import install_presets
 from flex.registry import resolve_cell, list_cells
+from flex.modules.specs import module_spec_for, normalize_cell_type, stock_subdirs
 
 # Preset source directories
 PRESET_ROOT = Path(__file__).resolve().parent.parent / "retrieve" / "presets"
@@ -21,19 +22,33 @@ GENERAL_DIR = PRESET_ROOT / "general"
 
 # Module-specific preset directories (keyed by cell_type from registry)
 MODULE_ROOT = Path(__file__).resolve().parent.parent / "modules"
-MODULE_PRESETS = {
-    'claude-code': [
-        MODULE_ROOT / "claude_code" / "stock" / "presets",
-        MODULE_ROOT / "soma"        / "stock" / "presets",
-    ],
+PUBLIC_PRESET_GROUPS = {
+    "claude_code": ("claude_code", "soma"),
 }
+
+
+def _stock_preset_dir(module_name: str) -> Path | None:
+    path = MODULE_ROOT / module_name / "stock" / "presets"
+    if path.exists() and any(path.glob("*.sql")):
+        return path
+    return None
 
 
 def _preset_dirs_for(cell_type: str | None) -> list[Path]:
     """Return preset directories for a cell type. General + module-specific."""
     dirs = [GENERAL_DIR]
-    if cell_type and cell_type in MODULE_PRESETS:
-        dirs.extend(MODULE_PRESETS[cell_type])
+    if module_spec_for(cell_type):
+        spec_dirs = stock_subdirs(cell_type, "presets_from", "presets")
+        dirs.extend(spec_dirs)
+    else:
+        normalized = normalize_cell_type(cell_type)
+        module_names = PUBLIC_PRESET_GROUPS.get(
+            normalized, (normalized,) if normalized else ()
+        )
+        for module_name in module_names:
+            path = _stock_preset_dir(module_name)
+            if path:
+                dirs.append(path)
     return dirs
 
 

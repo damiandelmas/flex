@@ -4,17 +4,20 @@
 # Usage:
 #   curl -sSL https://getflex.dev/install.sh | bash                    # base (flex index only)
 #   curl -sSL https://getflex.dev/install.sh | bash -s -- claude-code  # + sessions, worker, MCP
+#   curl -sSL https://getflex.dev/install.sh | bash -s -- obsidian     # + auto-detect vault, index, MCP
 #
 # Options (via env vars or flags):
-#   FLEX_VERSION=0.10.0    pin a specific version
-#   --uninstall           remove flex completely
-#   --reinstall           wipe venv and reinstall from scratch
-#   --no-init             install only, skip flex init
-#   --help                show usage
+#   FLEX_VERSION=0.20.0     pin a specific version (default: fetched from getflex.dev)
+#   VAULT=/path/to/vault    specify Obsidian vault path (obsidian module)
+#   --uninstall            remove flex completely
+#   --reinstall            wipe venv and reinstall from scratch
+#   --no-init              install only, skip flex init
+#   --help                 show usage
 #
 # Modules:
-#   claude-code           scan sessions, start worker, register MCP
-#   (default)             base install — flex index, flex search, no module
+#   claude-code            scan sessions, start worker, register MCP
+#   obsidian               index Obsidian vault, start worker, register MCP
+#   (default)              base install — flex index, flex search, no module
 
 main() {
     set -eo pipefail
@@ -70,6 +73,7 @@ main() {
                 echo ""
                 echo "Modules:"
                 echo "  claude-code     scan sessions, start worker, register MCP"
+                echo "  obsidian        index Obsidian vault, start worker, register MCP"
                 echo "  (none)          base install — flex index, flex search"
                 echo ""
                 echo "Options:"
@@ -78,7 +82,8 @@ main() {
                 echo "  --no-init       install only, skip flex init"
                 echo ""
                 echo "Environment:"
-                echo "  FLEX_VERSION    pin a specific version (e.g. 0.10.0)"
+                echo "  FLEX_VERSION    pin a specific version (default: latest from getflex.dev)"
+                echo "  VAULT           Obsidian vault path (obsidian module only)"
                 exit 0
                 ;;
             --*)
@@ -212,7 +217,19 @@ main() {
     fi
 
     # ── Install getflex ──────────────────────────────────────────
-    FLEX_VERSION="${FLEX_VERSION:-0.10.0}"
+    # Resolve version: env var override → latest.txt fetch → hard fail
+    if [ -z "${FLEX_VERSION:-}" ]; then
+        _spin_start "version" "fetching latest"
+        FLEX_VERSION=$(curl -sSLf --retry 2 --max-time 10 \
+            https://getflex.dev/releases/latest.txt 2>/dev/null | tr -d '[:space:]')
+        _spin_stop
+        if [ -z "$FLEX_VERSION" ]; then
+            fail "Failed to fetch latest version from getflex.dev.\n  Check https://getflex.dev or set FLEX_VERSION=X.Y.Z manually."
+        fi
+        ok "version" "$FLEX_VERSION"
+    else
+        ok "version" "$FLEX_VERSION (pinned)"
+    fi
 
     # Skip if already on target version (unless --reinstall)
     local _cur_ver
@@ -330,6 +347,9 @@ main() {
         local _init_args=""
         if [ -n "$MODULE" ]; then
             _init_args="--module $MODULE"
+        fi
+        if [ "$MODULE" = "obsidian" ] && [ -n "${VAULT:-}" ]; then
+            _init_args="$_init_args --vault $VAULT"
         fi
 
         # Reconnect /dev/tty so flex init can prompt interactively

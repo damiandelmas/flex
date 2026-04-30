@@ -57,15 +57,47 @@ MAX_CONTENT_CHARS = 200      # truncate content reps
 MAX_CONTENT_SENTS = 3        # max sentences per content rep
 MAX_LINES = 70               # safety net — trim lowest-entropy lines
 
+_NOISE_PREFIXES = (
+    'chunk id:',
+    'wall time:',
+    'process exited with code',
+    'process running with session id',
+    'original token count:',
+    'output:',
+    'stdout:',
+    'stderr:',
+)
+
 
 # ---------------------------------------------------------------------------
 # Helpers
 # ---------------------------------------------------------------------------
 
+def _is_noise_content(text):
+    """True for runtime telemetry accidentally stored as message content."""
+    if not text or not text.strip():
+        return True
+
+    lines = [line.strip() for line in text.strip().splitlines() if line.strip()]
+    if not lines:
+        return True
+
+    head = lines[:8]
+    noisy = sum(1 for line in head if line.lower().startswith(_NOISE_PREFIXES))
+    if noisy >= 2:
+        return True
+    if noisy == 1 and len(lines) <= 3:
+        return True
+    return False
+
+
 def _is_content_chunk(chunk):
     """True if chunk carries human-readable text (not a tool call)."""
     tool = chunk.get('tool_name')
     if tool and tool not in ('UserPrompt',):
+        return False
+    content = chunk.get('content')
+    if content is not None and _is_noise_content(content):
         return False
     return True
 
@@ -109,6 +141,16 @@ def _dedup_reps(reps):
             scored = sorted(group, key=lambda r: _text_entropy(r['text']), reverse=True)
             deduped.extend(scored[:MAX_REPS_PER_POSITION])
     return deduped
+
+
+def _prioritize_content_lead(lines):
+    """Keep evidence lines, but do not let a tool-only run name a session."""
+    if not lines or not lines[0][1].startswith('>'):
+        return lines
+    for idx, (_, line) in enumerate(lines):
+        if not line.startswith('>'):
+            return [lines[idx]] + lines[:idx] + lines[idx + 1:]
+    return lines
 
 
 # ---------------------------------------------------------------------------
@@ -423,6 +465,7 @@ def build_fingerprint(chunks, labels_unused=None, embed_fn=None, span_embeddings
         content = content_scored[:budget]
         lines = sorted(tool + content, key=lambda x: x[0])
 
+    lines = _prioritize_content_lead(lines)
     return '\n'.join(line for _, line in lines)
 
 
@@ -465,4 +508,5 @@ def build_short_fingerprint(chunks):
     if not lines:
         return None
 
+    lines = _prioritize_content_lead(lines)
     return '\n'.join(line for _, line in lines)

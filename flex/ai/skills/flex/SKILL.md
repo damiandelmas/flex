@@ -1,6 +1,6 @@
 ---
 name: flex
-description: Search Claude Code session history via the flex MCP server. Covers decision archaeology, file lineage, weekly digests, and semantic search. Use when the user asks about past sessions, file history, why something was done, or what happened recently.
+description: Search knowledge cells via the flex MCP server. Use when the user asks to flex, search conversations, memories, changes, documentation, session history, or knowledge bases.
 allowed-tools:
   - mcp__flex__flex_search
 user-invocable: true
@@ -9,73 +9,275 @@ argument-hint: "what to search for (e.g., 'history of auth.py', 'what did we bui
 
 # Flex Search
 
-Search the user's Claude Code session history. The MCP tool documentation covers syntax — this skill covers methodology.
+Flex indexes the user's conversations and knowledge bases. Each cell is a self-describing SQLite database with chunks, embeddings, and graph intelligence. Use when the user asks to "flex" or search their conversations, memories, changes, documentation, or knowledge.
 
-## Setup
+Single endpoint: `mcp__flex__flex_search`. Two params: `query` (SQL or `@preset`) and `cell` (cell name).
 
-Requires the flex MCP server. If `mcp__flex__flex_search` is not available, run the setup script:
+Every query must be valid SQL or a `@preset`. Plain text is not accepted; wrap it in `keyword()` or `vec_ops()`.
 
-```bash
-bash scripts/setup.sh
+# RETRIEVAL
+
+Pipeline: SQL -> vec_ops -> SQL. Phase 1 narrows with SQL. Phase 2 scores with embeddings. Phase 3 composes with SQL.
+
+Scores are ordinal within a query. Do not compare scores across queries with different tokens.
+
+## PHASE 1: SQL PRE-FILTER
+
+The second argument to `vec_ops` narrows candidates **before** scoring. Push every known constraint here.
+
+A `WHERE` clause after `vec_ops` filters **after** the pool is filled; sparse post-filters (hitting <5% of chunks) cause pool starvation, for example 500 candidates scored, then `WHERE` drops 498. Pre-filter prevents this.
+
+```sql
+SELECT id FROM chunks WHERE type = 'user_prompt'
+SELECT id FROM chunks WHERE session_id LIKE 'abc123%'
+SELECT id FROM chunks WHERE tool_name = 'Edit'
+SELECT id FROM chunks WHERE created_at >= date('now', '-7 days')
+SELECT id FROM chunks WHERE type = 'user_prompt'
 ```
 
-Or install manually: `curl -sSL https://getflex.dev/install.sh | bash`
+## PHASE 2: VECTOR OPERATIONS (vec_ops)
 
-After install, restart Claude Code and type `/mcp` to verify.
+Scores candidates using embeddings. Tokens reshape scoring before selection: spread across subtopics, suppress a dominant theme, weight recency, search from examples, or trace a direction.
 
-## Start Here
+Tokens compose freely in one pass. Returns `(id, score)` pairs for Phase 3.
 
-Run `@orient` first. Always. It returns the schema, views, and presets. Never assume column names.
+```sql
+vec_ops('similar:query_text tokens', 'pre_filter_sql')
+```
 
-## Question Types
+**IMPORTANT:** `vec_ops` is a table source; always after `FROM` or `JOIN`:
 
-### Decision Archaeology
+```sql
+FROM vec_ops('similar:how the authentication system evolved over time diverse decay:7') v
+```
 
-*"Why did we do it this way?"*
+The `similar:` text is embedded. Bare keywords cast a wide net; natural language (5-15 words) narrows focus.
 
-1. Broad semantic search for the topic
-2. Narrow by project or time range from what you find
-3. Pull the session where the decision happened
-4. Surface the exact user prompts and assistant responses — the user wants to see what was said, not a summary
+### Modulation Tokens
 
-### File Lineage
+Tokens compose:
 
-*"What's the history of this file?"*
+```text
+similar:how we handle auth and token refresh diverse suppress:JWT rotation boilerplate decay:7
+```
 
-Use `@file path=src/auth.py` — it resolves identity across renames automatically.
+#### diverse
 
-### Weekly Digest
+MMR; penalizes similarity to already-selected results. Use for breadth across subtopics.
 
-*"What did we build this week?"*
+#### suppress:TEXT
 
-Use `@digest days=7`. Follow up with specific queries on anything interesting.
+Embeds `TEXT`, demotes chunks similar to it. Suppresses the dominant signal so edges surface.
 
-### Session Details
+Stack multiple: `suppress:deployment pipeline suppress:CI/CD configuration`.
 
-*"Tell me about session X"*
+Aim at the dominant cluster theme, not the whole topic.
 
-Use `@story session={session_id}`.
+#### decay:N
 
-### Concept Lineage
+Temporal decay. N-day half-life. `decay:7` = weekly. `decay:1` = aggressive. `decay:0` = disabled.
 
-*"How did our auth approach evolve?"*
+#### centroid:id1,id2,...
 
-Use `@genealogy concept=authentication`. Traces a concept across sessions and surfaces hubs.
+Mean embedding of given chunk IDs as query. Use when examples define a concept better than words.
 
-### Semantic Search
+#### from:TEXT to:TEXT
 
-*"Find sessions about X but not Y"*
+Direction vector through embedding space. Finds content along the conceptual arc between two ideas.
 
-Use `suppress:` to push a dominant topic out. Use `diverse` for breadth. Use `decay:N` for recency. These compose — the MCP tool docs have the full token reference.
+Anchors should be contrasting concepts: `from:quick hacky prototype to:principled production system`.
 
-## Methodology
+#### pool:N
 
-1. **Orient first.** `@orient` before anything. The cell describes itself.
-2. **Presets first.** If a preset fits, use it. They encode multi-query workflows in one call.
-3. **Discover then narrow.** First query broad, let results redirect. Pre-filter the next query with what you find.
-4. **Push constraints early.** Known session, project, date? SQL pre-filter before scoring — not after.
-5. **Exact terms use keyword.** Function names, error strings, UUIDs — semantic search won't find these. Use `keyword('term')`.
-6. **Include excerpts.** Always surface actual user prompts and assistant responses. Never summarize what you can quote.
+Candidate pool size (default 500). Increase if post-filter `WHERE` is sparse: `pool:2000`.
+
+### Examples
+
+Broad survey with recency:
+
+```sql
+SELECT v.id, v.score, c.content, c.session_id
+FROM vec_ops('similar:key decisions tradeoffs and design choices we made this week diverse decay:7',
+  'SELECT id FROM chunks WHERE type = ''user_prompt''') v
+JOIN chunks c ON v.id = c.id
+ORDER BY v.score DESC LIMIT 15
+```
+
+Suppress dominant theme to find edges:
+
+```sql
+SELECT v.id, v.score, c.content
+FROM vec_ops('similar:what else happened beyond the main refactor this week diverse suppress:deployment pipeline suppress:CI configuration',
+  'SELECT id FROM chunks WHERE created_at >= date(''now'', ''-7 days'')') v
+JOIN chunks c ON v.id = c.id
+ORDER BY v.score DESC LIMIT 10
+```
+
+Trajectory; conceptual evolution:
+
+```sql
+SELECT v.id, v.score, c.content
+FROM vec_ops('similar:how the system architecture evolved from:monolithic worker to:cell-based design') v
+JOIN chunks c ON v.id = c.id
+ORDER BY v.score DESC LIMIT 10
+```
+
+### Edge Cases
+
+- `diverse` is boolean; no parameter.
+- `decay:0` disables decay, `pool:0` falls back to default (500).
+- One `vec_ops` per query. For multiple, use CTEs: `WITH a AS (SELECT * FROM vec_ops(...) v) SELECT * FROM a`.
+- Some sessions have `NULL` graph columns (`centrality`, `community`); enrichment runs every 30 min. Use `COALESCE`.
+
+## PHASE 3: SQL COMPOSITION
+
+Join scored results back to views, boost with graph metadata, group, filter, paginate.
+
+```sql
+SELECT v.id, v.score, c.content
+FROM vec_ops('similar:authentication patterns and middleware design') v
+JOIN chunks c ON v.id = c.id
+ORDER BY v.score DESC LIMIT 10
+```
+
+# RECIPES
+
+**Structural** (no embeddings; free):
+
+```sql
+SELECT project, COUNT(*) as sessions
+FROM sessions GROUP BY project ORDER BY sessions DESC
+```
+
+**Semantic search** (the skeleton):
+
+```sql
+SELECT v.id, v.score, c.content
+FROM vec_ops('similar:YOUR TOPIC IN NATURAL LANGUAGE', 'PRE_FILTER') v
+JOIN chunks c ON v.id = c.id
+ORDER BY v.score DESC LIMIT 10
+```
+
+Pre-filter examples:
+
+- Session scope: `'SELECT id FROM chunks WHERE session_id LIKE ''abc%'''`
+- User messages: `'SELECT id FROM chunks WHERE type = ''user_prompt'''`
+- Recent: `'SELECT id FROM chunks WHERE created_at >= date(''now'', ''-7 days'')'`
+- By project: `'SELECT id FROM chunks WHERE session_id IN (SELECT session_id FROM sessions WHERE project = ''myapp'')'`
+- Files only: `'SELECT id FROM chunks WHERE type = ''file'''`
+- No filter: omit or `''`
+
+**Exact term** (FTS5; filename, error, function name, UUID):
+
+```sql
+SELECT k.id, k.rank, k.snippet, c.content
+FROM keyword('term') k
+JOIN chunks c ON k.id = c.id
+ORDER BY k.rank DESC LIMIT 10
+-- keyword() is a table source — always after FROM or JOIN.
+-- Returns (id, rank, snippet). rank is positive — higher = better.
+```
+
+**Scoped keyword** (pre-filter restricts which chunks BM25 ranks; prevents pool starvation):
+
+```sql
+SELECT k.id, k.rank, k.snippet, c.content
+FROM keyword('authentication', 'SELECT id FROM chunks WHERE type = ''user_prompt''') k
+JOIN chunks c ON k.id = c.id
+ORDER BY k.rank DESC LIMIT 10
+-- 2nd arg = pre-filter SQL (must start with SELECT). Same pattern as vec_ops.
+-- Without pre-filter, BM25 ranks globally — scoped post-filters starve the pool.
+```
+
+**Hybrid intersection** (BOTH keyword and semantic; empty results mean no overlap, not broken syntax):
+
+```sql
+SELECT k.id, k.rank, v.score, c.content
+FROM keyword('sdk') k
+JOIN vec_ops('similar:cell creation pipeline and programmatic ingest workflow') v ON k.id = v.id
+JOIN chunks c ON k.id = c.id
+ORDER BY v.score DESC LIMIT 10
+```
+
+**FTS as pre-filter** (semantic results scoped to keyword matches):
+
+```sql
+SELECT v.id, v.score, c.content
+FROM vec_ops('similar:error handling and retry patterns',
+  'SELECT c.id FROM chunks_fts f JOIN _raw_chunks c ON f.rowid = c.rowid
+   WHERE chunks_fts MATCH ''timeout''') v
+JOIN chunks c ON v.id = c.id
+ORDER BY v.score DESC LIMIT 10
+```
+
+**Hub navigation** (most connected sessions):
+
+```sql
+SELECT v.id, v.score, s.title, s.centrality
+FROM vec_ops('similar:the main architectural decisions and system design') v
+JOIN chunks c ON v.id = c.id
+JOIN sessions s ON c.session_id = s.session_id
+WHERE s.is_hub = 1
+ORDER BY s.centrality DESC LIMIT 5
+```
+
+**File search:**
+
+```sql
+-- By path (structural, no embeddings)
+SELECT file, section, ext, substr(content, 1, 200)
+FROM chunks WHERE type = 'file' AND file LIKE '%/changes/code/2603%'
+ORDER BY created_at DESC LIMIT 10
+```
+
+```sql
+-- Semantic within files
+SELECT v.id, v.score, c.file, c.section, substr(c.content, 1, 200)
+FROM vec_ops('similar:how authentication middleware validates tokens', 'SELECT id FROM chunks WHERE type = ''file''') v
+JOIN chunks c ON v.id = c.id
+ORDER BY v.score DESC LIMIT 10
+```
+
+**One-liners:**
+
+- Session: `WHERE session_id LIKE 'd332a1a0%'`
+- Type: `WHERE type = 'file'` / `'user_prompt'` / `'tool_call'`
+- Extension: `WHERE ext = 'py'`
+- Drill-down: `@story session=d332a1a0`
+
+# METHODOLOGY
+
+**Right mode for the task:**
+
+- Known path/name -> `WHERE file LIKE '%pattern%'` (structural, free)
+- Known exact term -> `keyword('term')` (FTS5)
+- Conceptual/fuzzy -> `vec_ops('similar:...')` (semantic)
+
+Start with `@orient`. Then `PRAGMA table_info(chunks)` to discover columns; they differ per cell.
+
+**Structural first.** `GROUP BY` / `COUNT(*)` / `DISTINCT` cost nothing. Get the shape before going semantic.
+
+**Discover then narrow.** Broad `vec_ops` -> find themes -> pre-filter next query with findings.
+
+Push constraints into the pre-filter (2nd arg), not `WHERE` after `vec_ops`.
+
+**Pivot on mode shift.** Theme -> quantify with `GROUP BY`. ID -> exact retrieval with `JOIN` + `ORDER BY position`.
+
+**Cross-cell** when needed. Different cells have different columns and date ranges.
+
+Column names vary: `created_at` (`claude_code`), `timestamp`, `file_date` (other cells). Always `PRAGMA` first.
+
+# PRESETS
+
+Use presets when possible. `@name` as the query. `@orient` discovers all presets per cell.
+
+Positional args: `@story session=abc123`, `@digest days=14`.
+
+# EXTREMELY IMPORTANT: ALWAYS START WITH @orient FOR THE REQUESTED CELL
+
+**`query="@orient"`, `cell="cell_name"`**
+
+Returns cell schema, views, hubs, presets. Do this BEFORE any other queries.
 
 # Final
 

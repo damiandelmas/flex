@@ -81,7 +81,7 @@ class PresetLoader:
         if preset['multi']:
             results = []
             for query in preset['queries']:
-                sql = self._interpolate(query['sql'], params)
+                sql, positional = self._interpolate(query['sql'], params)
                 sql = self._materialize_vec_ops(db, sql)
                 if sql.startswith('{"error"'):
                     results.append({
@@ -90,7 +90,7 @@ class PresetLoader:
                     })
                     continue
                 try:
-                    rows = db.execute(sql).fetchall()
+                    rows = db.execute(sql, positional).fetchall()
                     results.append({
                         'query': query['name'],
                         'results': [dict(r) for r in rows]
@@ -102,11 +102,11 @@ class PresetLoader:
                     })
             return results
         else:
-            sql = self._interpolate(preset['queries'][0]['sql'], params)
+            sql, positional = self._interpolate(preset['queries'][0]['sql'], params)
             sql = self._materialize_vec_ops(db, sql)
             if sql.startswith('{"error"'):
                 return [{"error": sql}]
-            rows = db.execute(sql).fetchall()
+            rows = db.execute(sql, positional).fetchall()
             return [dict(r) for r in rows]
 
     @staticmethod
@@ -212,17 +212,26 @@ class PresetLoader:
         return preset
 
     @staticmethod
-    def _interpolate(sql: str, params: dict) -> str:
-        """Replace :named_params with values (escaped)."""
-        for key, value in params.items():
-            placeholder = f":{key}"
-            if placeholder in sql:
-                if isinstance(value, str):
-                    escaped = value.replace("'", "''")
-                    sql = sql.replace(placeholder, f"'{escaped}'")
-                else:
-                    sql = sql.replace(placeholder, str(value))
-        return sql
+    def _interpolate(sql: str, params: dict) -> tuple[str, list]:
+        """Convert ``:named`` placeholders to ``?`` and return positional params.
+
+        H3 — replaces the previous manual ``''`` escaping with native SQLite
+        parameterization. Returns ``(rewritten_sql, positional_values)``.
+        Placeholders not present in ``params`` are left untouched so SQLite
+        surfaces a clear error (rather than silently stripping them).
+        """
+        positional: list = []
+
+        def _sub(match: re.Match) -> str:
+            key = match.group(1)
+            if key not in params:
+                return match.group(0)  # leave untouched; SQLite will raise
+            positional.append(params[key])
+            return '?'
+
+        # Match ``:name`` word-boundary placeholders. Skip ``::`` (type casts).
+        new_sql = re.sub(r'(?<!:):([A-Za-z_][A-Za-z0-9_]*)', _sub, sql)
+        return new_sql, positional
 
 
 def install_presets(db: sqlite3.Connection, preset_dir: Path):
