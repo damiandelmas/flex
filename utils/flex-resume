@@ -1,0 +1,91 @@
+#!/usr/bin/env bash
+
+# flex-resume: resume a Claude Code session by id from any project.
+#
+# Usage:
+#   flex-resume <session-id-or-prefix>
+#
+# Claude Code stores sessions under ~/.claude/projects/<encoded-project>/*.jsonl.
+# This helper finds the session globally, makes it visible from the current
+# project when needed, then resumes it from the session's recorded cwd.
+
+set -euo pipefail
+
+usage() {
+    echo "Usage: flex-resume <session-id-or-prefix>" >&2
+}
+
+if [[ $# -ne 1 || -z "${1:-}" ]]; then
+    usage
+    exit 1
+fi
+
+SESSION_ID="$1"
+CLAUDE_PROJECTS="${CLAUDE_PROJECTS:-$HOME/.claude/projects}"
+
+if [[ ! -d "$CLAUDE_PROJECTS" ]]; then
+    echo "Error: Claude projects directory not found at $CLAUDE_PROJECTS" >&2
+    exit 1
+fi
+
+SESSION_FILE="$(
+    find "$CLAUDE_PROJECTS" -name "${SESSION_ID}*.jsonl" -type f 2>/dev/null \
+        | sort \
+        | head -n 1
+)"
+
+if [[ -z "$SESSION_FILE" ]]; then
+    echo "Error: session '$SESSION_ID' not found under $CLAUDE_PROJECTS" >&2
+    exit 1
+fi
+
+if [[ ! -s "$SESSION_FILE" ]]; then
+    echo "Error: session file is empty: $SESSION_FILE" >&2
+    exit 1
+fi
+
+FULL_SESSION_ID="$(basename "$SESSION_FILE" .jsonl)"
+CURRENT_PROJECT_DIR="$(pwd)"
+PROJECT_ENCODED="$(printf '%s' "$CURRENT_PROJECT_DIR" | sed 's#/#-#g' | sed 's#^-##')"
+CURRENT_CLAUDE_DIR="$CLAUDE_PROJECTS/-${PROJECT_ENCODED}"
+SESSION_PROJECT_DIR="$(dirname "$SESSION_FILE")"
+
+mkdir -p "$CURRENT_CLAUDE_DIR"
+
+if [[ "$SESSION_PROJECT_DIR" != "$CURRENT_CLAUDE_DIR" ]]; then
+    SYMLINK_PATH="$CURRENT_CLAUDE_DIR/${FULL_SESSION_ID}.jsonl"
+    rm -f "$SYMLINK_PATH"
+    ln -s "$SESSION_FILE" "$SYMLINK_PATH"
+fi
+
+CWD="$(
+    python3 - "$SESSION_FILE" <<'PY'
+import json
+import sys
+
+path = sys.argv[1]
+with open(path, "r", encoding="utf-8", errors="ignore") as handle:
+    for _, line in zip(range(200), handle):
+        try:
+            row = json.loads(line)
+        except json.JSONDecodeError:
+            continue
+        cwd = row.get("cwd")
+        if isinstance(cwd, str) and cwd:
+            print(cwd)
+            break
+PY
+)"
+
+if [[ -z "$CWD" || ! -d "$CWD" ]]; then
+    echo "Warning: could not determine original cwd; using current directory." >&2
+    CWD="$CURRENT_PROJECT_DIR"
+fi
+
+echo "Found session: $SESSION_FILE"
+echo "Working directory: $CWD"
+echo "Resuming session..."
+echo
+
+cd "$CWD"
+exec claude -r "$FULL_SESSION_ID"
