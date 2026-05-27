@@ -253,22 +253,30 @@ def main():
     args = parser.parse_args()
 
     from flex.mcp_server import init
+    from flex.instructions import ensure_instructions_cell
+
+    ensure_instructions_cell()
 
     # Discover cells: --cell flags override, otherwise scan filesystem
     if args.cell:
         cell_names = args.cell
         active_names = args.cell  # explicit --cell = activate everything requested
+        restrict_to_cells = True
     else:
         from flex.mcp_server import discover_cells
         from flex.registry import discover_active_cells
         cell_names = discover_cells()
         active_names = discover_active_cells()
-        inactive_names = sorted(set(cell_names) - set(active_names))
+        restrict_to_cells = False
         print(f"[flex-mcp] Discovered {len(cell_names)} cells: {cell_names}", file=sys.stderr)
-        if inactive_names:
-            print(f"[flex-mcp] Inactive (lazy-load): {inactive_names}", file=sys.stderr)
 
-    init(cell_names, active_names=active_names, no_embed=args.no_embed, warm=False)
+    init(
+        cell_names,
+        active_names=active_names,
+        no_embed=args.no_embed,
+        warm=False,
+        restrict_to_cells=restrict_to_cells,
+    )
 
     print(f"[flex-mcp] Ready", file=sys.stderr)
 

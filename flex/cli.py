@@ -133,12 +133,23 @@ def _install_claude_assets():
     """Copy public Flex skill assets from package ai/ dir to ~/.claude/."""
     _INSTALL_FILES = {
         "skills/flex/",
+        "skills/flex-sessions/",
     }
 
-    # Subordinate: what we actually want to install right now
-    _INSTALL_ASSETS = [
-        "skills/flex/",
-    ]
+    skill_mode = os.environ.get("FLEX_SKILL_MODE", "mcp").strip().lower()
+    if skill_mode == "none":
+        _INSTALL_ASSETS = []
+    elif skill_mode in ("", "default", "mcp"):
+        _INSTALL_ASSETS = [
+            ("skills/flex/", "skills/flex/"),
+            ("skills/flex-sessions/", "skills/flex-sessions/"),
+        ]
+    else:
+        print(f"  [warn] FLEX_SKILL_MODE={skill_mode!r} is deprecated; installing MCP skills")
+        _INSTALL_ASSETS = [
+            ("skills/flex/", "skills/flex/"),
+            ("skills/flex-sessions/", "skills/flex-sessions/"),
+        ]
 
     _claude_src = PKG_ROOT / "ai"
     if not _claude_src.exists():
@@ -154,26 +165,25 @@ def _install_claude_assets():
                 return True
         return False
 
-    for asset in _INSTALL_ASSETS:
-        if not _is_allowed(asset):
-            print(f"  [warn] {asset} skipped")
+    for src_asset, dest_asset in _INSTALL_ASSETS:
+        if not _is_allowed(src_asset):
+            print(f"  [warn] {src_asset} skipped")
             continue
 
-        src_path = _claude_src / asset
+        src_path = _claude_src / src_asset
         if src_path.is_dir():
             # Copy entire directory (skills)
             for src in src_path.rglob("*"):
                 if src.is_file():
-                    rel = src.relative_to(_claude_src)
-                    dest = CLAUDE_DIR / rel
+                    rel = src.relative_to(src_path)
+                    dest = CLAUDE_DIR / dest_asset / rel
                     dest.parent.mkdir(parents=True, exist_ok=True)
                     if dest.is_symlink():
                         dest.unlink()
                     if src.resolve() != dest.resolve():
                         shutil.copy2(src, dest)
         elif src_path.is_file():
-            rel = src_path.relative_to(_claude_src)
-            dest = CLAUDE_DIR / rel
+            dest = CLAUDE_DIR / dest_asset
             dest.parent.mkdir(parents=True, exist_ok=True)
             if dest.is_symlink():
                 dest.unlink()
@@ -377,7 +387,7 @@ def _install_launchd():
 </plist>""",
     }
 
-    (FLEX_HOME / "logs").mkdir(exist_ok=True)
+    (FLEX_HOME / "logs").mkdir(parents=True, exist_ok=True)
 
     uid = os.getuid()
     for name, content in _LAUNCHD_PLISTS.items():
@@ -685,6 +695,8 @@ def cmd_init(args):
     # 1. Storage
     FLEX_HOME.mkdir(parents=True, exist_ok=True)
     (FLEX_HOME / "cells").mkdir(exist_ok=True)
+    from flex.instructions import ensure_instructions_cell
+    ensure_instructions_cell()
 
     buf = io.StringIO()
     with contextlib.redirect_stdout(buf), contextlib.redirect_stderr(buf):
@@ -905,7 +917,10 @@ def _open_cell_for_search(cell_name: str):
         from flex.retrieve.vec_ops import VectorCache, register_vec_ops
         from flex.onnx import get_model
 
-        embedder = get_model()
+        try:
+            embedder = get_model()
+        except Exception:
+            embedder = None
         caches = {}
         for table, id_col in [("_raw_chunks", "id"), ("_raw_sources", "source_id")]:
             try:
@@ -1088,9 +1103,10 @@ def cmd_sync(args):
     from flex.registry import list_cells, resolve_cell
     from flex.views import regenerate_views, install_views
     from flex.manage.install_presets import install_cell as install_presets_cell
+    from flex.instructions import ensure_instructions_cell
 
     cells = list_cells()
-    if not cells:
+    if not cells and args.cell not in (None, "instructions"):
         print("No cells registered. Run 'flex init' first.")
         return
 
@@ -1109,6 +1125,12 @@ def cmd_sync(args):
             install_presets_cell(name)
         except Exception as e:
             print(f"  {name}: FAILED ({e})")
+    if target in (None, "instructions"):
+        try:
+            ensure_instructions_cell()
+            print("  instructions: ok")
+        except Exception as e:
+            print(f"  instructions: FAILED ({e})")
 
     # ---- Phase 2: Cell sync (stubs + curated views + auto views + FTS5) ----
     print()
@@ -1458,7 +1480,7 @@ def cmd_module_remove(args):
 
 def cmd_status(args):
     """Show cell health, lifecycle, and refresh status."""
-    from flex.health import refresh_problems
+    from flex.health import refresh_problems, watch_problem, watch_problems
     from flex.registry import classify_refresh_state, list_cells
     import sqlite3 as _sqlite3
 
@@ -1488,12 +1510,13 @@ def cmd_status(args):
         print("No cells registered. Run 'flex init' first.")
         return
 
-    # Filter unlisted unless --all
+    # Default user-facing status shows only discoverable cells. Operator/debug
+    # views can pass --all to include inactive or unlisted cells.
     if not args.all:
-        cells = [c for c in cells if not c.get('unlisted')]
+        cells = [c for c in cells if not c.get('unlisted') and c.get('active', 1)]
 
     if getattr(args, 'problems', False):
-        problems = refresh_problems(cells, include_unlisted=True)
+        problems = refresh_problems(cells, include_unlisted=True) + watch_problems(cells, include_unlisted=True)
         if args.json:
             import json
             print(json.dumps(problems, indent=2))
@@ -1518,6 +1541,7 @@ def cmd_status(args):
         out = []
         for c in cells:
             state = classify_refresh_state(c)
+            wp = watch_problem(c, state=state)
             chunks, sources = _counts(c['path'])
             entry = {
                 'name': c['name'],
@@ -1525,7 +1549,7 @@ def cmd_status(args):
                 'lifecycle': c.get('lifecycle', 'static'),
                 'active': bool(c.get('active', 1)),
                 'unlisted': bool(c.get('unlisted', 0)),
-                'discoverable': not bool(c.get('unlisted', 0)),
+                'discoverable': bool(c.get('active', 1)) and not bool(c.get('unlisted', 0)),
                 'warm_on_startup': bool(c.get('active', 1)) and not bool(c.get('unlisted', 0)),
                 'refresh_status': c.get('refresh_status'),
                 'effective_refresh_status': state['effective_refresh_status'],
@@ -1540,6 +1564,9 @@ def cmd_status(args):
                 'path': c.get('path'),
                 'refresh_module': c.get('refresh_module'),
                 'refresh_script': c.get('refresh_script'),
+                'watch_path': c.get('watch_path'),
+                'watch_pattern': c.get('watch_pattern'),
+                'watch_problem': wp['problem'] if wp else None,
             }
             entry['chunks'] = chunks
             entry['sources'] = sources
@@ -1590,18 +1617,20 @@ def cmd_status(args):
 
 def cmd_health(args):
     """Show compact operational health."""
-    from flex.health import refresh_problems, refresh_summary
+    from flex.health import refresh_problems, refresh_summary, watch_problems, watch_summary
     from flex.registry import list_cells
     import json
 
     cells = list_cells()
     if not args.all:
-        cells = [c for c in cells if not c.get('unlisted')]
+        cells = [c for c in cells if not c.get('unlisted') and c.get('active', 1)]
     refresh = refresh_summary(cells, include_unlisted=True)
-    problems = refresh_problems(cells, include_unlisted=True)
+    watch = watch_summary(cells, include_unlisted=True)
+    problems = refresh_problems(cells, include_unlisted=True) + watch_problems(cells, include_unlisted=True, worker=watch["worker"])
     summary = {
-        "status": refresh["status"],
+        "status": "degraded" if refresh["status"] == "degraded" or watch["status"] == "degraded" else "ok",
         "refresh": refresh,
+        "watch": watch,
         "problems": problems,
     }
 
@@ -1732,6 +1761,24 @@ def main():
     # Register built-in SDK commands such as `flex index` before CLI parsing.
     import flex.sdk  # noqa: F401
 
+    raw_argv = sys.argv[1:]
+    if raw_argv and raw_argv[0] == "core":
+        raw_argv = raw_argv[1:]
+    elif raw_argv and raw_argv[0] == "search":
+        print(
+            "`flex search` moved to `flex core search`.\n"
+            "Use MCP for agent retrieval, or `flex core search --cell <name> <query>` for raw CLI debugging.",
+            file=sys.stderr,
+        )
+        sys.exit(2)
+    elif raw_argv and raw_argv[0] in {"context", "sessions", "memory"}:
+        print(
+            f"`flex {raw_argv[0]}` project commands are deprecated.\n"
+            "Use the Flex MCP tool for agent retrieval, or `flex core search --cell <name> <query>` for raw CLI debugging.",
+            file=sys.stderr,
+        )
+        sys.exit(2)
+
     parser = argparse.ArgumentParser(
         prog="flex",
         description="Your AI sessions, searchable forever.",
@@ -1820,7 +1867,7 @@ def main():
     if _register_extra:
         _register_extra(sub)
 
-    args = parser.parse_args()
+    args = parser.parse_args(raw_argv)
     try:
         if args.command == "init":
             cmd_init(args)

@@ -152,9 +152,13 @@ def execute_preset(db: sqlite3.Connection, query: str) -> str:
 
 def materialize(db: sqlite3.Connection, sql: str) -> str:
     """Run materializers. Returns transformed SQL or error JSON."""
+    from flex.retrieve.doc_mounts import materialize_docs
     from flex.retrieve.vec_ops import materialize_vec_ops
     from flex.retrieve.keyword import materialize_keyword
 
+    sql = materialize_docs(db, sql)
+    if sql.startswith('{"error"'):
+        return sql
     sql = materialize_vec_ops(db, sql)
     if sql.startswith('{"error"'):
         return sql

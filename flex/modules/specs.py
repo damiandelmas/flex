@@ -48,7 +48,7 @@ def external_module_roots() -> list[Path]:
     """Return module roots outside the installed flex package.
 
     ``~/.flex/modules`` is the default user install location. ``FLEX_MODULE_PATH``
-    is a colon-separated development override for local labs checkouts.
+    is a colon-separated development override for external module checkouts.
     """
     roots = [user_modules_root()]
     raw = os.environ.get(EXTERNAL_MODULES_ENV, "")
@@ -76,14 +76,22 @@ def _load_module_from_path(folder: str, module_file: Path, kind: str):
         promoted_pkg.__path__ = [str(module_file.parent)]
         sys.modules[promoted_name] = promoted_pkg
     module_root = str(module_file.parent)
-    if module_root not in sys.path:
+    inserted_path = module_root not in sys.path
+    if inserted_path:
         sys.path.insert(0, module_root)
-    spec = importlib.util.spec_from_file_location(module_name, module_file)
-    if spec is None or spec.loader is None:
-        raise ImportError(f"cannot load {module_file}")
-    mod = importlib.util.module_from_spec(spec)
-    sys.modules[module_name] = mod
-    spec.loader.exec_module(mod)
+    try:
+        spec = importlib.util.spec_from_file_location(module_name, module_file)
+        if spec is None or spec.loader is None:
+            raise ImportError(f"cannot load {module_file}")
+        mod = importlib.util.module_from_spec(spec)
+        sys.modules[module_name] = mod
+        spec.loader.exec_module(mod)
+    finally:
+        if inserted_path:
+            try:
+                sys.path.remove(module_root)
+            except ValueError:
+                pass
     return mod
 
 
@@ -136,6 +144,8 @@ def discover_install_modules() -> dict[str, dict[str, Any]]:
             if not hasattr(mod, "run"):
                 continue
             cli_name = getattr(mod, "CLI_NAME", folder.replace("_", "-"))
+            if cli_name in discovered:
+                continue
             discovered[cli_name] = {
                 "import_path": None,
                 "module": mod,

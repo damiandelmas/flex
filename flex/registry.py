@@ -248,6 +248,8 @@ def register_cell(
     cell_type: str | None = None,
     description: str | None = None,
     corpus_path: str | Path | None = None,
+    unlisted: bool | int | None = None,
+    active: bool | int | None = None,
     source_url: str | None = None,
     checksum: str | None = None,
     lifecycle: str | None = None,
@@ -294,17 +296,19 @@ def register_cell(
 
     db.execute("""
         INSERT INTO cells (id, name, path, corpus_path, cell_type, description,
-                           source_url, checksum,
+                           unlisted, active, source_url, checksum,
                            lifecycle, refresh_interval, refresh_script, refresh_module,
                            watch_path, watch_pattern,
                            created_at, updated_at)
-        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
         ON CONFLICT(name) DO UPDATE SET
             id = COALESCE(cells.id, excluded.id),
             path = excluded.path,
             corpus_path = COALESCE(excluded.corpus_path, cells.corpus_path),
             cell_type = COALESCE(excluded.cell_type, cells.cell_type),
             description = COALESCE(excluded.description, cells.description),
+            unlisted = COALESCE(excluded.unlisted, cells.unlisted),
+            active = COALESCE(excluded.active, cells.active),
             source_url = COALESCE(excluded.source_url, cells.source_url),
             checksum = COALESCE(excluded.checksum, cells.checksum),
             lifecycle = COALESCE(excluded.lifecycle, cells.lifecycle),
@@ -319,6 +323,8 @@ def register_cell(
             watch_pattern = COALESCE(excluded.watch_pattern, cells.watch_pattern),
             updated_at = excluded.updated_at
     """, (cell_id, name, path_str, corpus_str, cell_type, description,
+          None if unlisted is None else int(bool(unlisted)),
+          None if active is None else int(bool(active)),
           source_url, checksum,
           lifecycle, refresh_interval, refresh_script, refresh_module,
           watch_str, watch_pattern,
@@ -375,6 +381,33 @@ def resolve_cell(name: str) -> Optional[Path]:
     return None
 
 
+def get_cell_metadata(name: str) -> dict | None:
+    """Return registry metadata for one cell, or None when unknown.
+
+    This is intentionally separate from ``resolve_cell`` because most
+    maintenance commands need to resolve registered cells regardless of
+    lifecycle flags, while user-facing query surfaces need to distinguish:
+    active=false means unavailable; unlisted=true means hidden from discovery
+    but still addressable by exact name.
+    """
+    try:
+        db = _open_registry_readonly()
+        row = db.execute(
+            "SELECT id, name, path, corpus_path, cell_type, description, "
+            "source_url, checksum, "
+            "lifecycle, refresh_interval, refresh_script, refresh_module, "
+            "last_refresh_at, refresh_status, watch_path, watch_pattern, "
+            "created_at, updated_at, COALESCE(unlisted, 0) as unlisted, "
+            "COALESCE(active, 1) as active "
+            "FROM cells WHERE name = ?",
+            (name,),
+        ).fetchone()
+        db.close()
+        return dict(row) if row else None
+    except Exception:
+        return None
+
+
 def resolve_cell_for_path(file_path: str | Path) -> tuple[str, Path] | None:
     """Resolve a file path to its owning cell via longest corpus_path match.
 
@@ -420,15 +453,18 @@ def list_cells() -> list[dict]:
 
 
 def discover_cells() -> list[str]:
-    """Discover listed cells from registry.
+    """Discover active listed cells from registry.
 
-    Returns sorted list of cell names. Skips unlisted cells.
+    Returns sorted list of cell names for default discovery surfaces. Skips
+    unlisted cells and inactive cells. Active unlisted cells remain resolvable
+    by exact name through ``resolve_cell`` / ``get_cell_metadata``.
     """
     names = set()
 
-    # From registry (skip unlisted)
     for cell in list_cells():
         if cell.get('unlisted'):
+            continue
+        if not cell.get('active', 1):
             continue
         p = Path(cell['path'])
         if p.exists():
@@ -438,22 +474,11 @@ def discover_cells() -> list[str]:
 
 
 def discover_active_cells() -> list[str]:
-    """Discover listed cells that should be warmed at startup.
+    """Discover active listed cells that should be warmed at startup.
 
     Returns sorted list of cell names. Skips unlisted and inactive cells.
-    Inactive cells are still discoverable (in the enum) but their VectorCaches
-    are lazy-loaded on first query instead of pre-warmed.
     """
-    names = set()
-    for cell in list_cells():
-        if cell.get('unlisted'):
-            continue
-        if not cell.get('active', 1):
-            continue
-        p = Path(cell['path'])
-        if p.exists():
-            names.add(cell['name'])
-    return sorted(names)
+    return discover_cells()
 
 
 def set_active(name: str, active: bool) -> bool:

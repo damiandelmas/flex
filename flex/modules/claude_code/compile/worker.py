@@ -1195,7 +1195,7 @@ def sync_session_messages(session_id: str, conn: sqlite3.Connection,
     return inserted
 
 
-def scan_sessions(conn: sqlite3.Connection, size_cache: dict) -> dict:
+def scan_sessions(conn: sqlite3.Connection, size_cache: dict, error_cache: dict | None = None) -> dict:
     """Scan all JSONLs by file size, sync only those that grew.
 
     Replaces the old queue-drain and startup-backfill paths. Pure stat()-based
@@ -1212,6 +1212,8 @@ def scan_sessions(conn: sqlite3.Connection, size_cache: dict) -> dict:
     """
     synced = 0
     chunks = 0
+    error_cache = error_cache if error_cache is not None else {}
+    now = time.monotonic()
 
     for jsonl in CLAUDE_PROJECTS.rglob("*.jsonl"):
         # Reject symlinks — prevent ingestion of arbitrary files
@@ -1224,20 +1226,39 @@ def scan_sessions(conn: sqlite3.Connection, size_cache: dict) -> dict:
 
         session_id = jsonl.stem
         last_size = size_cache.get(session_id, -1)
+        error_state = error_cache.get(session_id)
 
         if current_size == last_size:
             continue  # unchanged — skip
+        if (
+            error_state
+            and error_state.get("size") == current_size
+            and now < error_state.get("retry_after", 0)
+        ):
+            continue
 
         # New or grown file — sync it
         try:
             count = sync_session_messages(session_id, conn)
             _update_warmup(conn, session_id)
             size_cache[session_id] = current_size
+            error_cache.pop(session_id, None)
             if count > 0:
                 synced += 1
                 chunks += count
         except Exception as e:
-            print(f"[worker] sync error {session_id[:12]}: {e}", file=sys.stderr)
+            failures = int(error_state.get("failures", 0)) + 1 if error_state else 1
+            delay = min(300, 5 * (2 ** min(failures - 1, 6)))
+            error_cache[session_id] = {
+                "size": current_size,
+                "failures": failures,
+                "retry_after": now + delay,
+            }
+            print(
+                f"[worker] sync error {session_id[:12]}: {e} "
+                f"(retry in {delay}s)",
+                file=sys.stderr,
+            )
 
     if chunks > 0:
         conn.commit()
@@ -1248,7 +1269,7 @@ def scan_sessions(conn: sqlite3.Connection, size_cache: dict) -> dict:
 # Compatibility wrapper for background-indexer callers.
 def scan_primary_cell(conn: sqlite3.Connection) -> dict:
     """Preserve the historical return shape over stat-based scanning."""
-    stats = scan_sessions(conn, _global_size_cache)
+    stats = scan_sessions(conn, _global_size_cache, _global_error_cache)
     return {'processed': stats['synced'], 'embedded': stats['chunks']}
 
 
@@ -1259,6 +1280,7 @@ def process_queue(conn: sqlite3.Connection) -> dict:
 
 # Global size cache for background-indexer callers.
 _global_size_cache: dict = {}
+_global_error_cache: dict = {}
 
 
 _DEFAULT_CC_DESCRIPTION = (

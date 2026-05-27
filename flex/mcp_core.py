@@ -43,6 +43,13 @@ _ALLOWED_PRAGMAS = frozenset(
     }
 )
 
+_MATERIALIZE_PRAGMAS = frozenset(
+    {
+        "data_version",
+        "database_list",
+    }
+)
+
 
 def search_authorizer(action, arg1, arg2, db_name, trigger_name):
     """SQLite authorizer for final user queries."""
@@ -71,7 +78,7 @@ def materialize_authorizer(action, arg1, arg2, db_name, trigger_name):
     remain blocked.
     """
     if action == _SQLITE_PRAGMA:
-        return _SQLITE_OK if (arg1 or "").lower() == "data_version" else _SQLITE_DENY
+        return _SQLITE_OK if (arg1 or "").lower() in _MATERIALIZE_PRAGMAS else _SQLITE_DENY
     if action == _SQLITE_INSERT:
         return _SQLITE_OK if db_name == "temp" else _SQLITE_DENY
     if action == _SQLITE_UPDATE:

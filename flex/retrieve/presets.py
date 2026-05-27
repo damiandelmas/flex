@@ -82,7 +82,7 @@ class PresetLoader:
             results = []
             for query in preset['queries']:
                 sql, positional = self._interpolate(query['sql'], params)
-                sql = self._materialize_vec_ops(db, sql)
+                sql = self._materialize(db, sql)
                 if sql.startswith('{"error"'):
                     results.append({
                         'query': query['name'],
@@ -103,7 +103,7 @@ class PresetLoader:
             return results
         else:
             sql, positional = self._interpolate(preset['queries'][0]['sql'], params)
-            sql = self._materialize_vec_ops(db, sql)
+            sql = self._materialize(db, sql)
             if sql.startswith('{"error"'):
                 return [{"error": sql}]
             rows = db.execute(sql, positional).fetchall()
@@ -135,6 +135,18 @@ class PresetLoader:
             return materialize_vec_ops(db, sql)
         except ImportError:
             return sql
+
+    @staticmethod
+    def _materialize(db: sqlite3.Connection, sql: str) -> str:
+        """Materialize preset-local table sources before execution."""
+        try:
+            from flex.retrieve.doc_mounts import materialize_docs
+            sql = materialize_docs(db, sql)
+        except ImportError:
+            pass
+        if sql.startswith('{"error"'):
+            return sql
+        return PresetLoader._materialize_vec_ops(db, sql)
 
     @staticmethod
     def _parse(text: str, name: str) -> dict:

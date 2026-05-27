@@ -30,6 +30,7 @@ from flex.mcp_core import execute_query as _execute_mcp_query
 from flex.registry import (
     resolve_cell as registry_resolve,
     discover_cells as registry_discover,
+    get_cell_metadata as registry_cell_metadata,
 )
 
 # Engine facade — degrades gracefully when .whl engine not installed
@@ -135,6 +136,11 @@ def get_cell(name: str, warm_vec: bool = True):
         yield None
         return
 
+    metadata = registry_cell_metadata(name)
+    if not metadata or not metadata.get("active", 1):
+        yield None
+        return
+
     p = _db_path(name)
     if not p.exists():
         yield None
@@ -142,8 +148,10 @@ def get_cell(name: str, warm_vec: bool = True):
 
     db = _open_query_cell(p)
     try:
-        is_new = name not in _known_cells
-        _known_cells.add(name)
+        is_listed = not bool(metadata.get("unlisted", 0))
+        is_new = is_listed and name not in _known_cells
+        if is_listed:
+            _known_cells.add(name)
 
         # Rebuild instructions when a new cell is discovered lazily
         if is_new:
@@ -203,13 +211,17 @@ def init(
     active_names: list[str] | None = None,
     no_embed: bool = False,
     warm: bool = True,
+    restrict_to_cells: bool = False,
 ):
     """Initialize the server: discover cells, optionally warm caches, set instructions.
 
     Called by serve.py (the entrypoint) before transport starts.
-    cell_names: all discoverable cells (appear in tool enum, queryable).
+    cell_names: default-discoverable cells (appear in tool enum/schema).
     active_names: subset to pre-warm VectorCaches at startup. Inactive cells
-                  (in cell_names but not active_names) are lazy-loaded on first query.
+                  are unavailable to query; unlisted active cells are not in
+                  cell_names but remain addressable by exact name.
+    restrict_to_cells: True only for explicit --cell startup selection; when
+                       False, exact-name active unlisted cells can still query.
     warm: when False, defer VectorCache warmup until after the MCP transport is
           accepting initialization/list_tools requests.
     """
@@ -220,7 +232,8 @@ def init(
         active_names = cell_names  # backward compat: activate everything
 
     _known_cells.update(cell_names)
-    _explicit_cells.update(cell_names)
+    if restrict_to_cells:
+        _explicit_cells.update(cell_names)
 
     if no_embed:
         _set_warmup_state(
@@ -364,6 +377,9 @@ def _execute_attaches(db: sqlite3.Connection, sql: str) -> tuple[str, str | None
     for cell_name, alias in matches:
         if _explicit_cells and cell_name not in _explicit_cells:
             return sql, f"Cell not allowed by --cell: '{cell_name}'. Allowed: {sorted(_explicit_cells)}"
+        metadata = registry_cell_metadata(cell_name)
+        if not metadata or not metadata.get("active", 1):
+            return sql, f"Unknown or inactive cell: '{cell_name}'. Available: {sorted(_known_cells)}"
         path = resolve_cell(cell_name)
         if path is None:
             return sql, f"Unknown cell: '{cell_name}'. Available: {sorted(_known_cells)}"
@@ -419,13 +435,9 @@ def build_instructions() -> str:
 
 
 def _build_query_description() -> str:
-    """Build the query parameter description — carries ALL retrieval docs.
-
-    Moved here from server instructions to avoid the 2KB server-instructions cap
-    (v2.1.84). Parameter descriptions are uncapped.
-    """
+    """Build the query parameter description for the public MCP surface."""
     parts = [
-        "SQL query, @preset name, or vec_ops expression.",
+        "Read-only query for one Flex knowledge cell. Always pass both cell and query. Use SQL, an @preset, or SQL with keyword()/vec_ops(); plain English alone is not a query.",
         "",
         "CELLS:",
     ]
@@ -458,242 +470,29 @@ def _build_query_description() -> str:
         cell_list = ', '.join(cells)
         parts.append(f"  {view_list}:  {cell_list}")
 
-    # --- Query-writer instructions ---
     parts.extend([
         "",
-        "# RETRIEVAL",
+        "MCP STARTER:",
+        "- Normal path: choose the cell that matches the user's task, then call `@orient` in that cell.",
+        "- `@orient` is the cell manual: schema, views, presets, examples, traps, packaged cell instructions, and local notes when present.",
+        "- Structural question: write SELECTs against the listed tables/views such as chunks, sections, sessions, files, or typed views.",
+        "- Exact term, id, path, symbol, or quoted string: use `keyword('literal', 'SELECT id FROM ...')` as a table source.",
+        "- Multi-word names/phrases: quote the phrase inside keyword, for example `keyword('\"Northstar Coffee\"', 'SELECT id FROM chunks')`.",
+        "- Semantic question: use `vec_ops('similar:natural language target', 'SELECT id FROM ...')` as a table source.",
+        "- Put scope limits in the second argument to `keyword` or `vec_ops`; do not depend on a later WHERE clause to shrink a huge pool.",
+        "- Join returned ids back to cell views so answers include concrete source, session, file, timestamp, and excerpt evidence.",
+        "- Coding-agent cells: `chunks.content` is a search clue and may be clipped. Use `@full id=...` to recover source bodies from `messages.file_body`.",
+        "- Coding-agent path recovery: use `@observed-file path=...` for Bash/stdout reads and `@file-history path=...` for ordered captures.",
+        "- Treat ranks/scores as local ordering signals within one query, not stable values across searches.",
+        "- Use the Flex skills for deeper playbooks: general retrieval (`flex`), project docs (`flex:context`), coding-agent sessions (`flex:sessions`), and live Aura seat scopes (`aura:flex`).",
         "",
-        "Single endpoint: mcp__flex__flex_search. Two params: query (SQL or @preset), cell (cell name).",
-        "Every query must be valid SQL or a @preset. Plain text is not accepted — wrap in keyword() or vec_ops().",
-        "",
-        "Pipeline: SQL → vec_ops → SQL. Phase 1 narrows with SQL. Phase 2 scores with embeddings. Phase 3 composes with SQL.",
-        "",
-        "Scores are ordinal within a query. Do not compare scores across queries with different tokens.",
-        "",
-        "## PHASE 1: SQL PRE-FILTER",
-        "",
-        "The second argument to vec_ops narrows candidates **before** scoring. Push every known constraint here.",
-        "A WHERE clause after vec_ops filters **after** the pool is filled — sparse post-filters (hitting <5% of chunks) cause pool starvation",
-        "(e.g. 500 candidates scored, then WHERE drops 498). Pre-filter prevents this.",
-        "",
-        "```sql",
-        "SELECT id FROM chunks WHERE type = 'user_prompt'",
-        "SELECT id FROM chunks WHERE session_id LIKE 'abc123%'",
-        "SELECT id FROM chunks WHERE tool_name = 'Edit'",
-        "SELECT id FROM chunks WHERE created_at >= date('now', '-7 days')",
-        "SELECT id FROM chunks WHERE type = 'user_prompt'",
-        "```",
-        "",
-        "## PHASE 2: VECTOR OPERATIONS (vec_ops)",
-        "",
-        "Scores candidates using embeddings. Tokens reshape scoring before selection — spread across subtopics,",
-        "suppress a dominant theme, weight recency, search from examples, or trace a direction.",
-        "Tokens compose freely in one pass. Returns (id, score) pairs for Phase 3.",
-        "",
-        "`vec_ops('similar:query_text tokens', 'pre_filter_sql')`",
-        "",
-        "**IMPORTANT:** vec_ops is a table source — always after FROM or JOIN:",
-        "```sql",
-        "FROM vec_ops('similar:how the authentication system evolved over time diverse decay:7') v",
-        "```",
-        "",
-        "The similar: text is embedded. Bare keywords cast a wide net; natural language (5-15 words) narrows focus.",
-        "",
-        "### Modulation Tokens",
-        "",
-        "Tokens compose: `'similar:how we handle auth and token refresh diverse suppress:JWT rotation boilerplate decay:7'`",
-        "",
-        "#### diverse",
-        "MMR — penalizes similarity to already-selected results. Use for breadth across subtopics.",
-        "",
-        "#### suppress:TEXT",
-        "Embeds TEXT, demotes chunks similar to it. Suppresses the dominant signal so edges surface.",
-        "Stack multiple: `suppress:deployment pipeline suppress:CI/CD configuration`.",
-        "Aim at the dominant cluster theme, not the whole topic.",
-        "",
-        "#### decay:N",
-        "Temporal decay. N-day half-life. `decay:7` = weekly. `decay:1` = aggressive. `decay:0` = disabled.",
-        "",
-        "#### centroid:id1,id2,...",
-        "Mean embedding of given chunk IDs as query. Use when examples define a concept better than words.",
-        "",
-        "#### from:TEXT to:TEXT",
-        "Direction vector through embedding space. Finds content along the conceptual arc between two ideas.",
-        "Anchors should be contrasting concepts: `from:quick hacky prototype to:principled production system`.",
-        "",
-        "#### pool:N",
-        "Candidate pool size (default 500). Increase if post-filter WHERE is sparse: `pool:2000`.",
-        "",
-        "### Examples",
-        "",
-        "Broad survey with recency:",
-        "```sql",
-        "SELECT v.id, v.score, c.content, c.session_id",
-        "FROM vec_ops('similar:key decisions tradeoffs and design choices we made this week diverse decay:7',",
-        "  'SELECT id FROM chunks WHERE type = ''user_prompt''') v",
-        "JOIN chunks c ON v.id = c.id",
-        "ORDER BY v.score DESC LIMIT 15",
-        "```",
-        "",
-        "Suppress dominant theme to find edges:",
-        "```sql",
-        "SELECT v.id, v.score, c.content",
-        "FROM vec_ops('similar:what else happened beyond the main refactor this week diverse suppress:deployment pipeline suppress:CI configuration',",
-        "  'SELECT id FROM chunks WHERE created_at >= date(''now'', ''-7 days'')') v",
-        "JOIN chunks c ON v.id = c.id",
-        "ORDER BY v.score DESC LIMIT 10",
-        "```",
-        "",
-        "Trajectory — conceptual evolution:",
-        "```sql",
-        "SELECT v.id, v.score, c.content",
-        "FROM vec_ops('similar:how the system architecture evolved from:monolithic worker to:cell-based design') v",
-        "JOIN chunks c ON v.id = c.id",
-        "ORDER BY v.score DESC LIMIT 10",
-        "```",
-        "",
-        "### Edge Cases",
-        "",
-        "- `diverse` is boolean — no parameter",
-        "- `decay:0` disables decay, `pool:0` falls back to default (500)",
-        "- One vec_ops per query — for multiple, use CTEs: `WITH a AS (SELECT * FROM vec_ops(...) v) SELECT * FROM a`",
-        "- Some sessions have NULL graph columns (centrality, community) — enrichment runs every 30 min. Use COALESCE.",
-        "",
-        "## PHASE 3: SQL COMPOSITION",
-        "",
-        "Join scored results back to views, boost with graph metadata, group, filter, paginate.",
-        "",
-        "```sql",
-        "SELECT v.id, v.score, c.content",
-        "FROM vec_ops('similar:authentication patterns and middleware design') v",
-        "JOIN chunks c ON v.id = c.id",
-        "ORDER BY v.score DESC LIMIT 10",
-        "```",
-        "",
-        "# RECIPES",
-        "",
-        "**Structural** (no embeddings — free):",
-        "```sql",
-        "SELECT project, COUNT(*) as sessions",
-        "FROM sessions GROUP BY project ORDER BY sessions DESC",
-        "```",
-        "",
-        "**Semantic search** (the skeleton):",
-        "```sql",
-        "SELECT v.id, v.score, c.content",
-        "FROM vec_ops('similar:YOUR TOPIC IN NATURAL LANGUAGE', 'PRE_FILTER') v",
-        "JOIN chunks c ON v.id = c.id",
-        "ORDER BY v.score DESC LIMIT 10",
-        "```",
-        "",
-        "Pre-filter examples:",
-        "- Session scope: `'SELECT id FROM chunks WHERE session_id LIKE ''abc%'''`",
-        "- User messages: `'SELECT id FROM chunks WHERE type = ''user_prompt'''`",
-        "- Recent: `'SELECT id FROM chunks WHERE created_at >= date(''now'', ''-7 days'')'`",
-        "- By project: `'SELECT id FROM chunks WHERE session_id IN (SELECT session_id FROM sessions WHERE project = ''myapp'')'`",
-        "- Files only: `'SELECT id FROM chunks WHERE type = ''file'''`",
-        "- No filter: omit or `''`",
-        "",
-        "**Exact term** (FTS5 — filename, error, function name, UUID):",
-        "```sql",
-        "SELECT k.id, k.rank, k.snippet, c.content",
-        "FROM keyword('term') k",
-        "JOIN chunks c ON k.id = c.id",
-        "ORDER BY k.rank DESC LIMIT 10",
-        "-- keyword() is a table source — always after FROM or JOIN.",
-        "-- Returns (id, rank, snippet). rank is positive — higher = better.",
-        "```",
-        "",
-        "**Scoped keyword** (pre-filter restricts which chunks BM25 ranks — prevents pool starvation):",
-        "```sql",
-        "SELECT k.id, k.rank, k.snippet, c.content",
-        "FROM keyword('authentication', 'SELECT id FROM chunks WHERE type = ''user_prompt''') k",
-        "JOIN chunks c ON k.id = c.id",
-        "ORDER BY k.rank DESC LIMIT 10",
-        "-- 2nd arg = pre-filter SQL (must start with SELECT). Same pattern as vec_ops.",
-        "-- Without pre-filter, BM25 ranks globally — scoped post-filters starve the pool.",
-        "```",
-        "",
-        "**Hybrid intersection** (BOTH keyword and semantic — empty results mean no overlap, not broken syntax):",
-        "```sql",
-        "SELECT k.id, k.rank, v.score, c.content",
-        "FROM keyword('sdk') k",
-        "JOIN vec_ops('similar:cell creation pipeline and programmatic ingest workflow') v ON k.id = v.id",
-        "JOIN chunks c ON k.id = c.id",
-        "ORDER BY v.score DESC LIMIT 10",
-        "```",
-        "",
-        "**FTS as pre-filter** (semantic results scoped to keyword matches):",
-        "```sql",
-        "SELECT v.id, v.score, c.content",
-        "FROM vec_ops('similar:error handling and retry patterns',",
-        "  'SELECT c.id FROM chunks_fts f JOIN _raw_chunks c ON f.rowid = c.rowid",
-        "   WHERE chunks_fts MATCH ''timeout''') v",
-        "JOIN chunks c ON v.id = c.id",
-        "ORDER BY v.score DESC LIMIT 10",
-        "```",
-        "",
-        "**Hub navigation** (most connected sessions):",
-        "```sql",
-        "SELECT v.id, v.score, s.title, s.centrality",
-        "FROM vec_ops('similar:the main architectural decisions and system design') v",
-        "JOIN chunks c ON v.id = c.id",
-        "JOIN sessions s ON c.session_id = s.session_id",
-        "WHERE s.is_hub = 1",
-        "ORDER BY s.centrality DESC LIMIT 5",
-        "```",
-        "",
-        "**File search:**",
-        "```sql",
-        "-- By path (structural, no embeddings)",
-        "SELECT file, section, ext, substr(content, 1, 200)",
-        "FROM chunks WHERE type = 'file' AND file LIKE '%/changes/code/2603%'",
-        "ORDER BY created_at DESC LIMIT 10",
-        "```",
-        "```sql",
-        "-- Semantic within files",
-        "SELECT v.id, v.score, c.file, c.section, substr(c.content, 1, 200)",
-        "FROM vec_ops('similar:how authentication middleware validates tokens', 'SELECT id FROM chunks WHERE type = ''file''') v",
-        "JOIN chunks c ON v.id = c.id",
-        "ORDER BY v.score DESC LIMIT 10",
-        "```",
-        "",
-        "**One-liners:**",
-        "- Session: `WHERE session_id LIKE 'd332a1a0%'`",
-        "- Type: `WHERE type = 'file'` / `'user_prompt'` / `'tool_call'`",
-        "- Extension: `WHERE ext = 'py'`",
-        "- Drill-down: `@story session=d332a1a0`",
-        "",
-        "# METHODOLOGY",
-        "",
-        "**Right mode for the task:**",
-        "- Known path/name → `WHERE file LIKE '%pattern%'` (structural, free)",
-        "- Known exact term → `keyword('term')` (FTS5)",
-        "- Conceptual/fuzzy → `vec_ops('similar:...')` (semantic)",
-        "",
-        "Start with `@orient`. Then `PRAGMA table_info(chunks)` to discover columns — they differ per cell.",
-        "",
-        "**Structural first.** `GROUP BY` / `COUNT(*)` / `DISTINCT` cost nothing. Get the shape before going semantic.",
-        "",
-        "**Discover then narrow.** Broad vec_ops → find themes → pre-filter next query with findings.",
-        "Push constraints into the pre-filter (2nd arg), not WHERE after vec_ops.",
-        "",
-        "**Pivot on mode shift.** Theme → quantify with GROUP BY. ID → exact retrieval with JOIN + ORDER BY position.",
-        "",
-        "**Cross-cell** when needed. Different cells have different columns and date ranges.",
-        "Column names vary: `created_at` (claude_code), `timestamp`, `file_date` (other cells). Always PRAGMA first.",
-        "",
-        "# PRESETS",
-        "",
-        "Use presets when possible. `@name` as the query. `@orient` discovers all presets per cell.",
-        "Positional args: `@story session=abc123`, `@digest days=14`.",
-        "",
-        "# EXTREMELY IMPORTANT: ALWAYS START WITH @orient FOR THE REQUESTED CELL",
-        "",
-        "**`query=\"@orient\"`, `cell=\"cell_name\"`**",
-        "",
-        "Returns cell schema, views, communities, hubs, presets. Do this BEFORE any other queries.",
-        "",
+        "STARTER EXAMPLES:",
+        "@orient",
+        "SELECT name, description, params FROM _presets ORDER BY name",
+        "SELECT k.id, k.rank, k.snippet, c.session_id, c.position FROM keyword('\"release boundary\"', 'SELECT id FROM chunks') k JOIN chunks c ON c.id = k.id LIMIT 10",
+        "SELECT v.id, v.score, c.session_id, c.position, substr(c.content,1,500) AS preview FROM vec_ops('similar:release readiness', 'SELECT id FROM chunks') v JOIN chunks c ON c.id = v.id LIMIT 10",
+        "@full id=<message_or_chunk_id>",
+        "@observed-file path=<path-fragment>",
     ])
     return "\n".join(parts)
 
@@ -703,15 +502,18 @@ def _build_query_description() -> str:
 # ============================================================
 
 def _build_tool_description() -> str:
-    """Build tool description — one-liner for the 2KB tool description cap."""
+    """Build tool description — concise activation guidance for agents."""
     return (
-        "Read-only SQL on knowledge cells. Single endpoint for semantic search, "
-        "keyword search, and structural queries across all cells."
+        "Flex indexes the user's conversations and knowledge bases. Each cell is a "
+        "self-describing SQLite database with chunks, embeddings, and graph intelligence; "
+        "use Flex to search conversations, memories, changes, docs, coding-agent sessions, "
+        "or project knowledge with SQL, @presets, keyword(), or vec_ops(). Choose the "
+        "cell that matches the task, then call @orient in that cell first."
     )
 
 
 def _build_tool_schema() -> dict:
-    """Build JSON Schema. The query parameter description carries ALL retrieval docs."""
+    """Build JSON Schema. The query parameter description carries the starter contract."""
     cell_list = sorted(_known_cells)
     return {
         "type": "object",
@@ -722,7 +524,7 @@ def _build_tool_schema() -> dict:
             },
             "cell": {
                 "type": "string",
-                "description": "Knowledge cell to query",
+                "description": "Knowledge cell to query.",
                 "default": "claude_code",
                 "enum": cell_list if cell_list else ["claude_code"],
             },

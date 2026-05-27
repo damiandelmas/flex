@@ -10,6 +10,17 @@ SELECT datetime('now', 'localtime') as now,
 -- @query: about
 SELECT value as description FROM _meta WHERE key = 'description';
 
+-- @query: cell_docs
+SELECT scope, name, path, mtime, chars, content
+FROM _flex_docs
+ORDER BY
+    CASE scope
+        WHEN 'cell_instructions' THEN 0
+        WHEN 'local_notes' THEN 1
+        ELSE 2
+    END,
+    name;
+
 -- @query: shape
 SELECT 'chunks' as what, COUNT(*) as n FROM _raw_chunks
 UNION ALL
@@ -19,8 +30,8 @@ SELECT 'sources', COUNT(*) FROM _raw_sources;
 -- Everything composable in one section: views (primary), table functions, edge tables for explicit JOIN.
 SELECT 'view' as kind, m.name as name, GROUP_CONCAT(p.name, ', ') as columns,
     CASE m.name
-        WHEN 'chunks' THEN 'UNIFIED surface — all chunks (messages + files). type: user_prompt|assistant|tool_call|file. Narrow via pre-filter: SELECT id FROM chunks WHERE type = ''file''. Default vec_ops target.'
-        WHEN 'messages' THEN 'Message chunks only (no file body sub-chunks). Tool ops, identity, delegation. Use chunks view for unified search.'
+        WHEN 'chunks' THEN 'UNIFIED search surface. Treat content as retrieval clues; tool-output chunks may be clipped. Use @full id=... for source body recovery.'
+        WHEN 'messages' THEN 'Message/tool surface. file_body holds full tool IO/file bodies when available. Compare length(content) vs length(file_body).'
         WHEN 'agent_key_chunks' THEN 'High-signal agent timeline: prompts, plans, edits, delegation, failed tools, summaries/gaps. Best pre-filter for intent/state queries.'
         WHEN 'files' THEN 'File body sub-chunks only. file, section, ext columns. Use chunks view for unified search.'
         WHEN 'sessions' THEN 'Sources with graph intelligence, fingerprints'
@@ -45,29 +56,36 @@ UNION ALL
 SELECT 'edge_table', '_edges_repo_identity', 'chunk_id, repo_root', 'Repo root hash → _enrich_repo_identity lookup'
 ORDER BY kind, name;
 
+-- @query: source_recovery
+SELECT 'full_body' AS mode,
+       '@full id=<message_or_chunk_id>' AS query,
+       'Recover best full body. Climbs from clipped Chunk ID output rows to sibling messages.file_body when possible.' AS note
+UNION ALL
+SELECT 'path_observation',
+       '@observed-file path=<path-fragment>',
+       'Find target_file hits plus Bash/stdout observations such as sed, cat, rg, or generated heredocs.'
+UNION ALL
+SELECT 'path_timeline',
+       '@file-history path=<path-fragment>',
+       'Ordered mutations, reads, target-file touches, and stdout observations.'
+UNION ALL
+SELECT 'exact_phrase',
+       'keyword(''\"multi word phrase\"'', ''SELECT id FROM chunks'')',
+       'Quote multi-word names/brands/titles inside keyword() to avoid tokenization noise.'
+UNION ALL
+SELECT 'manual_check',
+       'SELECT id, length(content), length(file_body) FROM messages WHERE id = ...',
+       'If file_body is longer than content, prefer file_body; chunks.content is the clue, not the source.';
 
 -- @query: hubs
-WITH ranked_key AS (
-    SELECT
-        session_id,
-        substr(content, 1, 160) AS key_label,
-        ROW_NUMBER() OVER (
-            PARTITION BY session_id
-            ORDER BY key_weight DESC, position ASC
-        ) AS rn
-    FROM agent_key_chunks
-    WHERE length(trim(content)) > 20
-)
-SELECT g.source_id AS session_id,
-    COALESCE(k.key_label, NULLIF(substr(src.title, 1, 160), ''), substr(ess.fingerprint_index, 1, 160)) as label,
-    ROUND(g.centrality, 4) as centrality,
-    substr(g.community_label, 1, instr(g.community_label || ' ·', ' ·') - 1) AS community
-FROM _enrich_source_graph g
-JOIN _raw_sources src ON g.source_id = src.source_id
-LEFT JOIN _enrich_session_summary ess ON g.source_id = ess.source_id
-LEFT JOIN ranked_key k ON k.session_id = g.source_id AND k.rn = 1
-WHERE g.is_hub = 1
-ORDER BY g.centrality DESC LIMIT 10;
+SELECT session_id,
+    COALESCE(NULLIF(substr(title, 1, 160), ''), substr(fingerprint_index, 1, 160)) AS label,
+    ROUND(centrality, 4) AS centrality,
+    substr(community_label, 1, instr(community_label || ' ·', ' ·') - 1) AS community
+FROM sessions
+WHERE is_hub = 1
+ORDER BY centrality DESC
+LIMIT 10;
 
 -- @query: communities
 SELECT * FROM (
@@ -155,7 +173,7 @@ SELECT 'raw_content',
     'Tool inputs/outputs. JOIN via _edges_raw_content.';
 
 -- @query: sample
-SELECT key_reason, substr(content, 1, 180) as preview
-FROM agent_key_chunks
+SELECT substr(content, 1, 180) as preview
+FROM _raw_chunks
 WHERE length(content) > 100
-ORDER BY RANDOM() LIMIT 3;
+LIMIT 3;

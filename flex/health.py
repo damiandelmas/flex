@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 from collections import Counter
+import subprocess
 from typing import Iterable
 
 from flex.registry import classify_refresh_state, list_cells
@@ -122,5 +123,135 @@ def refresh_summary(
             1 for cell, _ in states
             if (cell.get("refresh_status") or "").startswith("error")
         ),
+        "problem_cells": [problem["cell"] for problem in problems],
+    }
+
+
+def local_worker_state() -> dict:
+    """Best-effort local worker service state for watch-cell diagnostics."""
+    try:
+        result = subprocess.run(
+            ["systemctl", "--user", "is-active", "flex-worker.service"],
+            capture_output=True,
+            text=True,
+            timeout=2,
+        )
+        state = result.stdout.strip() or result.stderr.strip() or "unknown"
+        return {
+            "known": True,
+            "active": result.returncode == 0 and state == "active",
+            "state": state,
+            "manager": "systemd",
+            "service": "flex-worker.service",
+            "next": "systemctl --user restart flex-worker.service",
+        }
+    except Exception:
+        return {
+            "known": False,
+            "active": None,
+            "state": "unknown",
+            "manager": None,
+            "service": "flex-worker.service",
+            "next": "check flex-worker service",
+        }
+
+
+def watch_problem(cell: dict, worker: dict | None = None, state: dict | None = None) -> dict | None:
+    """Return a stable watch-cell problem record, or None when healthy."""
+    if cell.get("lifecycle") != "watch":
+        return None
+    state = state or classify_refresh_state(cell)
+    worker = worker or local_worker_state()
+    name = cell["name"]
+    age_s = state.get("refresh_age_s")
+
+    def record(problem: str, reason: str, next_step: str) -> dict:
+        return {
+            "cell": name,
+            "cell_type": cell.get("cell_type"),
+            "status": problem,
+            "problem": problem,
+            "severity": "error",
+            "reason": reason,
+            "next": next_step,
+            "affected": [name],
+            "age_s": age_s,
+            "age": _fmt_age(age_s),
+            "watch_path": cell.get("watch_path"),
+            "refresh_status": cell.get("refresh_status"),
+            "last_refresh_at": cell.get("last_refresh_at"),
+            "active": bool(cell.get("active", 1)),
+            "unlisted": bool(cell.get("unlisted", 0)),
+        }
+
+    if state["effective_refresh_status"] == "stale-running":
+        return record(
+            "watch-stale-running",
+            "watch refresh running marker exceeded stale window",
+            f"python -m flex.refresh --cells {name}",
+        )
+    if worker.get("known") and worker.get("active") is False:
+        return record(
+            "worker-dead",
+            "local worker service is not active",
+            worker.get("next") or "check flex-worker service",
+        )
+    raw_status = cell.get("refresh_status") or ""
+    if raw_status.startswith("error"):
+        return record(
+            "watch-refresh-error",
+            raw_status,
+            f"python -m flex.refresh --cells {name}",
+        )
+    return None
+
+
+def watch_problems(
+    cells: Iterable[dict] | None = None,
+    *,
+    include_unlisted: bool = False,
+    worker: dict | None = None,
+    worker_state: dict | None = None,
+) -> list[dict]:
+    selected = list(cells) if cells is not None else list_cells()
+    if not include_unlisted:
+        selected = [c for c in selected if not c.get("unlisted")]
+    worker_state = worker_state or worker or local_worker_state()
+    problems = []
+    for cell in selected:
+        if cell.get("lifecycle") != "watch":
+            continue
+        problem = watch_problem(cell, worker_state)
+        if problem:
+            problems.append(problem)
+    return problems
+
+
+def watch_summary(
+    cells: Iterable[dict] | None = None,
+    *,
+    include_unlisted: bool = False,
+    worker: dict | None = None,
+    worker_state: dict | None = None,
+) -> dict:
+    selected = list(cells) if cells is not None else list_cells()
+    if not include_unlisted:
+        selected = [c for c in selected if not c.get("unlisted")]
+    watch_cells = [c for c in selected if c.get("lifecycle") == "watch"]
+    worker_state = worker_state or worker or local_worker_state()
+    problems = watch_problems(watch_cells, include_unlisted=True, worker=worker_state)
+    counts = Counter(problem["problem"] for problem in problems)
+    return {
+        "status": "degraded" if problems else "ok",
+        "watch_cells": len(watch_cells),
+        "problems": len(problems),
+        "counts": dict(counts),
+        "stale_running": counts.get("watch-stale-running", 0),
+        "worker_dead": counts.get("worker-dead", 0),
+        "affected_by_worker": [
+            problem["cell"] for problem in problems
+            if problem["problem"] == "worker-dead"
+        ],
+        "worker": worker_state,
         "problem_cells": [problem["cell"] for problem in problems],
     }

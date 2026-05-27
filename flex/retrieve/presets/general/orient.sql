@@ -9,6 +9,17 @@ SELECT datetime('now', 'localtime') as now,
 -- @query: about
 SELECT value as description FROM _meta WHERE key = 'description';
 
+-- @query: cell_docs
+SELECT scope, name, path, mtime, chars, content
+FROM _flex_docs
+ORDER BY
+    CASE scope
+        WHEN 'cell_instructions' THEN 0
+        WHEN 'local_notes' THEN 1
+        ELSE 2
+    END,
+    name;
+
 -- @query: shape
 SELECT 'chunks' as what, COUNT(*) as n FROM _raw_chunks
 UNION ALL

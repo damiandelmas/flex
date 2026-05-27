@@ -63,6 +63,7 @@ def regenerate_views(db: sqlite3.Connection, views: dict = None):
         if sql:
             db.execute(sql)
 
+    _install_acp_views(db)
     db.commit()
 
 
@@ -131,6 +132,166 @@ def _has_table(db: sqlite3.Connection, name: str) -> bool:
     return db.execute(
         "SELECT 1 FROM sqlite_master WHERE type='table' AND name=?", (name,)
     ).fetchone() is not None
+
+
+def _has_column(db: sqlite3.Connection, table: str, column: str) -> bool:
+    if not _has_table(db, table):
+        return False
+    return any(row[1] == column for row in db.execute(f"PRAGMA table_info([{table}])"))
+
+
+def _sql_literal(value: str) -> str:
+    return "'" + value.replace("'", "''") + "'"
+
+
+def _provider_for_acp(db: sqlite3.Connection) -> str:
+    providers = [
+        ("claude_code", "_types_message"),
+        ("codex", "_types_codex_turn"),
+        ("opencode", "_types_opencode_session"),
+        ("goose", "_types_goose_session"),
+        ("aider", "_types_aider_session"),
+    ]
+    for provider, table in providers:
+        if _has_table(db, table):
+            return provider
+    return "coding_agent"
+
+
+def _is_coding_agent_cell(db: sqlite3.Connection) -> bool:
+    return any(
+        _has_table(db, table)
+        for table in (
+            "_types_message",
+            "_edges_tool_ops",
+            "_types_codex_turn",
+            "_types_opencode_session",
+            "_types_goose_session",
+            "_types_aider_session",
+        )
+    )
+
+
+def _optional_col(db: sqlite3.Connection, alias: str, table: str, column: str,
+                  fallback: str = "NULL") -> str:
+    if _has_column(db, table, column):
+        return f"{alias}.[{column}]"
+    return fallback
+
+
+def _install_acp_views(db: sqlite3.Connection) -> None:
+    """Install ACP-shaped compatibility views for coding-agent cells.
+
+    Native/provider tables remain the fidelity source. These views give coding
+    agent cells a common recall surface with drillback pointers into native rows.
+    """
+    for name in ("acp_category_coverage", "acp_events", "acp_sessions"):
+        db.execute(f"DROP VIEW IF EXISTS [{name}]")
+
+    if not (
+        _is_coding_agent_cell(db)
+        and _has_table(db, "_raw_sources")
+        and _has_table(db, "_raw_chunks")
+        and _has_table(db, "_edges_source")
+    ):
+        return
+
+    provider = _sql_literal(_provider_for_acp(db))
+    native_cell = provider
+    source_path = _optional_col(db, "src", "_raw_sources", "source_path")
+    source_position = _optional_col(db, "s", "_edges_source", "position")
+    chunk_timestamp = _optional_col(db, "r", "_raw_chunks", "timestamp")
+    message_role = _optional_col(db, "m", "_types_message", "role")
+    message_type = _optional_col(db, "m", "_types_message", "type")
+    tool_name = _optional_col(db, "t", "_edges_tool_ops", "tool_name")
+    target_file = _optional_col(db, "t", "_edges_tool_ops", "target_file")
+
+    message_join = (
+        "LEFT JOIN _types_message m ON r.id = m.chunk_id"
+        if _has_table(db, "_types_message")
+        else ""
+    )
+    tool_join = (
+        "LEFT JOIN _edges_tool_ops t ON r.id = t.chunk_id"
+        if _has_table(db, "_edges_tool_ops")
+        else ""
+    )
+
+    db.execute(f"""
+CREATE VIEW acp_sessions AS
+SELECT
+    {provider} AS provider,
+    {native_cell} AS native_cell,
+    src.source_id AS native_session_id,
+    src.source_id AS native_record_id,
+    src.source_id AS source_id,
+    NULL AS chunk_id,
+    {source_path} AS source_path,
+    NULL AS source_offset_or_rowid,
+    NULL AS raw_payload_ref,
+    'direct' AS fidelity_status,
+    0 AS inferred,
+    'session' AS event_type,
+    NULL AS event_role,
+    COALESCE(src.title, src.summary, src.source_id) AS event_text,
+    NULL AS tool_name,
+    NULL AS target_file,
+    MIN(r.timestamp) AS timestamp
+FROM _raw_sources src
+LEFT JOIN _edges_source s ON src.source_id = s.source_id
+LEFT JOIN _raw_chunks r ON s.chunk_id = r.id
+GROUP BY src.source_id
+""")
+
+    db.execute(f"""
+CREATE VIEW acp_events AS
+SELECT
+    {provider} AS provider,
+    {native_cell} AS native_cell,
+    s.source_id AS native_session_id,
+    r.id AS native_record_id,
+    s.source_id AS source_id,
+    r.id AS chunk_id,
+    {source_path} AS source_path,
+    {source_position} AS source_offset_or_rowid,
+    NULL AS raw_payload_ref,
+    CASE
+        WHEN t.chunk_id IS NOT NULL OR m.chunk_id IS NOT NULL THEN 'direct'
+        ELSE 'inferred'
+    END AS fidelity_status,
+    CASE
+        WHEN t.chunk_id IS NOT NULL OR m.chunk_id IS NOT NULL THEN 0
+        ELSE 1
+    END AS inferred,
+    CASE
+        WHEN {tool_name} IS NOT NULL AND {tool_name} IN ('Bash', 'shell', 'local_shell')
+            THEN 'terminal_create'
+        WHEN {tool_name} IS NOT NULL THEN 'tool_call'
+        WHEN {message_type} IS NOT NULL THEN {message_type}
+        ELSE 'message'
+    END AS event_type,
+    {message_role} AS event_role,
+    r.content AS event_text,
+    {tool_name} AS tool_name,
+    {target_file} AS target_file,
+    {chunk_timestamp} AS timestamp
+FROM _raw_chunks r
+LEFT JOIN _edges_source s ON r.id = s.chunk_id
+LEFT JOIN _raw_sources src ON s.source_id = src.source_id
+{message_join}
+{tool_join}
+""")
+
+    db.execute("""
+CREATE VIEW acp_category_coverage AS
+SELECT
+    event_type AS category,
+    fidelity_status,
+    inferred,
+    COUNT(*) AS count
+FROM acp_events
+GROUP BY event_type, fidelity_status, inferred
+""")
 
 
 def _build_chunk_view(view_name: str, db: sqlite3.Connection,

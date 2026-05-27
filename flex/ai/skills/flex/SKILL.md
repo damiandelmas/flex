@@ -7,13 +7,22 @@ user-invocable: true
 argument-hint: "what to search for (e.g., 'history of auth.py', 'what did we build this week', 'why did we switch to Postgres')"
 ---
 
-# Flex Search
+# flex
 
 Flex indexes the user's conversations and knowledge bases. Each cell is a self-describing SQLite database with chunks, embeddings, and graph intelligence. Use when the user asks to "flex" or search their conversations, memories, changes, documentation, or knowledge.
 
 Single endpoint: `mcp__flex__flex_search`. Two params: `query` (SQL or `@preset`) and `cell` (cell name).
 
+Use the MCP server for agent retrieval. It is the normal path for skill-led
+Flex queries.
+
 Every query must be valid SQL or a `@preset`. Plain text is not accepted; wrap it in `keyword()` or `vec_ops()`.
+
+Specialized Flex skill:
+
+```text
+flex:sessions  coding-agent session history and scoped session retrieval
+```
 
 # RETRIEVAL
 
@@ -253,7 +262,7 @@ ORDER BY v.score DESC LIMIT 10
 - Known exact term -> `keyword('term')` (FTS5)
 - Conceptual/fuzzy -> `vec_ops('similar:...')` (semantic)
 
-Start with `@orient`. Then `PRAGMA table_info(chunks)` to discover columns; they differ per cell.
+Start with `@orient`. Use `PRAGMA table_info(...)` only when `@orient` does not expose the column detail you need.
 
 **Structural first.** `GROUP BY` / `COUNT(*)` / `DISTINCT` cost nothing. Get the shape before going semantic.
 
@@ -265,7 +274,7 @@ Push constraints into the pre-filter (2nd arg), not `WHERE` after `vec_ops`.
 
 **Cross-cell** when needed. Different cells have different columns and date ranges.
 
-Column names vary: `created_at` (`claude_code`), `timestamp`, `file_date` (other cells). Always `PRAGMA` first.
+Column names vary: `created_at` (`claude_code`), `timestamp`, `file_date` (other cells). Trust `@orient` first; use `PRAGMA` as a fallback for missing details.
 
 # PRESETS
 

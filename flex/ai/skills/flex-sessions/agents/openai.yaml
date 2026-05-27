@@ -1,0 +1,4 @@
+interface:
+  display_name: "flex:sessions"
+  short_description: "Search coding-agent sessions, turns, tools, files, and ACP-shaped evidence."
+  default_prompt: "Use flex:sessions to scope coding-agent session history first, then query turns, tool calls, files, stories, or selected sessions with SQL, keyword, or vector retrieval."

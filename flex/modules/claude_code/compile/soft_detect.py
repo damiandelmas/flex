@@ -6,6 +6,7 @@ Parses Bash command text to infer file writes, edits, moves, etc.
 Returns detected operations with confidence levels.
 """
 
+import os
 import re
 from pathlib import Path
 from dataclasses import dataclass
@@ -265,7 +266,12 @@ def _resolve_path(filepath: str, cwd: str = None) -> str:
 
     # Home directory
     if filepath.startswith("~"):
-        return str(Path(filepath).expanduser())
+        expanded = os.path.expanduser(filepath)
+        # Unknown "~user" tokens, or systems without a resolvable home, must not
+        # abort session ingestion. Keep the literal token when expansion fails.
+        if expanded.startswith("~"):
+            return filepath
+        return expanded
 
     # Relative - use cwd if available
     if cwd:
