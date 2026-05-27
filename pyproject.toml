@@ -1,6 +1,6 @@
 [project]
 name = "getflex"
-version = "0.30.0"
+version = "0.30.1"
 description = "Knowledge engine for AI agents. Compile any data source into a queryable SQLite cell with embeddings, graph intelligence, and full-text search."
 license = "MIT"
 license-files = ["LICENSE"]

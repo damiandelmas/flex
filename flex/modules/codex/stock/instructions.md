@@ -20,7 +20,7 @@ Use the Codex cell when the question is about Codex work:
 
 - user prompts, assistant turns, tool calls, tool output, and session tails
 - which files Codex read, wrote, patched, or printed to stdout
-- forks, delegation, Aura-launched Codex homes, and `.codex` source coverage
+- forks, delegation, additional Codex homes, and `.codex` source coverage
 - semantic search over Codex workstreams, decisions, failures, and plans
 - recovering exact source bodies from clipped search results
 
@@ -185,9 +185,9 @@ ORDER BY position;
 ## Codex Source Coverage
 
 The Codex cell can be built from more than global `~/.codex`. It may include
-additional `.codex` homes discovered from Flex config and Aura registry/ledger
-metadata. The intended shape is simple: every usable `.codex` home has the same
-session layout and is scanned through the same Codex ingestion path.
+additional `.codex` homes declared in Flex config or cell metadata. The intended
+shape is simple: every usable `.codex` home has the same session layout and is
+scanned through the same Codex ingestion path.
 
 When auditing coverage, distinguish:
 

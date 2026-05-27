@@ -10,7 +10,6 @@ import json
 import os
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Iterable
 
 
 @dataclass(frozen=True)
@@ -98,99 +97,7 @@ def _source_from_entry(entry, *, source_kind: str, source_field: str, source_ord
     )
 
 
-_AURA_CODEX_HOME_FIELDS = {
-    "omx_box_codex_home": "aura-omx-box",
-    "codex_box_codex_home": "aura-codex-box",
-    "omx_package_codex_home": "aura-omx-package",
-    "codex_package_codex_home": "aura-codex-package",
-}
-_AURA_CODEX_HOME_FIELD_ORDER = {
-    field: idx for idx, field in enumerate(_AURA_CODEX_HOME_FIELDS)
-}
-
-
-def _walk_json(value, prefix: str = ""):
-    if isinstance(value, dict):
-        for key, child in value.items():
-            path = f"{prefix}.{key}" if prefix else str(key)
-            yield path, child
-            yield from _walk_json(child, path)
-    elif isinstance(value, list):
-        for idx, child in enumerate(value):
-            yield from _walk_json(child, f"{prefix}[{idx}]")
-
-
-def _codex_home_from_transcript(path: str) -> Path | None:
-    transcript = Path(path).expanduser()
-    for parent in transcript.parents:
-        if parent.name == "sessions":
-            return parent.parent
-    return None
-
-
-def _aura_row_entries(row: dict, source_field: str) -> Iterable[tuple[Path, str, str]]:
-    codex_home_entries: list[tuple[int, Path, str, str]] = []
-    evidence_entries: list[tuple[Path, str, str]] = []
-    for path, value in _walk_json(row):
-        if not isinstance(value, str) or not value:
-            continue
-        field = path.rsplit(".", 1)[-1]
-        if field in _AURA_CODEX_HOME_FIELDS:
-            codex_home_entries.append(
-                (
-                    _AURA_CODEX_HOME_FIELD_ORDER[field],
-                    Path(value).expanduser(),
-                    _AURA_CODEX_HOME_FIELDS[field],
-                    f"{source_field}.{path}",
-                )
-            )
-        elif field == "native_state_ref":
-            codex_home = Path(value).expanduser()
-            if (codex_home / "sessions").is_dir():
-                evidence_entries.append((codex_home, "aura-native-state", f"{source_field}.{path}"))
-        elif field == "transcript_path":
-            codex_home = _codex_home_from_transcript(value)
-            if codex_home is not None:
-                evidence_entries.append((codex_home, "aura-transcript", f"{source_field}.{path}"))
-
-    for _priority, codex_home, source_kind, entry_field in sorted(codex_home_entries):
-        yield codex_home, source_kind, entry_field
-    yield from evidence_entries
-
-
-def _aura_entries(registry_path: Path, ledger_path: Path) -> Iterable[tuple[Path, str, str]]:
-    if registry_path.exists():
-        try:
-            data = json.loads(registry_path.read_text(encoding="utf-8"))
-        except (OSError, json.JSONDecodeError):
-            data = {}
-        rows = data.values() if isinstance(data, dict) else data if isinstance(data, list) else []
-        for row in rows:
-            if isinstance(row, dict):
-                yield from _aura_row_entries(row, "aura-registry")
-
-    if ledger_path.exists():
-        try:
-            lines = ledger_path.read_text(encoding="utf-8", errors="replace").splitlines()
-        except OSError:
-            lines = []
-        for line in lines:
-            if not line.strip():
-                continue
-            try:
-                row = json.loads(line)
-            except json.JSONDecodeError:
-                continue
-            if isinstance(row, dict):
-                yield from _aura_row_entries(row, "aura-ledger")
-
-
-def resolve_sources(
-    conn,
-    *,
-    aura_registry: Path | None = None,
-    aura_ledger: Path | None = None,
-) -> list[CodexSource]:
+def resolve_sources(conn) -> list[CodexSource]:
     sources: list[CodexSource] = []
     order = 0
 
@@ -228,23 +135,6 @@ def resolve_sources(
         )
         if source:
             sources.append(source)
-        order += 1
-
-    registry_path = aura_registry or Path.home() / ".aura" / "registry" / "seats.json"
-    ledger_path = aura_ledger or Path.home() / ".aura" / "registry" / "session-ledger.jsonl"
-    for codex_home, kind, source_field in _aura_entries(registry_path, ledger_path):
-        if not codex_home.exists():
-            continue
-        sources.append(
-            CodexSource(
-                codex_home=codex_home,
-                sessions_dir=codex_home / "sessions",
-                state_db=codex_home / "state_5.sqlite",
-                source_kind=kind,
-                source_field=source_field,
-                source_order=order,
-            )
-        )
         order += 1
 
     resolved: list[CodexSource] = []

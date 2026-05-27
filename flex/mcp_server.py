@@ -484,7 +484,7 @@ def _build_query_description() -> str:
         "- Coding-agent cells: `chunks.content` is a search clue and may be clipped. Use `@full id=...` to recover source bodies from `messages.file_body`.",
         "- Coding-agent path recovery: use `@observed-file path=...` for Bash/stdout reads and `@file-history path=...` for ordered captures.",
         "- Treat ranks/scores as local ordering signals within one query, not stable values across searches.",
-        "- Use the Flex skills for deeper playbooks: general retrieval (`flex`), project docs (`flex:context`), coding-agent sessions (`flex:sessions`), and live Aura seat scopes (`aura:flex`).",
+        "- Use the public Flex skills for deeper playbooks: general retrieval (`flex`) and coding-agent sessions (`flex:sessions`).",
         "",
         "STARTER EXAMPLES:",
         "@orient",

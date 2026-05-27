@@ -17,7 +17,7 @@ def project_from_git_root(git_root: str) -> str:
     Derive a meaningful project name from a git root path.
 
     Rules (in order):
-      1. Worktree: .../aura/worktrees/sql-first → aura
+      1. Worktree: .../worktrees/sql-first → project
       2. Generic basename: .../flex/main  → flex
       3. Default: basename of git_root
     """

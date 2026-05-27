@@ -24,7 +24,6 @@ GENERAL_DIR = PRESET_ROOT / "general"
 MODULE_ROOT = Path(__file__).resolve().parent.parent / "modules"
 PUBLIC_PRESET_GROUPS = {
     "claude_code": ("claude_code", "soma"),
-    "project_sessions": ("claude_code", "soma"),
 }
 
 
