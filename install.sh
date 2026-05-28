@@ -17,7 +17,7 @@
 # Modules:
 #   claude-code            scan sessions, start worker, register MCP
 #   obsidian               index Obsidian vault, start worker, register MCP
-#   (default)              base install — flex index, flex core search, no module
+#   (default)              base install — flex index, flex search, no module
 
 main() {
     set -eo pipefail
@@ -74,7 +74,7 @@ main() {
                 echo "Modules:"
                 echo "  claude-code     scan sessions, start worker, register MCP"
                 echo "  obsidian        index Obsidian vault, start worker, register MCP"
-                echo "  (none)          base install — flex index, flex core search"
+                echo "  (none)          base install — flex index, flex search"
                 echo ""
                 echo "Options:"
                 echo "  --uninstall     remove flex (venv + symlink)"
