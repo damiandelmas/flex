@@ -252,9 +252,9 @@ same query interface, direct from the terminal.
 
 ## on flexvec
 
-[paper](https://arxiv.org/abs/2603.22587): the architecture of  the retrieval kernal, [flexvec](https://github.com/damiandelmas/flexvec), and a practical evaluation is available as an arXiv preprint: how the score array becomes a programmable surface instead of just a sorting criterion.
+the architecture of  the retrieval kernal, [flexvec](https://github.com/damiandelmas/flexvec), and a practical evaluation is available as an arXiv preprint: how the score array becomes a programmable surface instead of just a sorting criterion.
 
-
+here: [paper](https://arxiv.org/abs/2603.22587)
 
 ---
 
