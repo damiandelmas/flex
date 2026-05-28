@@ -13,6 +13,13 @@ from pathlib import Path
 
 CLI_NAME = "obsidian"
 MODULE_SUMMARY = "index Obsidian vault, start worker, register MCP"
+MODULE = {
+    "cell_type": "markdown",
+    "description": "Markdown and Obsidian vault indexing",
+    "views_from": ("markdown",),
+    "presets_from": ("markdown",),
+    "instructions_from": ("markdown",),
+}
 
 
 def register_args(parser) -> None:
@@ -141,13 +148,13 @@ def run(args, console) -> None:
     panel_content.append(f"{cell_name}\n", style="green")
     panel_content.append("MCP Server            ", style="")
     panel_content.append("http://localhost:7134/mcp\n\n", style="green")
-    panel_content.append("  flex search --cell ", style="bold")
+    panel_content.append("  flex core search --cell ", style="bold")
     panel_content.append(f"{cell_name} ", style="bold green")
     panel_content.append('"@orient"\n', style="bold")
-    panel_content.append("  flex search --cell ", style="bold")
+    panel_content.append("  flex core search --cell ", style="bold")
     panel_content.append(f"{cell_name} ", style="bold green")
     panel_content.append('"@hubs"\n', style="bold")
-    panel_content.append("  flex search --cell ", style="bold")
+    panel_content.append("  flex core search --cell ", style="bold")
     panel_content.append(f"{cell_name} ", style="bold green")
     panel_content.append('"@ghost-notes"\n', style="bold")
     console.print(Panel(panel_content, padding=(1, 2), highlight=False))

@@ -488,7 +488,7 @@ def register(
     """Register cell: validate, generate views, install presets, activate for MCP.
 
     This is the last call. After register(), the cell is queryable via MCP
-    and flex search.
+    and flex core search.
 
     Args:
         db: Cell connection from create().
@@ -620,7 +620,7 @@ def _register_extra_commands(sub):
         sources = db.execute("SELECT COUNT(*) FROM _raw_sources").fetchone()[0]
         db.close()
         print(f"  {chunks} chunks from {sources} sources")
-        print(f"  Query: flex search --cell {name} \"@orient\"")
+        print(f"  Query: flex core search --cell {name} \"@orient\"")
 
     idx_p.set_defaults(func=cmd_index)
 

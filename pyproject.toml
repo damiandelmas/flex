@@ -1,6 +1,6 @@
 [project]
 name = "getflex"
-version = "0.30.1"
+version = "0.31.0"
 description = "Knowledge engine for AI agents. Compile any data source into a queryable SQLite cell with embeddings, graph intelligence, and full-text search."
 license = "MIT"
 license-files = ["LICENSE"]
@@ -42,10 +42,27 @@ flex = "flex.cli:main"
 
 [tool.setuptools.package-data]
 flex = [
+    "modules/arxiv/**/*.sql",
+    "modules/arxiv/**/*.md",
     "modules/claude_code/**/*.sql",
     "modules/claude_code/**/*.md",
     "modules/codex/**/*.md",
+    "modules/devto/**/*.sql",
+    "modules/devto/**/*.md",
+    "modules/github/**/*.sql",
+    "modules/github/**/*.md",
+    "modules/goose/**/*.sql",
+    "modules/goose/**/*.md",
+    "modules/hn/**/*.sql",
+    "modules/hn/**/*.md",
+    "modules/lobsters/**/*.sql",
+    "modules/lobsters/**/*.md",
     "modules/markdown/**/*.sql",
+    "modules/markdown/**/*.md",
+    "modules/reddit/**/*.sql",
+    "modules/reddit/**/*.md",
+    "modules/skills/**/*.sql",
+    "modules/skills/**/*.md",
     "modules/soma/**/*.sql",
     "retrieve/presets/general/*.sql",
     "onnx/*.json",

@@ -1,6 +1,6 @@
 """Retrieve: query execution. Matrix multiply, named presets, direct SQL.
 
-Standalone usage (no MCP required):
+Direct Python usage:
     from flex.retrieve.execute import open_cell_for_query, execute
 
     db = open_cell_for_query('my_cell')

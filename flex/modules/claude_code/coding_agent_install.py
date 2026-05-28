@@ -204,7 +204,7 @@ def run_from_spec(args, console, spec: dict[str, Any]) -> None:
     panel.append(f"{cell_type} cell ready.\n\n", style="cyan")
     panel.append("Query examples:\n", style="bold")
     for example in spec.get("query_examples") or ("@orient", "@digest", "@file path='src/foo.py'"):
-        panel.append(f'  flex search --cell {name} "{example}"\n', style="dim")
+        panel.append(f'  flex core search --cell {name} "{example}"\n', style="dim")
     console.print(Panel(panel, padding=(1, 2), highlight=False))
     console.print()
 

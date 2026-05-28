@@ -98,17 +98,18 @@ everything runs in-process. no external services, no cloud dependency.
 
 ---
 
-## cli access
+## raw cli access
 
-query from the terminal without claude:
+MCP is the normal agent interface. use raw CLI access when an agent or operator
+needs direct terminal queries, debugging, or scripting:
 
 ```bash
-flex search "@digest days=3"
-flex search "@file path=src/worker.py"
-flex search "SELECT COUNT(*) FROM sessions WHERE project = 'myapp'"
+flex core search --cell claude_code "@digest days=3"
+flex core search --cell claude_code "@file path=src/worker.py"
+flex core search --cell claude_code "SELECT COUNT(*) FROM sessions WHERE project = 'myapp'"
 ```
 
-same queries, no MCP required.
+same query surface, direct from the terminal.
 
 ---
 
