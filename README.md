@@ -187,9 +187,9 @@ tokens reshape scores. they compose freely in a single string.
 
 `'similar:auth diverse suppress:oauth decay:7'` is four operations in one query.
 
-## here's an example query
+## example
 
-this is the kind of query an agent can write:
+the kind of query an agent can write:
 
 ```sql
 SELECT v.id, v.score, m.session_id, m.content
