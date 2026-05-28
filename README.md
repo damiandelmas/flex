@@ -250,7 +250,7 @@ same query interface, direct from the terminal.
   [paper](https://arxiv.org/abs/2603.22587)
 - **worker**: background refresh for local coding-agent memory.
 
-## the paper
+## on flexvec
 
 [paper](https://arxiv.org/abs/2603.22587): the architecture of  the retrieval kernal, [flexvec](https://github.com/damiandelmas/flexvec), and a practical evaluation is available as an arXiv preprint: how the score array becomes a programmable surface instead of just a sorting criterion.
 
