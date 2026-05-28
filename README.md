@@ -8,9 +8,9 @@
 [![License: MIT](https://img.shields.io/badge/License-MIT-blue.svg)](LICENSE)
 [![Python 3.12+](https://img.shields.io/badge/python-3.12+-blue.svg)](https://www.python.org/)
 
-**fastest way to get knowledge and memory for every Claude Code session**
+**fastest way to get knowledge and memory for your coding agent**
 
-flex compiles your Claude Code session history into a queryable SQLite database
+flex compiles your coding agent session history into a queryable SQLite database
 with vector and hybrid retrieval. your AI agent connects through MCP, discovers
 the schema at runtime, and writes SQL against your history.
 
@@ -27,38 +27,56 @@ curl -sSL https://getflex.dev/install.sh | bash -s -- claude-code
 **most memory systems start working after you install them.**
 
 flex works retroactively. as soon as you install, your existing sessions become
-queryable through the MCP tool. you can ask how you installed the cloudflare
+queryable through the MCP tool. you can ask how you installed the Cloudflare
 tunnel yesterday, why a release script changed, or what session created a file.
 
 **retrieval tools typically have minimal metadata to filter on.**
 
-flex captures the exact session, what files and repos it touched, which project
-it belongs to, and whether it spawned agents. filtering happens before scoring:
-the vector engine only scores what survives. flex also builds graph structure
-for hub sessions, file co-edit patterns, project attribution, and source
-recovery.
+coding-agent sessions are not plain documents. they have prompts, replies, tool
+calls, file edits, repos, projects, and sub-agents. flex keeps that structure,
+so the agent can filter before semantic scoring instead of asking vector search
+to guess what matters.
+
+flex also keeps the answer attached to source evidence: the session it came
+from, what files and repos it touched, what project it belongs to, and where to
+go next if you need the full trace.
 
 **vector search typically surfaces similar content and stops there.**
 
-flex lets the agent combine SQL, presets, semantic search, suppression,
-diversity, recency weighting, and trajectory search in one local query surface.
+flex lets the agent combine SQL, semantic search, keyword search, suppression,
+diversity, recency weighting, and trajectory search in one local query
+interface.
+
+that means you can ask for architecture work but not changelogs, recent auth
+work but not oauth docs, or a diverse sample instead of ten copies of the same
+answer.
 
 ## what can you do?
 
+ask things like:
+
+- how did we set up the docker environment for this?
+- what session did we edit `registry.py` last and what was my reason?
+- what are the wildest moments in our entire session history?
+
 ### file lineage
 
-flex tracks sessions, messages, tool operations, and file evidence. ask:
+flex tracks sessions, messages, tool calls, file edits, and source evidence.
+ask:
 
 ```text
 "Use flex: what's the history of worker.py?"
 ```
+
+flex can find what session created a file, what prompts were used to create it,
+what changed later, and why.
 
 ### decision archaeology
 
 the hardest question in software is why something was done. ask:
 
 ```text
-"Use flex: how did we create the curl install script?"
+"Use flex: why did we create registry.py?"
 ```
 
 flex finds the session where the decision happened and reconstructs the path:
@@ -72,7 +90,10 @@ sessions are grouped by projects, touched files, and key decisions. ask:
 "Use flex: what did we build this week?"
 ```
 
-### semantic search
+your agent can run the queries behind the scenes and come back with an overview
+of recent work.
+
+### semantic search (and more)
 
 semantic search can be composed with filters and operators. ask:
 
@@ -80,22 +101,35 @@ semantic search can be composed with filters and operators. ask:
 "Use flex: 5 things we talked about this week outside the main project"
 ```
 
-## codex
+flex can search for one topic while suppressing another, or retrieve a diverse
+sample instead of ten copies of the same answer.
 
-Codex CLI sessions use the same coding-agent substrate:
+## sources
+
+flex is one MCP search tool for local sources. each source has its own install
+path, but the agent uses the same query model across them.
+
+### Claude Code
+
+```bash
+curl -sSL https://getflex.dev/install.sh | bash -s -- claude-code
+```
+
+Claude Code sessions become searchable through MCP. flex indexes local session
+history, tool calls, file edits, and sub-agent traces, then keeps updating as
+you work.
+
+### Codex
 
 ```bash
 flex init --module codex
 flex core search --cell codex "@orient"
 ```
 
-The Codex cell indexes local Codex CLI sessions, messages, tool operations,
-file evidence, and source recovery so they can be queried through the same MCP
-surface.
+Codex CLI sessions use the same coding-agent model: messages, tool calls, file
+evidence, repo context, and source recovery through the same MCP interface.
 
-## obsidian
-
-flex can also turn an Obsidian vault or Markdown folder into a local cell:
+### Obsidian and Markdown
 
 ```bash
 curl -sSL https://getflex.dev/install.sh | bash -s -- obsidian
@@ -115,9 +149,81 @@ Then ask through MCP:
 "Use flex: summarize the notes that mention release planning"
 ```
 
-The Obsidian/Markdown cell indexes notes, sections, frontmatter tags, aliases,
-wikilinks, ghost notes, and heading hierarchy without modifying your source
-files.
+flex indexes notes, sections, frontmatter tags, aliases, wikilinks, ghost
+notes, and heading hierarchy without modifying your source files.
+
+## how retrieval works
+
+every query runs three phases in one SQL statement.
+
+```text
+SQL pre-filter  ->  score modulation  ->  SQL compose
+```
+
+1. **SQL pre-filter** narrows what enters scoring by date, source, type, length,
+   project, path, or any SQL expression.
+2. **score modulation** reshapes semantic scores with operators such as
+   suppression, diversity, recency, and trajectory.
+3. **SQL compose** joins results back to your tables for grouping, filtering,
+   reranking, or source recovery.
+
+the retrieval engine bridges vector scoring into SQL. the agent writes
+`FROM vec_ops(...)` as if it were a table; flex runs the scoring work, writes the
+results back into SQLite, and lets the rest of the query continue normally.
+
+## tokens
+
+tokens reshape scores. they compose freely in a single string.
+
+| token | what it does |
+|---|---|
+| `similar:TEXT` | search for this concept |
+| `suppress:TEXT` | push this topic out of results |
+| `diverse` | spread across subtopics instead of ten versions of the same answer |
+| `decay:N` | favor recent content with an N-day half-life |
+| `centroid:id1,id2` | search from the average of examples |
+| `from:A to:B` | find content along a conceptual arc |
+| `pool:N` | set how many candidates to score |
+
+`'similar:auth diverse suppress:oauth decay:7'` is four operations in one query.
+
+## here's an example query
+
+this is the kind of query an agent can write:
+
+```sql
+SELECT v.id, v.score, m.session_id, m.content
+FROM vec_ops(
+  'similar:how the system works architecture
+   diverse
+   suppress:website landing page design tagline',
+  'SELECT id FROM messages
+   WHERE type = ''assistant'''
+) v
+JOIN messages m ON v.id = m.id
+ORDER BY v.score DESC
+LIMIT 5
+```
+
+this finds the 5 assistant messages that are most similar to `how the system
+works architecture`, while suppressing messages that are similar to `website
+landing page design tagline`. that is how you get the old architecture thread
+instead of five landing page drafts.
+
+most vector search tools can only do the former, not the latter. since the tool
+is in SQL, the MCP instructions are pretty light: coding agents already know
+how to use the mechanics.
+
+## local-first
+
+your knowledge base is one SQLite file on your machine. flex stores local
+databases under `~/.flex/cells/`.
+
+```bash
+flex core search --cell claude_code "SELECT COUNT(*) FROM sessions"
+```
+
+everything runs locally. no hosted database required.
 
 ## raw cli access
 
@@ -130,30 +236,25 @@ flex core search --cell claude_code "@file path=worker.py"
 flex core search --cell claude_code "SELECT COUNT(*) FROM sessions"
 ```
 
-same query surface, direct from the terminal.
-
-## local-first
-
-your knowledge base is one SQLite file on your machine. flex registers the cell
-name and stores the database under `~/.flex/cells/`.
-
-```bash
-flex core search --cell claude_code "SELECT COUNT(*) FROM sessions"
-```
-
-everything runs locally. no hosted database required.
+same query interface, direct from the terminal.
 
 ## what's inside
 
 - **MCP server**: one read-only query tool, `flex_search`; this is the primary
   interface for agents.
-- **SQLite cells**: sessions, messages, chunks, source rows, views, presets, and
-  `@orient` docs.
-- **CLI**: initialize cells, run raw terminal queries, and inspect health.
+- **local SQLite databases**: source-specific tables, views, saved queries, and
+  runtime docs the agent can inspect.
+- **CLI**: initialize sources, run raw terminal queries, and inspect health.
 - **[flexvec](https://github.com/damiandelmas/flexvec)**: SQL vector retrieval
   kernel with suppression, diversification, decay, and trajectory operators.
   [paper](https://arxiv.org/abs/2603.22587)
 - **worker**: background refresh for local coding-agent memory.
+
+## the paper
+
+a paper on the architecture of the retrieval kernal and a practical evaluation is available as an arXiv preprint: how the score array becomes a programmable surface instead of just a sorting criterion.
+
+[paper](https://arxiv.org/abs/2603.22587)
 
 ---
 
