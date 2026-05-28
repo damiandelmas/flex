@@ -51,7 +51,8 @@ flex = [
     "onnx/*.json",
     "onnx/vocab.txt",
     "ai/skills/flex/**/*",
-    "ai/skills/flex-sessions/**/*",
+    "ai/skills/flex-sessions-claudecode/**/*",
+    "ai/skills/flex-sessions-codex/**/*",
 ]
 
 [tool.setuptools.exclude-package-data]

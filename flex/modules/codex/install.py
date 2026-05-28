@@ -36,6 +36,7 @@ MODULE = {
     "instructions_from": ("codex", "claude_code"),
     "enrichment_stubs_from": "claude_code",
     "query_examples": ("@orient", "@digest", "@file path='src/foo.py'"),
+    "skill": "flex:sessions:codex",
 }
 
 

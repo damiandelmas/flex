@@ -129,27 +129,30 @@ def _write_module_provenance(dest: Path, provenance: dict) -> None:
 # ============================================================
 
 
-def _install_claude_assets():
+def _install_claude_assets(skill_names=None):
     """Copy public Flex skill assets from package ai/ dir to ~/.claude/."""
-    _INSTALL_FILES = {
-        "skills/flex/",
-        "skills/flex-sessions/",
+    _SKILL_ASSETS = {
+        "flex": ("skills/flex/", "skills/flex/"),
+        "flex:sessions:claudecode": (
+            "skills/flex-sessions-claudecode/",
+            "skills/flex-sessions-claudecode/",
+        ),
+        "flex:sessions:codex": (
+            "skills/flex-sessions-codex/",
+            "skills/flex-sessions-codex/",
+        ),
     }
 
     skill_mode = os.environ.get("FLEX_SKILL_MODE", "mcp").strip().lower()
     if skill_mode == "none":
         _INSTALL_ASSETS = []
     elif skill_mode in ("", "default", "mcp"):
-        _INSTALL_ASSETS = [
-            ("skills/flex/", "skills/flex/"),
-            ("skills/flex-sessions/", "skills/flex-sessions/"),
-        ]
+        requested = tuple(skill_names or ("flex",))
+        _INSTALL_ASSETS = [_SKILL_ASSETS[name] for name in requested if name in _SKILL_ASSETS]
     else:
         print(f"  [warn] FLEX_SKILL_MODE={skill_mode!r} is deprecated; installing MCP skills")
-        _INSTALL_ASSETS = [
-            ("skills/flex/", "skills/flex/"),
-            ("skills/flex-sessions/", "skills/flex-sessions/"),
-        ]
+        requested = tuple(skill_names or ("flex",))
+        _INSTALL_ASSETS = [_SKILL_ASSETS[name] for name in requested if name in _SKILL_ASSETS]
 
     _claude_src = PKG_ROOT / "ai"
     if not _claude_src.exists():
@@ -157,7 +160,7 @@ def _install_claude_assets():
 
     def _is_allowed(rel_str):
         """Check if a relative path is in the install set."""
-        for entry in _INSTALL_FILES:
+        for entry, _dest in _SKILL_ASSETS.values():
             if entry.endswith("/"):
                 if rel_str.startswith(entry) or rel_str == entry.rstrip("/"):
                     return True
@@ -736,6 +739,7 @@ def cmd_init(args):
 
     # 3. Dispatch to module hook (or print base panel)
     if not _module:
+        _install_claude_assets(("flex",))
         console.print()
         panel_content = Text()
         panel_content.append("Flex is ready.\n\n", style="cyan")

@@ -77,6 +77,7 @@ def run_from_spec(args, console, spec: dict[str, Any]) -> None:
     )
     from flex.modules.claude_code.contract import validate_coding_agent_cell
     from flex.registry import register_cell
+    from flex.cli import _install_claude_assets
 
     cell_type = spec["cell_type"]
     name = getattr(args, "name", None) or spec.get("default_cell_name") or cell_type
@@ -84,6 +85,9 @@ def run_from_spec(args, console, spec: dict[str, Any]) -> None:
     source_attr = spec["source_arg"].lstrip("-").replace("-", "_")
     source_arg = getattr(args, source_attr, None)
     source = (Path(source_arg) if source_arg else Path(spec["default_source"])).expanduser()
+
+    if spec.get("skill"):
+        _install_claude_assets((spec["skill"],))
 
     console.print(f"  {spec.get('source_label', cell_type + ' source'):<20} {source}")
     if not source.exists():

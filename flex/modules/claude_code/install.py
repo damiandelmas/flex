@@ -53,7 +53,7 @@ def run(args, console) -> None:
     _model_ok = getattr(args, '_model_ok', True)
 
     # 3. Claude assets
-    _install_claude_assets()
+    _install_claude_assets(("flex:sessions:claudecode",))
     console.print("  capture             [green]ok[/green]")
     console.print()
 
