@@ -14,22 +14,35 @@ flex compiles your coding agent session history into a queryable SQLite database
 with vector and hybrid retrieval. your AI agent connects through MCP, discovers
 the schema at runtime, and writes SQL against your history.
 
-**install one source:**
+**install:**
+
+Claude Code:
 
 ```bash
-# Claude Code
 curl -sSL https://getflex.dev/install.sh | bash -s -- claude-code
+```
 
-# Codex CLI
+Codex CLI:
+
+```bash
 curl -sSL https://getflex.dev/install.sh | bash -s -- codex
+```
 
-# Obsidian / Markdown
+Obsidian / Markdown:
+
+```bash
 curl -sSL https://getflex.dev/install.sh | bash -s -- obsidian
 ```
 
 ---
 
-## what's different
+## coding-agent memory
+
+Claude Code and Codex sessions become searchable through the same MCP query
+surface. flex indexes local session history, tool calls, file edits, source
+evidence, repo context, and sub-agent traces, then keeps updating as you work.
+
+### what's different
 
 **most memory systems start working after you install them.**
 
@@ -58,7 +71,7 @@ that means you can ask for architecture work but not changelogs, recent auth
 work but not oauth docs, or a diverse sample instead of ten copies of the same
 answer.
 
-## what can you do?
+### what can you do?
 
 ask things like:
 
@@ -111,11 +124,6 @@ semantic search can be composed with filters and operators. ask:
 flex can search for one topic while suppressing another, or retrieve a diverse
 sample instead of ten copies of the same answer.
 
-## sources
-
-flex is one MCP search tool for local sources. each source has its own install
-path, but the agent uses the same query model across them.
-
 ### Claude Code
 
 Fresh install:
@@ -130,10 +138,6 @@ If flex is already installed:
 flex init --module claude-code
 flex core search --cell claude_code "@orient"
 ```
-
-Claude Code sessions become searchable through MCP. flex indexes local session
-history, tool calls, file edits, and sub-agent traces, then keeps updating as
-you work.
 
 ### Codex
 
@@ -152,6 +156,11 @@ flex core search --cell codex "@orient"
 
 Codex CLI sessions use the same coding-agent model: messages, tool calls, file
 evidence, repo context, and source recovery through the same MCP interface.
+
+## source modules
+
+flex is one MCP search tool for local sources. each source has its own install
+path, but the agent uses the same query model across them.
 
 ### Obsidian and Markdown
 
