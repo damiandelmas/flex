@@ -14,10 +14,17 @@ flex compiles your coding agent session history into a queryable SQLite database
 with vector and hybrid retrieval. your AI agent connects through MCP, discovers
 the schema at runtime, and writes SQL against your history.
 
-**install:**
+**install one source:**
 
 ```bash
+# Claude Code
 curl -sSL https://getflex.dev/install.sh | bash -s -- claude-code
+
+# Codex CLI
+curl -sSL https://getflex.dev/install.sh | bash -s -- codex
+
+# Obsidian / Markdown
+curl -sSL https://getflex.dev/install.sh | bash -s -- obsidian
 ```
 
 ---
@@ -120,6 +127,12 @@ history, tool calls, file edits, and sub-agent traces, then keeps updating as
 you work.
 
 ### Codex
+
+```bash
+curl -sSL https://getflex.dev/install.sh | bash -s -- codex
+```
+
+If flex is already installed:
 
 ```bash
 flex init --module codex
@@ -252,7 +265,7 @@ same query interface, direct from the terminal.
 
 ## on flexvec
 
-the architecture of  the retrieval kernal, [flexvec](https://github.com/damiandelmas/flexvec), and a practical evaluation is available as an arXiv preprint: how the score array becomes a programmable surface instead of just a sorting criterion.
+the architecture of the retrieval kernel, [flexvec](https://github.com/damiandelmas/flexvec), and a practical evaluation is available as an arXiv preprint: how the score array becomes a programmable surface instead of just a sorting criterion.
 
 here: [paper](https://arxiv.org/abs/2603.22587)
 

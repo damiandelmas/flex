@@ -4,6 +4,7 @@
 # Usage:
 #   curl -sSL https://getflex.dev/install.sh | bash                    # base (flex index only)
 #   curl -sSL https://getflex.dev/install.sh | bash -s -- claude-code  # + sessions, worker, MCP
+#   curl -sSL https://getflex.dev/install.sh | bash -s -- codex        # + sessions, worker, MCP
 #   curl -sSL https://getflex.dev/install.sh | bash -s -- obsidian     # + auto-detect vault, index, MCP
 #
 # Options (via env vars or flags):
@@ -16,6 +17,7 @@
 #
 # Modules:
 #   claude-code            scan sessions, start worker, register MCP
+#   codex                  scan Codex CLI sessions, start worker, register MCP
 #   obsidian               index Obsidian vault, start worker, register MCP
 #   (default)              base install — flex index, flex search, no module
 
@@ -73,6 +75,7 @@ main() {
                 echo ""
                 echo "Modules:"
                 echo "  claude-code     scan sessions, start worker, register MCP"
+                echo "  codex           scan Codex CLI sessions, start worker, register MCP"
                 echo "  obsidian        index Obsidian vault, start worker, register MCP"
                 echo "  (none)          base install — flex index, flex search"
                 echo ""
