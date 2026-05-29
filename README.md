@@ -46,12 +46,12 @@ Claude Code and Codex sessions become searchable through one MCP query surface.
 flex indexes session history, tool calls, file edits, source evidence, repo
 context, and sub-agent traces — and keeps updating as you work.
 
-Most memory systems start working *after* you install them. flex works
-retroactively: the moment you install, your existing sessions are queryable. Ask
+### what's different
+
+**most memory systems start working *after* you install them.** flex works
+retroactively — the moment you install, your existing sessions are queryable. Ask
 how you set up the Cloudflare tunnel yesterday, why a release script changed, or
 what session created a file.
-
-#### what's different
 
 **sessions aren't plain documents.** They have prompts, replies, tool calls, file
 edits, repos, projects, and sub-agents. flex keeps that structure, so your agent
@@ -60,12 +60,11 @@ matters. Every answer stays attached to its source evidence — the session it c
 from, the files and repos it touched, and where to go next for the full trace.
 
 **vector search usually returns similar content and stops.** flex lets your agent
-combine SQL, semantic search, keyword search, suppression, diversity, recency
-weighting, and trajectory search in one query — architecture work but not
-changelogs, recent auth work but not oauth docs, a diverse sample instead of ten
-near-duplicates.
+compose SQL, semantic, and keyword search with operators for suppression,
+diversity, recency, and trajectory — architecture work but not changelogs, recent
+auth work but not oauth docs, a diverse sample instead of ten near-duplicates.
 
-#### what you can ask
+### what you can ask
 
 **file lineage** — flex tracks sessions, messages, tool calls, and file edits:
 
@@ -96,25 +95,10 @@ then ask: `"Use flex: orient me to my Claude Code memory."`
 ## beyond coding agents
 
 Coding memory is the sharpest use of flex, not its edge. Underneath, flex is a
-substrate: anything that compiles into the cell format becomes queryable through
-the same MCP tool.
+substrate: any source that compiles into the cell format becomes queryable through
+the same MCP tool, and adding a source never adds a new tool.
 
-**index anything in one line.** Point it at a folder of docs, notes, or exports
-and get a queryable cell — embeddings, keyword search, views, and `@orient` — with
-zero decisions and zero failure modes:
-
-```bash
-flex index ./docs
-```
-
-```python
-from flex.sdk import index
-index("docs", Path("./docs"))
-```
-
-Then ask: `"Use flex: what do my notes say about release planning?"`
-
-**Obsidian and Markdown** ship as a ready-made module:
+Obsidian and Markdown ship as a ready-made module today:
 
 ```bash
 VAULT=/path/to/vault curl -sSL https://getflex.dev/install.sh | bash -s -- obsidian
@@ -122,36 +106,25 @@ VAULT=/path/to/vault curl -sSL https://getflex.dev/install.sh | bash -s -- obsid
 
 flex indexes notes, sections, frontmatter, aliases, wikilinks, ghost notes, and
 heading hierarchy without touching your files, then exposes backlinks and note
-communities as queryable columns.
-
-**three ways to add a source — one cell format at the end:**
-
-- **index** — one line, zero decisions. Embeddings, keyword search, and views for
-  docs, notes, text dumps, or CSV exports — anywhere "find similar" is enough.
-- **build** — about a hundred lines through the SDK, when you want typed metadata
-  (`WHERE author = 'alice'`), threading, and graph intelligence. Ask your agent: it
-  runs the build-cell skill, asks a handful of questions, writes the script, and a
-  queryable cell exists. It's been used to stand up cells for chat platforms,
-  GitHub, RSS, Wikipedia, and more.
-- **module** — a hand-built pipeline for always-on, always-fresh, distributable
-  sources. This is how Claude Code and Codex themselves ship.
-
-The format is identical at every tier, so a quick cell can grow into a structured
-one without a rebuild.
+communities as queryable columns. New sources arrive the same way Claude Code,
+Codex, and Obsidian do — compiled into a cell behind the one query surface.
 
 ## extension modules
 
 Extension modules enrich any cell with shared structure — they don't add a source
 or a tool.
 
-**SOMA** gives files, repos, content, and URLs a stable identity, so flex follows
-the same file across renames, moves, and repo relocations. That's what makes file
-history work as lineage instead of path search. (Ships with Claude Code and Codex.)
+### SOMA
 
-**knowledge graphs** add hubs, bridges, communities, centrality, and co-edit
-relationships over sessions and files — and backlinks, ghost notes, and hub notes
-over a Markdown vault. Your agent queries them as ordinary SQL columns, not through
-a separate graph tool.
+Stable identity for files, repos, content, and URLs, so flex follows the same file
+across renames, moves, and repo relocations. That's what makes file history work as
+lineage instead of path search. Ships with Claude Code and Codex.
+
+### knowledge graphs
+
+Hubs, bridges, communities, centrality, and co-edit relationships over sessions and
+files — and backlinks, ghost notes, and hub notes over a Markdown vault. Your agent
+queries them as ordinary SQL columns, not through a separate graph tool.
 
 ## how retrieval works
 
@@ -282,9 +255,7 @@ A module installs by creating tables with the convention prefixes and uninstalls
 by dropping them — no registration, no coupling. A cell without a given module
 still has full retrieval; those columns are simply absent. SOMA and the graph
 enrichments are modules in exactly this sense — ordinary SQLite tables and columns,
-queried as SQL, never a separate tool. The [SDK](#beyond-coding-agents) is the
-public way to write those tables: a handful of composable primitives that produce
-the same cell format as the built-in modules.
+queried as SQL, never a separate tool.
 
 ### one interface, local-first
 
@@ -301,9 +272,6 @@ The durable artifact is the cell itself — one local SQLite file under
   for agents.
 - **local SQLite databases**: source-specific tables, views, saved queries, and
   runtime docs your agent can inspect.
-- **SDK**: composable primitives (`create`, `source`, `ingest`, `link`, `embed`,
-  `graph`, `register`, plus the one-line `index`) that produce the same cell format
-  as the built-in modules.
 - **CLI**: initialize sources and inspect health.
 - **[flexvec](https://github.com/damiandelmas/flexvec)**: SQL vector retrieval
   kernel with suppression, diversification, decay, and trajectory operators.
