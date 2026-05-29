@@ -118,8 +118,17 @@ path, but the agent uses the same query model across them.
 
 ### Claude Code
 
+Fresh install:
+
 ```bash
 curl -sSL https://getflex.dev/install.sh | bash -s -- claude-code
+```
+
+If flex is already installed:
+
+```bash
+flex init --module claude-code
+flex core search --cell claude_code "@orient"
 ```
 
 Claude Code sessions become searchable through MCP. flex indexes local session
@@ -127,6 +136,8 @@ history, tool calls, file edits, and sub-agent traces, then keeps updating as
 you work.
 
 ### Codex
+
+Fresh install:
 
 ```bash
 curl -sSL https://getflex.dev/install.sh | bash -s -- codex
@@ -144,14 +155,23 @@ evidence, repo context, and source recovery through the same MCP interface.
 
 ### Obsidian and Markdown
 
+Fresh install:
+
 ```bash
 curl -sSL https://getflex.dev/install.sh | bash -s -- obsidian
 ```
 
-or point directly at a vault:
+Point directly at a vault:
 
 ```bash
 VAULT=/path/to/vault curl -sSL https://getflex.dev/install.sh | bash -s -- obsidian
+```
+
+If flex is already installed:
+
+```bash
+flex init --module obsidian --vault /path/to/vault --name obsidian
+flex core search --cell obsidian "@orient"
 ```
 
 Then ask through MCP:
