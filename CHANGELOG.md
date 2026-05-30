@@ -30,31 +30,54 @@ The overloaded CLI skill was replaced by a clearer split: a public `flex` retrie
 
 Default MCP discovery is smaller: active listed sources show by default, active unlisted sources stay queryable by exact name, and inactive sources stay unavailable. `flex status`, `flex status --problems`, and `flex health` report local source health. Worker retry on repeatedly-failing unchanged session files is quieter.
 
-**Runtime And Install Reliability**
+## 0.20.0 — April 29, 2026
 
-`flex core sync` repairs supervised Linux service installs instead of replacing them with unmanaged background processes, and restarts respect systemd-owned installs. Local worker services and remote refresh scheduling are separated, so a service restart no longer triggers unrelated refresh work. Public install paths exist for `claude-code`, `codex`, and `obsidian`.
+**Published To PyPI**
 
-## 0.10.0 — March 30, 2026
+flex became installable from PyPI as `getflex`, published through GitHub Actions Trusted Publishing from the public repository. The `getflex.dev` installer resolves the published wheel and checksum, so `pip install getflex` and `curl -sSL https://getflex.dev/install.sh | bash` both serve the released version.
 
-**Hybrid Retrieval**
+## 0.10.0 — April 3, 2026
 
-`keyword()` gained scoped filtering, better natural-language handling, and rank normalization, so it composes with `vec_ops()` in one SQL statement for hybrid search. Install split into base Flex and source-specific setup paths, and local embedding via `flex-embed` replaced the previous cloud embedding path. Public delivery moved to a wheel-first install aligned around `getflex.dev`.
+**Flex SDK**
 
-## 0.8.1 — March 13, 2026
+Introduced the SDK for building a cell from any source without writing view SQL or importing module internals. `index()` indexes a text list or folder in one line; the structured path — `create`, `source`, `ingest`, `link`, `embed`, `graph`, `register` — adds typed metadata, tree edges, and graph intelligence. `create()` reuses an existing cell path instead of orphaning databases, and `register()` carries lifecycle and refresh controls (`static` / `refresh` / `watch`).
+
+**Lifecycle And Status**
+
+Cell lifecycle moved into the registry as a single control plane. `flex status` reports lifecycle, last refresh, and state across cells.
+
+**Hybrid Retrieval Hardening**
+
+`keyword()` gained a scoped pre-filter so BM25 ranks within a subset instead of the global index, plus FTS5 sanitization for natural-language input and rank normalization that makes `keyword()`/`vec_ops()` score fusion meaningful.
+
+**Install Paths**
+
+Install split into base flex (`flex index` ready) and a full `claude-code` pipeline (session scanning, worker, services, MCP). Wheels are hosted on `getflex.dev`.
+
+## 0.9.0 — March 14, 2026
+
+**Indexing And Scale**
+
+Added file-body indexing — content from Write, Read, and Edit tool results is chunked by language and embedded alongside session messages. Session parsing became fork-aware, code files split along structural boundaries via tree-sitter, and graph builds scaled to large cells through FAISS nearest-neighbor search with NetworKit graph algorithms.
+
+## 0.8.0 — March 13, 2026
+
+**Public Release**
+
+The public repository was released under MIT with public install artifacts.
 
 **Unified Query Surface**
 
-A single `chunks` view made content queryable across source types. `vec_ops()` tokens were renamed around retrieval behavior (`similar:`, `suppress:`, `centroid:`, `pool:`) and gained `decay:` for temporal score decay. File-body content — generated and edited files, split along Markdown and code structural boundaries — became queryable alongside session messages. Graph and similarity work got faster on larger sources, and embedding writes became safe under concurrent reads.
+A single `chunks` view made content queryable across source types, with `type` as a column rather than a separate view per substrate. `vec_ops()` tokens were renamed around retrieval behavior (`similar:`, `suppress:`, `centroid:`, `pool:`) and gained `decay:` for temporal score decay.
 
-## 0.3.0 — March 2, 2026
+## 0.7.0 — March 10, 2026
 
-**Keyword Search**
+**arXiv Source**
 
-`keyword()` was added for full-text search alongside `vec_ops()`, combinable in one query, with `flex sync` checking and repairing the keyword index. The `curl | bash` installer was rewritten for interrupted downloads, reinstall, uninstall, and shell PATH setup, and detects and re-downloads corrupt model files. Flex stopped colliding with GNU flex, the lexer generator.
+arXiv became the first non-conversation source — searchable papers with research-oriented views, proving the cell shape generalizes beyond coding-agent sessions.
 
-## 0.2.x — February 2026
+## 0.5.0 — March 7, 2026
 
-**One-Line Install And Mac Support**
+**Scoring Engine And Worker**
 
-`curl -sSL https://getflex.dev/install.sh | bash` handles Python venvs, PATH, and the GNU flex name collision. `flex init` recovers from interrupted or corrupt model downloads and resumes instead of restarting; `flex sync` repairs broken installs. Flex runs on macOS, supports multiple simultaneous Claude Code sessions, and on systems without a service manager the MCP server can handle indexing itself. Plain-text `flex search` input returns suggestions instead of a raw SQL error.
-
+The scoring engine moved to a compiled implementation while keeping query compatibility. Session indexing moved to size-based polling, which reliably captures sub-agent sessions and any still-growing session instead of marking partial syncs done.
