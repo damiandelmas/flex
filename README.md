@@ -109,28 +109,26 @@ heading hierarchy without touching your files, then exposes backlinks and note
 communities as queryable columns. New sources arrive the same way Claude Code,
 Codex, and Obsidian do — compiled into a cell behind the one query surface.
 
-### source modules and support tiers
-
-Two tiers, one honest promise each:
+### source modules
 
 **Core**
 
 | module | what it indexes |
 |---|---|
-| `claude-code` | Claude Code sessions: prompts, tool calls, file evidence |
-| `codex` | Codex CLI sessions, same surface |
-| `obsidian` | vaults and markdown trees: sections, wikilinks, backlinks |
-| `tools` | the agentic ecosystem catalog: skills, MCP servers, frameworks |
+| [`claude-code`](https://github.com/damiandelmas/flex/blob/main/flex/modules/claude_code/README.md) | Claude Code sessions: prompts, tool calls, file evidence |
+| [`codex`](https://github.com/damiandelmas/flex/blob/main/flex/modules/codex/README.md) | Codex CLI sessions, same surface |
+| [`obsidian`](https://github.com/damiandelmas/flex/blob/main/flex/modules/markdown/README.md) | vaults and markdown trees: sections, wikilinks, backlinks |
+| [`tools`](https://github.com/damiandelmas/flex/blob/main/flex/modules/skills/README.md) | the agentic ecosystem catalog: skills, MCP servers, frameworks |
 
 **Beta**
 
 | module | install |
 |---|---|
-| `reddit` | `flex init --module reddit --subreddits ClaudeCode,LocalLLaMA --since 30d` |
-| `hn` | `flex init --module hn --hn-queries "claude code,mcp server"` |
-| `github` | `flex init --module github --github-repos owner/repo` |
-| `arxiv` | `flex init --module arxiv --arxiv-query "all:retrieval augmented generation"` |
-| `goose` | Goose sessions via the shared coding-agent substrate |
+| [`reddit`](https://github.com/damiandelmas/flex/blob/main/flex/modules/reddit/README.md) | `flex init --module reddit --subreddits ClaudeCode,LocalLLaMA --since 30d` |
+| [`hn`](https://github.com/damiandelmas/flex/blob/main/flex/modules/hn/README.md) | `flex init --module hn --hn-queries "claude code,mcp server"` |
+| [`github`](https://github.com/damiandelmas/flex/blob/main/flex/modules/github/README.md) | `flex init --module github --github-repos owner/repo` |
+| [`arxiv`](https://github.com/damiandelmas/flex/blob/main/flex/modules/arxiv/README.md) | `flex init --module arxiv --arxiv-query "all:retrieval augmented generation"` |
+| [`goose`](https://github.com/damiandelmas/flex/blob/main/flex/modules/goose/README.md) | Goose sessions via the shared coding-agent substrate |
 
 ## extension modules
 
