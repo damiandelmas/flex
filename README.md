@@ -109,6 +109,29 @@ heading hierarchy without touching your files, then exposes backlinks and note
 communities as queryable columns. New sources arrive the same way Claude Code,
 Codex, and Obsidian do — compiled into a cell behind the one query surface.
 
+### source modules and support tiers
+
+Two tiers, one honest promise each:
+
+**Core**
+
+| module | what it indexes |
+|---|---|
+| `claude-code` | Claude Code sessions: prompts, tool calls, file evidence |
+| `codex` | Codex CLI sessions, same surface |
+| `obsidian` | vaults and markdown trees: sections, wikilinks, backlinks |
+| `tools` | the agentic ecosystem catalog: skills, MCP servers, frameworks |
+
+**Beta**
+
+| module | install |
+|---|---|
+| `reddit` | `flex init --module reddit --subreddits ClaudeCode,LocalLLaMA --since 30d` |
+| `hn` | `flex init --module hn --hn-queries "claude code,mcp server"` |
+| `github` | `flex init --module github --github-repos owner/repo` |
+| `arxiv` | `flex init --module arxiv --arxiv-query "all:retrieval augmented generation"` |
+| `goose` | Goose sessions via the shared coding-agent substrate |
+
 ## extension modules
 
 Extension modules enrich any cell with shared structure — they don't add a source

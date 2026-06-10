@@ -102,6 +102,9 @@ class VectorCache:
         self.dims: int = 0
         # Column arrays for landscape modulation (N,), aligned with self.ids
         self.timestamps: Optional[np.ndarray] = None    # (N,) float64, epoch seconds
+        # Incremental-append cursor state (see append_from_db)
+        self.max_rowid: int = 0          # highest rowid seen among loaded embedded rows
+        self.embedded_count: int = 0     # rows in the matrix (post dim-filter)
 
     def load_from_db(self, db, table: str, embedding_col: str = 'embedding',
                      id_col: str = 'id') -> 'VectorCache':
@@ -109,7 +112,7 @@ class VectorCache:
         start = time.time()
 
         rows = db.execute(
-            f"SELECT [{id_col}], [{embedding_col}] FROM [{table}] "
+            f"SELECT rowid, [{id_col}], [{embedding_col}] FROM [{table}] "
             f"WHERE [{embedding_col}] IS NOT NULL"
         ).fetchall()
 
@@ -120,8 +123,10 @@ class VectorCache:
         vectors = []
 
         for row in rows:
-            self.ids.append(row[0])
-            vectors.append(np.frombuffer(row[1], dtype=np.float32))
+            if row[0] is not None and row[0] > self.max_rowid:
+                self.max_rowid = row[0]
+            self.ids.append(row[1])
+            vectors.append(np.frombuffer(row[2], dtype=np.float32))
 
         # Detect dominant dimension and filter outliers (guards against mixed-model migrations)
         dims = [v.shape[0] for v in vectors]
@@ -150,11 +155,122 @@ class VectorCache:
         # Build index
         self._id_to_idx = {id_: i for i, id_ in enumerate(self.ids)}
 
+        self.embedded_count = len(self.ids)
+
         self.loaded_at = time.time()
         elapsed = (self.loaded_at - start) * 1000
         self._load_msg = f"VectorCache: {len(self.ids)} vectors ({self.dims}d) in {elapsed:.1f}ms"
 
         return self
+
+    def append_from_db(self, db, table: str, embedding_col: str = 'embedding',
+                       id_col: str = 'id') -> 'VectorCache | None | int':
+        """Incremental refresh: build a SUCCESSOR cache with rows appended.
+
+        Returns the successor VectorCache (swap it in with one assignment —
+        never mutate this instance, in-flight searches hold it), 0 if there
+        is nothing new (caller may treat the cache as fresh), or None if a
+        full rebuild is required.
+
+        None (rebuild) when: cache never loaded; embedded-row count for this
+        dim dropped (deletes happened — ghost risk); or the new-row batch is
+        large enough that a rebuild is cheaper.
+
+        Known residual: a delete + insert that keeps the count equal within
+        one refresh window can leave a ghost row (id that joins to nothing)
+        until the periodic full-rebuild floor (engine.refresh_vec_state)
+        forces a reload. Pool pollution only — never wrong content.
+        """
+        if self.matrix is None or not self.ids or self.dims == 0:
+            return None
+
+        byte_len = self.dims * 4  # float32 blobs; length() on BLOB = bytes
+        try:
+            total = db.execute(
+                f"SELECT COUNT(*) FROM [{table}] "
+                f"WHERE [{embedding_col}] IS NOT NULL AND length([{embedding_col}]) = ?",
+                (byte_len,),
+            ).fetchone()[0]
+        except Exception:
+            return None
+        if total < self.embedded_count:
+            return None  # deletes detected — heal via full rebuild
+
+        try:
+            rows = db.execute(
+                f"SELECT rowid, [{id_col}], [{embedding_col}] FROM [{table}] "
+                f"WHERE rowid > ? AND [{embedding_col}] IS NOT NULL",
+                (self.max_rowid,),
+            ).fetchall()
+        except Exception:
+            return None
+        if not rows:
+            return 0
+        if len(rows) > max(10_000, len(self.ids) // 4):
+            return None  # rebuild is cheaper than a mega-concat
+
+        new_max = self.max_rowid
+        new_ids: list = []
+        vecs: list = []
+        for rowid, id_, blob in rows:
+            if rowid is not None and rowid > new_max:
+                new_max = rowid
+            v = np.frombuffer(blob, dtype=np.float32)
+            if v.shape[0] != self.dims:
+                continue  # mixed-model artifact, same rule as load_from_db
+            if id_ in self._id_to_idx:
+                continue  # already present (e.g. re-scanned row)
+            new_ids.append(id_)
+            vecs.append(v)
+
+        succ = VectorCache()
+        succ.dims = self.dims
+        succ.loaded_at = self.loaded_at  # full-load age survives appends (rebuild floor)
+        succ.max_rowid = new_max
+        succ.embedded_count = self.embedded_count + len(new_ids)
+        succ.ids = self.ids + new_ids
+        succ._id_to_idx = dict(self._id_to_idx)
+        base = len(self.ids)
+        for i, id_ in enumerate(new_ids):
+            succ._id_to_idx[id_] = base + i
+
+        if vecs:
+            block = np.vstack(vecs)
+            norms = np.linalg.norm(block, axis=1, keepdims=True)
+            norms[norms == 0] = 1
+            block = block / norms
+            succ.matrix = np.concatenate([self.matrix, block])
+        else:
+            # All fetched rows were dupes/dim-skipped; matrix unchanged.
+            # Sharing is safe: matrices are immutable by convention.
+            succ.matrix = self.matrix
+
+        if self.timestamps is not None:
+            succ.timestamps = np.concatenate(
+                [self.timestamps, np.zeros(len(new_ids), dtype=np.float64)])
+            if new_ids:
+                try:
+                    cols = {r[1] for r in db.execute(
+                        f"PRAGMA table_info([{table}])").fetchall()}
+                    if 'timestamp' in cols:
+                        for chunk_start in range(0, len(new_ids), 900):
+                            chunk = new_ids[chunk_start:chunk_start + 900]
+                            ph = ','.join('?' * len(chunk))
+                            for id_, ts_raw in db.execute(
+                                f"SELECT [{id_col}], timestamp FROM [{table}] "
+                                f"WHERE [{id_col}] IN ({ph}) AND timestamp IS NOT NULL",
+                                tuple(chunk),
+                            ).fetchall():
+                                idx = succ._id_to_idx.get(id_)
+                                if idx is not None and idx >= base:
+                                    ts = _coerce_timestamp(ts_raw)
+                                    if ts is not None:
+                                        succ.timestamps[idx] = ts
+                except Exception as e:
+                    print(f"VectorCache: append timestamps load failed: {e}",
+                          file=sys.stderr)
+
+        return succ
 
     def load_columns(self, db, table: str, id_col: str = 'id'):
         """Load timestamp arrays from DB, aligned with self.ids."""

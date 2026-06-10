@@ -39,6 +39,7 @@ try:
         get_embedder as _engine_get_embedder,
         warm_embedder,
         build_vec_state as _engine_build_vec_state,
+        refresh_vec_state as _engine_refresh_vec_state,
         register_vec_udf,
         execute_preset as _engine_execute_preset,
         materialize as _engine_materialize,
@@ -64,6 +65,58 @@ _vec_locks_guard = threading.Lock()  # protects _vec_locks dict creation only
 # Debounce VectorCache rebuilds — daemon writes every 2s but embeddings change
 # much less often. Only rebuild if mtime is stale by more than this threshold.
 _VEC_REBUILD_DEBOUNCE_S = 60
+
+# Matrix-byte budget for resident VectorCaches. Cells queried once would
+# otherwise stay resident forever; least-recently-used cells are evicted
+# when the total exceeds the budget (re-warm on next query costs seconds).
+# Counts matrix bytes only — python id-list/dict overhead is excluded.
+_VEC_BUDGET_BYTES = int(os.environ.get('FLEX_VEC_BUDGET_MB', '3072')) * 1024 * 1024
+
+
+def _state_matrix_bytes(state: dict) -> int:
+    """Total numpy matrix bytes held by one cell's cached state."""
+    total = 0
+    for cache in (state.get('caches') or {}).values():
+        m = getattr(cache, 'matrix', None)
+        if m is not None:
+            total += m.nbytes
+        ts = getattr(cache, 'timestamps', None)
+        if ts is not None:
+            total += ts.nbytes
+    return total
+
+
+def _enforce_vec_budget(current: str | None = None):
+    """Evict least-recently-used cell caches until under _VEC_BUDGET_BYTES.
+
+    Never evicts `current` (the cell being served right now). Dict deletion
+    is atomic; a concurrently rebuilding cell simply re-inserts afterward
+    and the next sweep re-evaluates. In-flight queries hold their own
+    state references and are unaffected by eviction.
+    """
+    if _VEC_BUDGET_BYTES <= 0:
+        return
+    try:
+        sizes = {name: _state_matrix_bytes(s) for name, s in list(_vec_state.items())}
+        total = sum(sizes.values())
+        if total <= _VEC_BUDGET_BYTES:
+            return
+        by_age = sorted(
+            (name for name in sizes if name != current),
+            key=lambda n: _vec_state.get(n, {}).get('last_used', 0.0),
+        )
+        for name in by_age:
+            if total <= _VEC_BUDGET_BYTES:
+                break
+            state = _vec_state.pop(name, None)
+            if state is None:
+                continue
+            total -= sizes.get(name, 0)
+            print(f"[flex-mcp]   {name}: vec_cache evicted "
+                  f"({sizes.get(name, 0) // (1024*1024)}MB, LRU over budget)",
+                  file=sys.stderr)
+    except Exception:
+        pass  # budget enforcement must never break a query
 
 # Known cells (just names, for instructions). Populated at startup + lazily.
 _known_cells: set[str] = set()
@@ -171,12 +224,14 @@ def get_cell(name: str, warm_vec: bool = True):
             pass
         elif HAS_ENGINE and state and state['mtime'] == current_mtime:
             # Cache is fresh — just register UDF on this connection
+            state['last_used'] = time.time()
             register_vec_udf(db, state)
         elif HAS_ENGINE and not _no_embed:
             # Debounce: if cache exists and mtime drift is small, reuse stale cache.
-            # Embeddings are append-only — a slightly stale cache misses new rows
-            # but doesn't return wrong results. First warmup (state is None) always runs.
+            # Embeddings are mostly append-only — a slightly stale cache misses new
+            # rows but doesn't return wrong results. First warmup (state None) always runs.
             if state and (current_mtime - state['mtime']) < _VEC_REBUILD_DEBOUNCE_S:
+                state['last_used'] = time.time()
                 register_vec_udf(db, state)
             else:
                 # Per-cell lock — rebuilding one cell doesn't block queries on others
@@ -189,14 +244,33 @@ def get_cell(name: str, warm_vec: bool = True):
                     # Re-check after acquiring lock (another thread may have built it)
                     state = _vec_state.get(name)
                     if state and (current_mtime - state['mtime']) < _VEC_REBUILD_DEBOUNCE_S:
+                        state['last_used'] = time.time()
                         register_vec_udf(db, state)
                     else:
-                        new_state = _engine_build_vec_state(name, db, current_mtime)
-                        if new_state:
-                            _vec_state[name] = new_state
-                            register_vec_udf(db, new_state)
-                            print(f"[flex-mcp]   {name}: vec_cache {'refreshed' if state else 'warmed'}"
-                                  f" ({list(new_state['caches'].keys())})", file=sys.stderr)
+                        # Incremental first: embeddings mostly append, so a
+                        # successor-cache append avoids re-reading the whole
+                        # matrix (the RSS-ratchet source). Falls back to a
+                        # full rebuild on deletes, large drift, or age.
+                        refreshed = None
+                        if state:
+                            try:
+                                refreshed = _engine_refresh_vec_state(state, db)
+                            except Exception:
+                                refreshed = None
+                        if refreshed == 'appended':
+                            state['mtime'] = current_mtime
+                            state['last_used'] = time.time()
+                            register_vec_udf(db, state)
+                            print(f"[flex-mcp]   {name}: vec_cache appended", file=sys.stderr)
+                        else:
+                            new_state = _engine_build_vec_state(name, db, current_mtime)
+                            if new_state:
+                                new_state['last_used'] = time.time()
+                                _vec_state[name] = new_state
+                                register_vec_udf(db, new_state)
+                                print(f"[flex-mcp]   {name}: vec_cache {'refreshed' if state else 'warmed'}"
+                                      f" ({list(new_state['caches'].keys())})", file=sys.stderr)
+                                _enforce_vec_budget(current=name)
 
         yield db
     finally:
@@ -736,6 +810,21 @@ _GATE_TOKEN_LIMIT = 10_000  # gate results over ~10K tokens
 _GATE_CHAR_LIMIT = int(_GATE_TOKEN_LIMIT * _CHARS_PER_TOKEN)
 _GATE_FORCE_LIMIT = 100_000  # hard cap even with ! prefix (~350KB)
 _GATE_FORCE_CHAR_LIMIT = int(_GATE_FORCE_LIMIT * _CHARS_PER_TOKEN)
+# Presets exempt from the response gate. orient is the introspection entry
+# point — it must always return whole. Aliases mirror engine.execute_preset.
+_UNGATED_PRESETS = frozenset({
+    'orient', 'help', 'info', 'about', 'introspect', 'orientation',
+})
+
+
+def _is_ungated_preset(query: str) -> bool:
+    """True if query is a gate-exempt preset (orient + aliases)."""
+    q = query.lstrip()
+    if not q.startswith('@'):
+        return False
+    return q[1:].split()[0].lower() in _UNGATED_PRESETS if len(q) > 1 else False
+
+
 _PREVIEW_ROWS = 10  # max rows in preview (actual count limited by char budget)
 _PREVIEW_FIELD_LIMIT = 200  # max chars per string field in preview
 _PREVIEW_CHAR_BUDGET = 2000  # max total chars for preview (~500 tokens)
@@ -890,6 +979,11 @@ async def handle_call_tool(
     if query.startswith('!'):
         force = True
         query = query[1:].lstrip()
+
+    # orient (+ aliases) is never gated — introspection must return whole.
+    # Still subject to the force hard ceiling below.
+    if _is_ungated_preset(query):
+        force = True
 
     loop = asyncio.get_running_loop()
     result = await loop.run_in_executor(None, _execute_cell_query, cell, query)

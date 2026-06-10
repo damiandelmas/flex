@@ -87,6 +87,48 @@ def build_vec_state(name: str, db: sqlite3.Connection, mtime: float) -> dict | N
     }
 
 
+# Force a full VectorCache reload this often even if appends succeed —
+# bounds the lifetime of ghost rows from delete+insert sequences the
+# count-drift detector cannot see (see VectorCache.append_from_db).
+_VEC_FULL_REBUILD_INTERVAL_S = 3600
+
+
+def refresh_vec_state(state: dict, db: sqlite3.Connection) -> str:
+    """Try an incremental append on every cached table.
+
+    Returns 'appended' on success (successor caches swapped in; zero-row
+    appends count as success) or 'rebuild' if any table needs a full
+    build_vec_state. Successors are applied only if ALL tables succeed,
+    so the state never mixes appended and stale tables.
+    """
+    import time as _time
+
+    caches = (state or {}).get('caches') or {}
+    if not caches:
+        return 'rebuild'
+
+    updates = {}
+    for table, id_col in [('_raw_chunks', 'id'), ('_raw_sources', 'source_id')]:
+        cache = caches.get(table)
+        if cache is None:
+            continue
+        if cache.loaded_at and (_time.time() - cache.loaded_at) > _VEC_FULL_REBUILD_INTERVAL_S:
+            return 'rebuild'
+        try:
+            result = cache.append_from_db(db, table, 'embedding', id_col)
+        except Exception:
+            return 'rebuild'
+        if result is None:
+            return 'rebuild'
+        if result != 0:
+            updates[table] = result
+
+    for table, succ in updates.items():
+        caches[table] = succ  # single dict-key assignment — atomic swap
+
+    return 'appended'
+
+
 def register_vec_udf(db: sqlite3.Connection, state: dict):
     """Register vec_ops UDF on a connection using cached VectorCache."""
     try:

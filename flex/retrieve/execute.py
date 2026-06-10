@@ -30,6 +30,44 @@ from flex.retrieve.keyword import materialize_keyword
 _cache_state: dict = {}
 _cache_lock = threading.Lock()
 
+# Force a full reload this often even when appends succeed — bounds ghost
+# rows from delete+insert sequences the count-drift detector cannot see.
+_FULL_REBUILD_INTERVAL_S = 3600
+
+
+def _try_append(state: dict, db) -> bool:
+    """Incremental refresh of a cached state via VectorCache.append_from_db.
+
+    Returns True if all tables appended cleanly (successors swapped in),
+    False if any table needs a full rebuild. Applies successors only when
+    every table succeeds, so the state never mixes fresh and stale tables.
+    """
+    import time as _time
+
+    caches = (state or {}).get('caches') or {}
+    if not caches:
+        return False
+
+    updates = {}
+    for table, id_col in [('_raw_chunks', 'id'), ('_raw_sources', 'source_id')]:
+        cache = caches.get(table)
+        if cache is None:
+            continue
+        if cache.loaded_at and (_time.time() - cache.loaded_at) > _FULL_REBUILD_INTERVAL_S:
+            return False
+        try:
+            result = cache.append_from_db(db, table, 'embedding', id_col)
+        except Exception:
+            return False
+        if result is None:
+            return False
+        if result != 0:
+            updates[table] = result
+
+    for table, succ in updates.items():
+        caches[table] = succ  # single dict-key assignment — atomic swap
+    return True
+
 _embedder = None
 _embedder_lock = threading.Lock()
 
@@ -133,6 +171,11 @@ def open_cell_for_query(name: str, force_refresh: bool = False) -> sqlite3.Conne
         with _cache_lock:
             state = _cache_state.get(name)
             if state and state['mtime'] == current_mtime and not force_refresh:
+                _register_udf(db, state)
+            elif state and not force_refresh and _try_append(state, db):
+                # Incremental: only new rows read; in-flight consumers keep
+                # their old self-consistent cache objects.
+                state['mtime'] = current_mtime
                 _register_udf(db, state)
             else:
                 new_state = _build_cache(db, name, db_path)

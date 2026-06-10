@@ -145,12 +145,24 @@ def _sql_literal(value: str) -> str:
 
 
 def _provider_for_acp(db: sqlite3.Connection) -> str:
+    # The cell's own self-description is authoritative when present.
+    try:
+        row = db.execute(
+            "SELECT value FROM _meta WHERE key = 'cell_type'"
+        ).fetchone()
+        if row and row[0]:
+            return str(row[0])
+    except sqlite3.Error:
+        pass
+    # Fallback: provider-specific sidecars before the shared substrate table.
+    # Non-Claude cells built on the claude_code substrate all carry
+    # _types_message, so the generic table must be checked last.
     providers = [
-        ("claude_code", "_types_message"),
         ("codex", "_types_codex_turn"),
         ("opencode", "_types_opencode_session"),
         ("goose", "_types_goose_session"),
         ("aider", "_types_aider_session"),
+        ("claude_code", "_types_message"),
     ]
     for provider, table in providers:
         if _has_table(db, table):

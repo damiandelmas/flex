@@ -302,7 +302,7 @@ def compile_vault(
              presets_dirs=presets_dirs,
              lifecycle='watch',
              watch_path=str(root))
-    print(f"  Cell '{name}' ready. Query with: flex search --cell {name} \"@orient\"")
+    print(f"  Cell '{name}' ready. Query with: flex core search --cell {name} \"@orient\"")
 
     return db
 

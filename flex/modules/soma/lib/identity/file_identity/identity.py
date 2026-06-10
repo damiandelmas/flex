@@ -70,8 +70,9 @@ class FileIdentity:
         """Get database connection, init if needed."""
         self.db_path.parent.mkdir(parents=True, exist_ok=True)
 
-        db = sqlite3.connect(self.db_path)
+        db = sqlite3.connect(self.db_path, timeout=30)
         db.row_factory = sqlite3.Row
+        db.execute("PRAGMA busy_timeout=30000")
 
         # Init schema if fresh
         if not db.execute("SELECT name FROM sqlite_master WHERE type='table' AND name='files'").fetchone():

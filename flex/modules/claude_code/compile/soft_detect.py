@@ -19,6 +19,39 @@ class SoftFileOp:
     confidence: str   # low, medium, high
     detection_method: str = "parsed"
 
+# Characters that mean a captured token is shell syntax, not a literal path:
+# unexpanded vars ($VAR), brace expansion ({a,b}), globs (*?), command
+# substitution / quotes / lists. Targets containing any of these are dropped.
+_SHELL_META = set('${}*?()"\'`,;')
+
+
+def _looks_pathlike(token: str) -> bool:
+    """True if a raw captured token plausibly names a file path.
+
+    Used to gate the generic `CMD > target` redirect, whose `>` can also be a
+    comparison inside a heredoc body or script (e.g. `if a > b:`).
+    """
+    return bool(token) and (
+        token.startswith(('/', '~', './', '../')) or '/' in token or '.' in token
+    )
+
+
+def _clean_target(fp: str) -> str | None:
+    """Strip trailing punctuation/quotes; reject tokens that are shell syntax.
+
+    Returns the cleaned path, or None if the token should be dropped.
+    """
+    if not fp:
+        return None
+    fp = fp.strip().strip('\'"')
+    fp = fp.rstrip(':,;)') .rstrip('\'"')
+    if not fp:
+        return None
+    if any(ch in fp for ch in _SHELL_META):
+        return None
+    return fp
+
+
 def detect_file_ops(command: str, cwd: str = None) -> list[SoftFileOp]:
     """
     Detect file operations from a Bash command.
@@ -53,6 +86,25 @@ def detect_file_ops(command: str, cwd: str = None) -> list[SoftFileOp]:
                 confidence="medium"
             ))
 
+    # Pattern: generic overwrite redirect from any command - CMD > file
+    # Catches `cat > file`, `cat > file <<EOF`, `command > out`, etc.
+    # The char before `>` must not be `>` (append), a digit/`&` (fd redirect
+    # like `2>` / `&>`), or `-` (the `->` arrow). Targets that are fd dups
+    # (`&1`) or /dev/* are skipped.
+    generic_write = re.findall(r"(?:^|[^->\d&])>\s*([^\s;&|>]+)", cmd)
+    for filepath in generic_write:
+        if filepath.startswith("&") or filepath.startswith("/dev/"):
+            continue
+        # The generic redirect is the lowest-signal pattern: its `>` may be a
+        # comparison inside a heredoc body or script. Require a path-like token.
+        if not _looks_pathlike(filepath):
+            continue
+        ops.append(SoftFileOp(
+            file_path=_resolve_path(filepath, cwd),
+            inferred_op="write",
+            confidence="medium"
+        ))
+
     # Pattern: append redirect
     # echo "..." >> /path/file
     echo_append = re.findall(r">>\s*([^\s;&|]+)", cmd)
@@ -77,7 +129,8 @@ def detect_file_ops(command: str, cwd: str = None) -> list[SoftFileOp]:
     # Pattern: tee (write)
     # ... | tee /path/file
     # ... | tee -a /path/file (append)
-    tee_write = re.findall(r"\|\s*tee\s+(?:-a\s+)?([^\s;&|]+)", cmd)
+    # tee /path/file  (leading pipe optional)
+    tee_write = re.findall(r"\btee\s+(?:-a\s+)?([^\s;&|]+)", cmd)
     for filepath in tee_write:
         is_append = "-a" in cmd[:cmd.find(filepath)]
         ops.append(SoftFileOp(
@@ -244,6 +297,17 @@ def detect_file_ops(command: str, cwd: str = None) -> list[SoftFileOp]:
                 inferred_op="read",
                 confidence="high"
             ))
+
+    # Clean targets and drop tokens that are shell syntax rather than paths
+    # (unexpanded $vars, brace expansion, globs, quotes, trailing punctuation).
+    cleaned = []
+    for op in ops:
+        ct = _clean_target(op.file_path)
+        if ct is None:
+            continue
+        op.file_path = ct
+        cleaned.append(op)
+    ops = cleaned
 
     # Deduplicate by file_path, keeping highest confidence
     seen = {}

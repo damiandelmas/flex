@@ -1,10 +1,10 @@
 #!/usr/bin/env python3
 """
-Flex CLI — flex init + flex search.
+Flex CLI — flex init + flex core search.
 
 pip install getflex
 flex init              # storage + model + MCP wiring
-flex search "query"    # query your sessions
+flex core search --cell claude_code "query"    # raw terminal query
 """
 
 import argparse
@@ -141,6 +141,16 @@ def _install_claude_assets(skill_names=None):
             "skills/flex-sessions-codex/",
             "skills/flex-sessions-codex/",
         ),
+        "flex:sessions:goose": (
+            "skills/flex-sessions-goose/",
+            "skills/flex-sessions-goose/",
+        ),
+        "flex:reddit": ("skills/flex-reddit/", "skills/flex-reddit/"),
+        "flex:hn": ("skills/flex-hn/", "skills/flex-hn/"),
+        "flex:github": ("skills/flex-github/", "skills/flex-github/"),
+        "flex:arxiv": ("skills/flex-arxiv/", "skills/flex-arxiv/"),
+        "flex:markdown": ("skills/flex-markdown/", "skills/flex-markdown/"),
+        "flex:tools": ("skills/flex-tools/", "skills/flex-tools/"),
     }
 
     skill_mode = os.environ.get("FLEX_SKILL_MODE", "mcp").strip().lower()
@@ -240,6 +250,13 @@ def _install_systemd():
             "Restart=always\n"
             "RestartSec=5\n"
             "Environment=PYTHONUNBUFFERED=1\n"
+            # Cap glibc malloc arenas: VectorCache full-matrix rebuilds churn
+            # large allocations; unbounded arenas fragment and ratchet RSS.
+            "Environment=MALLOC_ARENA_MAX=2\n"
+            # Memory backstop: VectorCache has no eviction; a runaway resident
+            # set restarts the service (warm-up is ~seconds) instead of
+            # pressuring the host.
+            "MemoryMax=8G\n"
             # KillMode=mixed: SIGTERM to main only, then SIGKILL the whole
             # cgroup after TimeoutStopSec. Ensures python children get
             # reaped cleanly on restart.
@@ -743,8 +760,8 @@ def cmd_init(args):
         console.print()
         panel_content = Text()
         panel_content.append("Flex is ready.\n\n", style="cyan")
-        panel_content.append("  flex search          ", style="bold")
-        panel_content.append("query from terminal\n", style="dim")
+        panel_content.append("  flex core search     ", style="bold")
+        panel_content.append("raw terminal query\n", style="dim")
         panel_content.append("For Claude Code session search:\n", style="dim")
         panel_content.append("  curl -sSL https://getflex.dev/install.sh | bash -s -- claude-code\n", style="bold")
         console.print(Panel(panel_content, padding=(1, 2), highlight=False))
@@ -900,7 +917,7 @@ def cmd_relay(args):
 
 
 # ============================================================
-# flex search
+# raw search implementation
 # ============================================================
 
 def _open_cell_for_search(cell_name: str):
@@ -1752,7 +1769,7 @@ def _gnu_flex_proxy():
             "GNU flex doesn't appear to be installed on this system.\n"
             "\n"
             "  Install GNU flex:  apt install flex  /  brew install flex\n"
-            "  Use getflex:       flex init  |  flex search  |  flex sync",
+            "  Use getflex:       flex init  |  flex core search  |  flex sync",
             file=sys.stderr,
         )
         sys.exit(1)
@@ -1764,13 +1781,18 @@ def main():
     load_plugins()
     # Register built-in SDK commands such as `flex index` before CLI parsing.
     import flex.sdk  # noqa: F401
+    # Register public downloadable-cell commands such as `flex catalog` and `flex add`.
+    try:
+        import flex.catalog  # noqa: F401
+    except ImportError:
+        pass
 
     raw_argv = sys.argv[1:]
     if raw_argv and raw_argv[0] == "core":
         raw_argv = raw_argv[1:]
     elif raw_argv and raw_argv[0] == "search":
         print(
-            "`flex search` moved to `flex core search`.\n"
+            "Top-level search moved to `flex core search`.\n"
             "Use MCP for agent retrieval, or `flex core search --cell <name> <query>` for raw CLI debugging.",
             file=sys.stderr,
         )
@@ -1814,7 +1836,7 @@ def main():
             except Exception as _e:
                 print(f"[cli] register_args({_entry['folder']}) failed: {_e}", file=sys.stderr)
 
-    # flex search
+    # legacy top-level search shim
     search_p = sub.add_parser("search", help="Search your sessions")
     search_p.add_argument("query", help="SQL query, @preset, or vec_ops expression")
     search_p.add_argument("--cell", default="claude_code", help="Cell to query (default: claude_code)")

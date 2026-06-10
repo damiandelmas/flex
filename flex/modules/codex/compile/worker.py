@@ -66,6 +66,7 @@ from flex.modules.claude_code.compile.worker import (
     insert_chunk_atom,
     update_source_stats,
 )
+from flex.modules.claude_code.compile.soft_detect import detect_file_ops
 
 try:
     from flex.modules.soma.coding_agent import enrich_operation as soma_enrich_operation
@@ -280,6 +281,25 @@ def _web_search_text(payload: dict) -> str:
     return f"WebSearch: {query}" if query else "WebSearch"
 
 
+def _shell_cmd_str(cmd) -> str | None:
+    """Normalize a Codex shell cmd to a script string for soft-op detection.
+
+    Codex `exec_command.cmd` is usually a plain string. `local_shell_call`
+    may give an argv list; if it's a shell wrapper (`bash -lc <script>`,
+    `sh -c <script>`), the script is the last element — otherwise join argv.
+    """
+    if not cmd:
+        return None
+    if isinstance(cmd, str):
+        return cmd
+    if isinstance(cmd, (list, tuple)):
+        parts = [str(x) for x in cmd]
+        if len(parts) >= 3 and parts[0] in ("bash", "sh", "zsh") and parts[1] in ("-lc", "-c", "-lic"):
+            return parts[-1]
+        return " ".join(parts)
+    return None
+
+
 def _local_shell_text(payload: dict) -> tuple[str, dict]:
     action = payload.get("action") if isinstance(payload, dict) else None
     if isinstance(action, dict):
@@ -437,6 +457,7 @@ def _sync_session_jsonl(
     tool_ops_items: list[tuple] = []
     tool_content_items: list[tuple] = []
     fb_items: list[tuple] = []
+    soft_ops_items: list[tuple] = []          # (chunk_id, SoftFileOp) inferred shell file ops
     delegation_items: list[tuple] = []
     spawn_agent_chunks: list[str] = []        # chunk_ids of spawn_agent calls in line order
     spawn_agent_args:   list[dict] = []       # parallel: arguments dict for each spawn
@@ -605,6 +626,14 @@ def _sync_session_jsonl(
                 cmd = arguments.get("cmd")
                 if cmd:
                     text_content = f"Bash: {cmd}"
+                    # Soft file-op provenance: infer file mutations from the shell
+                    # command (cat >, heredoc, tee, cp/mv/rm/mkdir). Codex chunks
+                    # carry tool_name=None, so insert_chunk_atom's CC soft-op path
+                    # never fires — accumulate here and batch-insert below.
+                    cmd_str = _shell_cmd_str(cmd)
+                    if cmd_str:
+                        for op in detect_file_ops(cmd_str, effective_cwd):
+                            soft_ops_items.append((chunk_id, op))
             elif raw_name == "write_stdin":
                 ch = arguments.get("chars")
                 if ch:
@@ -682,6 +711,10 @@ def _sync_session_jsonl(
             raw_name = "local_shell"
             canonical = _map_tool_name(raw_name)
             text_content, args = _local_shell_text(p)
+            cmd_str = _shell_cmd_str(args.get("cmd")) if isinstance(args, dict) else None
+            if cmd_str:
+                for op in detect_file_ops(cmd_str, effective_cwd):
+                    soft_ops_items.append((chunk_id, op))
             if line_tc:
                 codex_turn_items.append((chunk_id, line_tc))
             tool_ops_items.append((chunk_id, canonical, None, effective_cwd, git_branch, True))
@@ -827,6 +860,17 @@ def _sync_session_jsonl(
                 )
         except Exception as e:
             print(f"[codex] tool_ops insert error: {e}", file=sys.stderr)
+
+    for chunk_id, op in soft_ops_items:
+        try:
+            conn.execute(
+                "INSERT OR IGNORE INTO _edges_soft_ops "
+                "(chunk_id, file_path, file_uuid, inferred_op, confidence) "
+                "VALUES (?, ?, NULL, ?, ?)",
+                (chunk_id, op.file_path, op.inferred_op, op.confidence),
+            )
+        except Exception as e:
+            print(f"[codex] soft_ops insert error: {e}", file=sys.stderr)
 
     for cid, raw, tname, ts in tool_content_items:
         try:
