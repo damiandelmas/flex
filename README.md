@@ -124,11 +124,11 @@ Codex, and Obsidian do — compiled into a cell behind the one query surface.
 
 | module | install |
 |---|---|
+| [`goose`](https://github.com/damiandelmas/flex/blob/main/flex/modules/goose/README.md) | `flex init --module goose` |
+| [`github`](https://github.com/damiandelmas/flex/blob/main/flex/modules/github/README.md) | `flex init --module github --github-repos owner/repo` |
 | [`reddit`](https://github.com/damiandelmas/flex/blob/main/flex/modules/reddit/README.md) | `flex init --module reddit --subreddits ClaudeCode,LocalLLaMA --since 30d` |
 | [`hn`](https://github.com/damiandelmas/flex/blob/main/flex/modules/hn/README.md) | `flex init --module hn --hn-queries "claude code,mcp server"` |
-| [`github`](https://github.com/damiandelmas/flex/blob/main/flex/modules/github/README.md) | `flex init --module github --github-repos owner/repo` |
 | [`arxiv`](https://github.com/damiandelmas/flex/blob/main/flex/modules/arxiv/README.md) | `flex init --module arxiv --arxiv-query "all:retrieval augmented generation"` |
-| [`goose`](https://github.com/damiandelmas/flex/blob/main/flex/modules/goose/README.md) | Goose sessions via the shared coding-agent substrate |
 
 ## extension modules
 
