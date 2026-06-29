@@ -9,8 +9,20 @@ Exports:
                       (formerly install._run_enrichment_quiet).
 """
 
-# Single source of truth for coding-agent enrichment stub tables.
-ENRICHMENT_STUBS: list[str] = [
+# Base enrichment stubs -- generic tables any flex module may need.
+BASE_ENRICHMENT_STUBS: list[str] = [
+    """CREATE TABLE IF NOT EXISTS _ops (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        timestamp INTEGER DEFAULT (strftime('%s','now')),
+        operation TEXT, target TEXT, sql TEXT, params TEXT,
+        rows_affected INTEGER, source TEXT)""",
+    """CREATE TABLE IF NOT EXISTS _views (
+        name TEXT PRIMARY KEY, sql TEXT NOT NULL,
+        description TEXT, created_at INTEGER)""",
+]
+
+# CC-specific enrichment stubs -- coding-agent graph intelligence tables.
+_CC_ENRICHMENT_STUBS: list[str] = [
     """CREATE TABLE IF NOT EXISTS _enrich_source_graph (
         source_id TEXT PRIMARY KEY, centrality REAL, is_hub INTEGER DEFAULT 0,
         is_bridge INTEGER DEFAULT 0, community_id INTEGER, community_label TEXT)""",
@@ -27,15 +39,10 @@ ENRICHMENT_STUBS: list[str] = [
         source_id TEXT PRIMARY KEY, agents_spawned INTEGER,
         is_orchestrator INTEGER DEFAULT 0, delegation_depth INTEGER,
         parent_session TEXT)""",
-    """CREATE TABLE IF NOT EXISTS _ops (
-        id INTEGER PRIMARY KEY AUTOINCREMENT,
-        timestamp INTEGER DEFAULT (strftime('%s','now')),
-        operation TEXT, target TEXT, sql TEXT, params TEXT,
-        rows_affected INTEGER, source TEXT)""",
-    """CREATE TABLE IF NOT EXISTS _views (
-        name TEXT PRIMARY KEY, sql TEXT NOT NULL,
-        description TEXT, created_at INTEGER)""",
 ]
+
+# Full coding-agent enrichment stubs (base + CC). Backward-compatible.
+ENRICHMENT_STUBS: list[str] = BASE_ENRICHMENT_STUBS + _CC_ENRICHMENT_STUBS
 
 
 def __getattr__(name):

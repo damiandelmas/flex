@@ -18,6 +18,16 @@ import sqlite3
 from dataclasses import dataclass, field
 
 
+# Tables that MUST exist after ingest for any flex cell (base contract).
+REQUIRED_BASE_TABLES: tuple[str, ...] = (
+    "_raw_sources",
+    "_raw_chunks",
+    "_raw_content",
+    "_edges_source",
+    "_edges_raw_content",
+)
+
+
 # Tables that MUST exist after ingest for any coding-agent cell.
 # A missing table = schema-level violation (probably a transpiler bug).
 REQUIRED_TABLES: tuple[str, ...] = (
@@ -157,3 +167,35 @@ def validate_coding_agent_cell(
             ))
 
     return report
+
+
+def validate_base_cell(
+    conn: sqlite3.Connection,
+    cell_type: str = "unknown",
+) -> ContractReport:
+    """
+    Validate any flex cell against the base (non-coding-agent) contract.
+
+    Checks only the generic tables that all flex modules produce.
+    Use this for modules with substrate='base'.
+    """
+    n_sources = conn.execute("SELECT COUNT(*) FROM _raw_sources").fetchone()[0]
+    report = ContractReport(cell_type=cell_type, n_sources=n_sources)
+
+    existing = {
+        row[0]
+        for row in conn.execute(
+            "SELECT name FROM sqlite_master "
+            "WHERE type = 'table' AND name NOT LIKE 'sqlite_%'"
+        )
+    }
+    for tbl in REQUIRED_BASE_TABLES:
+        if tbl not in existing:
+            report.violations.append(ContractViolation(
+                severity="error",
+                table=tbl,
+                message="required base table missing",
+            ))
+
+    return report
+
