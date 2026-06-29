@@ -1325,17 +1325,19 @@ _DEFAULT_CC_DESCRIPTION = (
 )
 
 
-def bootstrap_claude_code_cell(
+def bootstrap_cell(
     name: str = 'claude_code',
     cell_type: str = 'claude-code',
     description: str | None = None,
+    substrate: str = 'claude_code',
 ) -> Path:
-    """Create a coding-agent cell with the CC canonical schema. Idempotent.
+    """Create a flex cell with the appropriate schema. Idempotent.
+
+    substrate='claude_code' -- full coding-agent schema (base + CC + content + SOMA)
+    substrate='base'        -- generic chunk schema only (base + content)
 
     Defaults preserve the original behavior — existing CC callers pass
     nothing and get a cell named 'claude_code' / cell_type='claude-code'.
-    Compatible coding-agent modules pass their own name/cell_type to reuse
-    the same substrate.
     """
     desc = description or _DEFAULT_CC_DESCRIPTION
     existing = resolve_cell(name)
@@ -1350,10 +1352,14 @@ def bootstrap_claude_code_cell(
     conn = sqlite3.connect(str(db_path), timeout=30.0)
     conn.execute("PRAGMA journal_mode=WAL")
     conn.execute("PRAGMA busy_timeout=30000")
-    _ensure_core_tables(conn)
+
+    _ensure_base_tables(conn)
     _ensure_content_tables(conn)
-    if soma_ensure_tables:
-        soma_ensure_tables(conn)
+
+    if substrate == 'claude_code':
+        _ensure_cc_tables(conn)
+        if soma_ensure_tables:
+            soma_ensure_tables(conn)
 
     conn.execute("INSERT OR IGNORE INTO _meta VALUES ('description', ?)", (desc,))
     conn.execute("INSERT OR IGNORE INTO _meta VALUES ('cell_type', ?)", (cell_type,))
@@ -1362,6 +1368,10 @@ def bootstrap_claude_code_cell(
 
     register_cell(name, str(db_path), cell_type=cell_type, description=desc)
     return db_path
+
+
+# Backward-compatible alias
+bootstrap_claude_code_cell = bootstrap_cell
 
 
 def _batch_embed_chunks(conn, batch_size: int = 500, quiet: bool = False,
