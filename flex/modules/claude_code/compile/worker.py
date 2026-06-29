@@ -603,22 +603,37 @@ def _normalize_tool_result(content) -> str | None:
     return None
 
 
-def insert_chunk_atom(conn: sqlite3.Connection, chunk: dict):
-    """Insert a chunk into all chunk-atom tables."""
+def insert_base_chunk(conn: sqlite3.Connection, chunk: dict,
+                     source_type: str = 'claude-code'):
+    """Insert a chunk into base tables only. Module-agnostic.
+
+    Writes to _raw_chunks and _edges_source. Any flex module can call
+    this without requiring CC-specific extension tables.
+    """
     cur = conn.cursor()
     chunk_id = chunk['id']
 
-    # _raw_chunks
     cur.execute("""
         INSERT OR IGNORE INTO _raw_chunks (id, content, embedding, timestamp)
         VALUES (?, ?, ?, ?)
     """, (chunk_id, chunk['content'], chunk.get('embedding'), chunk['timestamp']))
 
-    # _edges_source
     cur.execute("""
         INSERT OR IGNORE INTO _edges_source (chunk_id, source_id, source_type, position)
-        VALUES (?, ?, 'claude-code', ?)
-    """, (chunk_id, chunk['doc_id'], chunk['chunk_number']))
+        VALUES (?, ?, ?, ?)
+    """, (chunk_id, chunk['doc_id'], source_type, chunk['chunk_number']))
+
+
+def insert_chunk_atom(conn: sqlite3.Connection, chunk: dict):
+    """Insert a chunk into all CC chunk-atom tables.
+
+    Calls insert_base_chunk() for generic storage, then writes
+    CC-specific extension tables (message types, tool ops, etc.).
+    """
+    insert_base_chunk(conn, chunk, source_type='claude-code')
+
+    cur = conn.cursor()
+    chunk_id = chunk['id']
 
     # _types_message
     cur.execute("""
