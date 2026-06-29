@@ -289,8 +289,12 @@ def update_source_stats(conn: sqlite3.Connection, session_id: str, chunk: dict):
                 """, (clean[:250], session_id))
 
 
-def _ensure_core_tables(conn: sqlite3.Connection):
-    """Create all chunk-atom tables for a fresh cell. Idempotent."""
+def _ensure_base_tables(conn: sqlite3.Connection):
+    """Create generic flex chunk-atom tables. Idempotent.
+
+    These tables are the shared storage contract for all flex modules --
+    not specific to any particular source type (Claude Code, Hermes, Matrix, etc.).
+    """
     conn.executescript("""
         CREATE TABLE IF NOT EXISTS _raw_chunks (
             id TEXT PRIMARY KEY,
@@ -327,6 +331,50 @@ def _ensure_core_tables(conn: sqlite3.Connection):
         CREATE INDEX IF NOT EXISTS idx_es_chunk ON _edges_source(chunk_id);
         CREATE INDEX IF NOT EXISTS idx_es_source ON _edges_source(source_id);
 
+        CREATE TABLE IF NOT EXISTS _meta (
+            key TEXT PRIMARY KEY,
+            value TEXT
+        );
+
+        CREATE TABLE IF NOT EXISTS _presets (
+            name TEXT PRIMARY KEY,
+            description TEXT,
+            params TEXT DEFAULT '',
+            sql TEXT
+        );
+
+        CREATE VIRTUAL TABLE IF NOT EXISTS chunks_fts USING fts5(
+            content,
+            content='_raw_chunks',
+            content_rowid='rowid'
+        );
+    """)
+    # FTS triggers -- can't use IF NOT EXISTS, so check first
+    has_trigger = conn.execute(
+        "SELECT 1 FROM sqlite_master WHERE type='trigger' AND name='raw_chunks_ai'"
+    ).fetchone()
+    if not has_trigger:
+        conn.executescript("""
+            CREATE TRIGGER raw_chunks_ai AFTER INSERT ON _raw_chunks BEGIN
+                INSERT INTO chunks_fts(rowid, content) VALUES (new.rowid, new.content);
+            END;
+            CREATE TRIGGER raw_chunks_ad AFTER DELETE ON _raw_chunks BEGIN
+                INSERT INTO chunks_fts(chunks_fts, rowid, content) VALUES('delete', old.rowid, old.content);
+            END;
+            CREATE TRIGGER raw_chunks_au AFTER UPDATE ON _raw_chunks BEGIN
+                INSERT INTO chunks_fts(chunks_fts, rowid, content) VALUES('delete', old.rowid, old.content);
+                INSERT INTO chunks_fts(rowid, content) VALUES (new.rowid, new.content);
+            END;
+        """)
+
+
+def _ensure_cc_tables(conn: sqlite3.Connection):
+    """Create Claude Code specific extension tables. Idempotent.
+
+    These tables capture coding-agent concepts: tool operations, message
+    threading, agent delegation, soft file-op detection, and file bodies.
+    """
+    conn.executescript("""
         CREATE TABLE IF NOT EXISTS _edges_tool_ops (
             chunk_id TEXT PRIMARY KEY,
             tool_name TEXT,
@@ -382,43 +430,16 @@ def _ensure_core_tables(conn: sqlite3.Connection):
             position INTEGER
         );
         CREATE INDEX IF NOT EXISTS idx_tfb_file ON _types_file_body(target_file);
-
-        CREATE TABLE IF NOT EXISTS _meta (
-            key TEXT PRIMARY KEY,
-            value TEXT
-        );
-
-        CREATE TABLE IF NOT EXISTS _presets (
-            name TEXT PRIMARY KEY,
-            description TEXT,
-            params TEXT DEFAULT '',
-            sql TEXT
-        );
-
-        CREATE VIRTUAL TABLE IF NOT EXISTS chunks_fts USING fts5(
-            content,
-            content='_raw_chunks',
-            content_rowid='rowid'
-        );
     """)
-    # FTS triggers — can't use IF NOT EXISTS, so check first
-    has_trigger = conn.execute(
-        "SELECT 1 FROM sqlite_master WHERE type='trigger' AND name='raw_chunks_ai'"
-    ).fetchone()
-    if not has_trigger:
-        conn.executescript("""
-            CREATE TRIGGER raw_chunks_ai AFTER INSERT ON _raw_chunks BEGIN
-                INSERT INTO chunks_fts(rowid, content) VALUES (new.rowid, new.content);
-            END;
-            CREATE TRIGGER raw_chunks_ad AFTER DELETE ON _raw_chunks BEGIN
-                INSERT INTO chunks_fts(chunks_fts, rowid, content) VALUES('delete', old.rowid, old.content);
-            END;
-            CREATE TRIGGER raw_chunks_au AFTER UPDATE ON _raw_chunks BEGIN
-                INSERT INTO chunks_fts(chunks_fts, rowid, content) VALUES('delete', old.rowid, old.content);
-                INSERT INTO chunks_fts(rowid, content) VALUES (new.rowid, new.content);
-            END;
-        """)
 
+
+def _ensure_core_tables(conn: sqlite3.Connection):
+    """Create all chunk-atom tables for a fresh cell. Idempotent.
+
+    Backward-compatible wrapper -- calls base + CC tables.
+    """
+    _ensure_base_tables(conn)
+    _ensure_cc_tables(conn)
 
 def _ensure_content_tables(conn: sqlite3.Connection):
     """Create content store tables if they don't exist."""
