@@ -1848,8 +1848,15 @@ def _run_enrichment_cycle(conn, graph_threshold=50):
     print(f"[enrich] Cycle done in {elapsed:.1f}s", file=sys.stderr)
 
 
-def daemon_loop(interval=2):
-    """Main daemon loop."""
+def daemon_loop(interval=2, watcher=None):
+    """Main daemon loop.
+
+    Args:
+        interval: Polling interval in seconds (default 2). When watcher is
+                  active, the tick interval drops to 0.25s for responsiveness.
+        watcher: Optional FlexWatcher instance for inotify-based change detection.
+                 When provided, polling becomes a slow integrity scan.
+    """
     # Resolve cell
     cell_path = resolve_cell('claude_code')
     if not cell_path:
@@ -1880,6 +1887,11 @@ def daemon_loop(interval=2):
     if _corpus_drainer:
         print("  Corpus indexing: enabled", file=sys.stderr)
 
+    if watcher and watcher.active:
+        print("  Mode: event-driven (inotify + integrity scan)", file=sys.stderr)
+    else:
+        print("  Mode: polling", file=sys.stderr)
+
     ENRICHMENT_INTERVAL = 30 * 60   # 30 minutes — graph, fingerprints, repo_project
     GRAPH_STALENESS_THRESHOLD = 50  # sessions since last graph build
 
@@ -1888,16 +1900,61 @@ def daemon_loop(interval=2):
 
     # Size caches — empty dict triggers full initial scan on first tick
     size_cache: dict = {}
+    error_cache: dict = {}
+
+    # inotify mode: integrity scan cadence (full rglob as safety net)
+    INTEGRITY_INTERVAL = int(os.environ.get("FLEX_INTEGRITY_INTERVAL", "60"))
+    last_integrity = 0.0
+    inotify_active = watcher is not None and watcher.active
+    tick_interval = 0.25 if inotify_active else interval
 
     while True:
-        # Phase 0: stat() scan — sync any JSONLs that grew (replaces queue + backfill)
-        try:
-            stats = scan_sessions(conn, size_cache)
-            if stats['synced'] > 0:
-                print(f"[worker] synced={stats['synced']} chunks={stats['chunks']}",
+        now_mono = time.monotonic()
+
+        if inotify_active:
+            # Event-driven path: sync only files that inotify flagged as changed
+            changed_paths = watcher.drain()
+            ev_synced = 0
+            ev_chunks = 0
+            for p in changed_paths:
+                session_id = p.stem
+                try:
+                    count = sync_session_messages(session_id, conn)
+                    _update_warmup(conn, session_id)
+                    try:
+                        size_cache[session_id] = p.stat().st_size
+                    except OSError:
+                        pass
+                    if count > 0:
+                        ev_synced += 1
+                        ev_chunks += count
+                except Exception as e:
+                    print(f"[worker] inotify sync error {session_id[:12]}: {e}",
+                          file=sys.stderr)
+            if ev_chunks > 0:
+                conn.commit()
+                print(f"[worker] inotify synced={ev_synced} chunks={ev_chunks}",
                       file=sys.stderr)
-        except Exception as e:
-            print(f"[worker] Scan error: {e}", file=sys.stderr)
+
+            # Integrity scan on slow cadence — catches anything inotify missed
+            if now_mono - last_integrity > INTEGRITY_INTERVAL:
+                try:
+                    stats = scan_sessions(conn, size_cache, error_cache)
+                    if stats['synced'] > 0:
+                        print(f"[worker] integrity synced={stats['synced']} "
+                              f"chunks={stats['chunks']}", file=sys.stderr)
+                except Exception as e:
+                    print(f"[worker] Integrity scan error: {e}", file=sys.stderr)
+                last_integrity = now_mono
+        else:
+            # Polling fallback — original behavior, unchanged
+            try:
+                stats = scan_sessions(conn, size_cache, error_cache)
+                if stats['synced'] > 0:
+                    print(f"[worker] synced={stats['synced']} chunks={stats['chunks']}",
+                          file=sys.stderr)
+            except Exception as e:
+                print(f"[worker] Scan error: {e}", file=sys.stderr)
 
         # Sweep NULL embeddings every tick — catches interrupted flex init,
         # failed embeds, or any other orphaned chunks. Small batch (64) so
@@ -1981,7 +2038,7 @@ def daemon_loop(interval=2):
                 except Exception as e:
                     print(f"[worker] Corpus graph refresh error: {e}", file=sys.stderr)
 
-        time.sleep(interval)
+        time.sleep(tick_interval)
 
 
 if __name__ == "__main__":

@@ -40,6 +40,47 @@ def _load_secrets():
                 os.environ.setdefault(key.strip(), val.strip())
 
 
+def _build_watcher():
+    """Create and configure the inotify watcher. Returns None on failure."""
+    from pathlib import Path
+
+    if os.environ.get("FLEX_DISABLE_INOTIFY"):
+        print("  inotify watcher: disabled (FLEX_DISABLE_INOTIFY)", file=sys.stderr)
+        return None
+
+    try:
+        from flex.watcher import FlexWatcher
+    except ImportError:
+        print("  inotify watcher: unavailable (watchdog not installed)", file=sys.stderr)
+        return None
+
+    debounce_ms = int(os.environ.get("FLEX_DEBOUNCE_MS", "500"))
+    watcher = FlexWatcher(debounce_ms=debounce_ms)
+
+    # Primary: Claude Code JSONLs
+    cc_projects = Path.home() / ".claude" / "projects"
+    if cc_projects.exists():
+        watcher.watch(cc_projects, pattern="*.jsonl", recursive=True)
+
+    # Secondary: watched cells from registry (markdown vaults, coding-agent dirs)
+    try:
+        from flex.registry import discover_watched
+        for cell in discover_watched():
+            wp = cell.get("watch_pattern", "*")
+            watcher.watch(cell["watch_path"], pattern=wp, recursive=True)
+    except Exception as e:
+        print(f"  inotify watcher: registry scan failed ({e})", file=sys.stderr)
+
+    if watcher.start():
+        print(f"  inotify watcher: active ({watcher.watch_count} watches, "
+              f"{debounce_ms}ms debounce)", file=sys.stderr)
+        return watcher
+    else:
+        print("  inotify watcher: failed to start, falling back to polling",
+              file=sys.stderr)
+        return None
+
+
 def _background_tick_loop(interval: int = 60):
     """Background task loop. Hook-driven — no-op if no hook registered."""
     while True:
@@ -122,7 +163,12 @@ def main():
                         help="Disable background tasks")
     parser.add_argument("--no-refresh", action="store_true",
                         help="Disable refresh cycle")
+    parser.add_argument("--no-inotify", action="store_true",
+                        help="Disable inotify watcher, use polling only")
     args = parser.parse_args()
+
+    if args.no_inotify:
+        os.environ["FLEX_DISABLE_INOTIFY"] = "1"
 
     print("[flex-daemon] Starting unified daemon", file=sys.stderr)
     print(f"  Local scan:      {args.interval}s", file=sys.stderr)
@@ -130,6 +176,9 @@ def main():
           file=sys.stderr)
     print(f"  Refresh:         {'disabled' if args.no_refresh else f'{args.refresh_interval}s'}",
           file=sys.stderr)
+
+    # inotify watcher (best-effort, falls back to polling)
+    watcher = _build_watcher()
 
     # Thread 1: background tasks (plugin-driven)
     if not args.no_background:
@@ -152,7 +201,11 @@ def main():
     # Main thread: local cell scan (blocks if module available)
     try:
         from flex.modules.claude_code.compile.worker import daemon_loop
-        daemon_loop(interval=args.interval)
+        try:
+            daemon_loop(interval=args.interval, watcher=watcher)
+        finally:
+            if watcher:
+                watcher.stop()
     except ImportError:
         print("[flex-daemon] claude_code module not installed — running background services only",
               file=sys.stderr)
