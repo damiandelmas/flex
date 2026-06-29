@@ -70,16 +70,17 @@ def run_from_spec(args, console, spec: dict[str, Any]) -> None:
     from rich.progress import BarColumn, Progress, SpinnerColumn, TextColumn
     from rich.text import Text
 
-    from flex.modules.claude_code import ENRICHMENT_STUBS, run_enrichment
+    from flex.modules.claude_code import BASE_ENRICHMENT_STUBS, ENRICHMENT_STUBS, run_enrichment
     from flex.modules.claude_code.compile.worker import (
         _batch_embed_chunks,
-        bootstrap_claude_code_cell,
+        bootstrap_cell,
     )
-    from flex.modules.claude_code.contract import validate_coding_agent_cell
+    from flex.modules.claude_code.contract import validate_base_cell, validate_coding_agent_cell
     from flex.registry import register_cell
     from flex.cli import _install_claude_assets
 
     cell_type = spec["cell_type"]
+    substrate = spec.get("substrate", "claude_code")
     name = getattr(args, "name", None) or spec.get("default_cell_name") or cell_type
     description = spec.get("description") or f"{cell_type} coding-agent session provenance."
     source_attr = spec["source_arg"].lstrip("-").replace("-", "_")
@@ -94,13 +95,14 @@ def run_from_spec(args, console, spec: dict[str, Any]) -> None:
         console.print(f"  [yellow]not found[/yellow] — {spec.get('missing_hint', 'run the source agent at least once.')}")
         return
 
-    db_path = bootstrap_claude_code_cell(name=name, cell_type=cell_type)
+    db_path = bootstrap_cell(name=name, cell_type=cell_type, substrate=substrate)
     conn = sqlite3.connect(str(db_path), timeout=30.0)
     conn.row_factory = sqlite3.Row
     conn.execute("PRAGMA journal_mode=WAL")
     conn.execute("PRAGMA busy_timeout=30000")
 
-    for ddl in ENRICHMENT_STUBS:
+    stubs = ENRICHMENT_STUBS if substrate == "claude_code" else BASE_ENRICHMENT_STUBS
+    for ddl in stubs:
         conn.execute(ddl)
     conn.execute(
         "INSERT OR REPLACE INTO _meta (key, value) VALUES ('description', ?)",
@@ -161,7 +163,10 @@ def run_from_spec(args, console, spec: dict[str, Any]) -> None:
         def _g_cb(step):
             progress.update(t_graph, info=step)
 
-        n_comm, failed = run_enrichment(conn, cell_type=cell_type, progress_cb=_g_cb)
+        if substrate == "claude_code":
+            n_comm, failed = run_enrichment(conn, cell_type=cell_type, progress_cb=_g_cb)
+        else:
+            n_comm, failed = 0, []
         progress.update(
             t_graph,
             visible=True,
@@ -181,7 +186,10 @@ def run_from_spec(args, console, spec: dict[str, Any]) -> None:
     except OSError:
         pass
 
-    report = validate_coding_agent_cell(conn, cell_type=cell_type)
+    if substrate == "claude_code":
+        report = validate_coding_agent_cell(conn, cell_type=cell_type)
+    else:
+        report = validate_base_cell(conn, cell_type=cell_type)
     if not report.ok or report.warnings:
         console.print()
         console.print(f"  [yellow]{report.summary()}[/yellow]")

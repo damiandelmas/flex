@@ -289,8 +289,12 @@ def update_source_stats(conn: sqlite3.Connection, session_id: str, chunk: dict):
                 """, (clean[:250], session_id))
 
 
-def _ensure_core_tables(conn: sqlite3.Connection):
-    """Create all chunk-atom tables for a fresh cell. Idempotent."""
+def _ensure_base_tables(conn: sqlite3.Connection):
+    """Create generic flex chunk-atom tables. Idempotent.
+
+    These tables are the shared storage contract for all flex modules --
+    not specific to any particular source type (Claude Code, Hermes, Matrix, etc.).
+    """
     conn.executescript("""
         CREATE TABLE IF NOT EXISTS _raw_chunks (
             id TEXT PRIMARY KEY,
@@ -327,6 +331,50 @@ def _ensure_core_tables(conn: sqlite3.Connection):
         CREATE INDEX IF NOT EXISTS idx_es_chunk ON _edges_source(chunk_id);
         CREATE INDEX IF NOT EXISTS idx_es_source ON _edges_source(source_id);
 
+        CREATE TABLE IF NOT EXISTS _meta (
+            key TEXT PRIMARY KEY,
+            value TEXT
+        );
+
+        CREATE TABLE IF NOT EXISTS _presets (
+            name TEXT PRIMARY KEY,
+            description TEXT,
+            params TEXT DEFAULT '',
+            sql TEXT
+        );
+
+        CREATE VIRTUAL TABLE IF NOT EXISTS chunks_fts USING fts5(
+            content,
+            content='_raw_chunks',
+            content_rowid='rowid'
+        );
+    """)
+    # FTS triggers -- can't use IF NOT EXISTS, so check first
+    has_trigger = conn.execute(
+        "SELECT 1 FROM sqlite_master WHERE type='trigger' AND name='raw_chunks_ai'"
+    ).fetchone()
+    if not has_trigger:
+        conn.executescript("""
+            CREATE TRIGGER raw_chunks_ai AFTER INSERT ON _raw_chunks BEGIN
+                INSERT INTO chunks_fts(rowid, content) VALUES (new.rowid, new.content);
+            END;
+            CREATE TRIGGER raw_chunks_ad AFTER DELETE ON _raw_chunks BEGIN
+                INSERT INTO chunks_fts(chunks_fts, rowid, content) VALUES('delete', old.rowid, old.content);
+            END;
+            CREATE TRIGGER raw_chunks_au AFTER UPDATE ON _raw_chunks BEGIN
+                INSERT INTO chunks_fts(chunks_fts, rowid, content) VALUES('delete', old.rowid, old.content);
+                INSERT INTO chunks_fts(rowid, content) VALUES (new.rowid, new.content);
+            END;
+        """)
+
+
+def _ensure_cc_tables(conn: sqlite3.Connection):
+    """Create Claude Code specific extension tables. Idempotent.
+
+    These tables capture coding-agent concepts: tool operations, message
+    threading, agent delegation, soft file-op detection, and file bodies.
+    """
+    conn.executescript("""
         CREATE TABLE IF NOT EXISTS _edges_tool_ops (
             chunk_id TEXT PRIMARY KEY,
             tool_name TEXT,
@@ -382,43 +430,16 @@ def _ensure_core_tables(conn: sqlite3.Connection):
             position INTEGER
         );
         CREATE INDEX IF NOT EXISTS idx_tfb_file ON _types_file_body(target_file);
-
-        CREATE TABLE IF NOT EXISTS _meta (
-            key TEXT PRIMARY KEY,
-            value TEXT
-        );
-
-        CREATE TABLE IF NOT EXISTS _presets (
-            name TEXT PRIMARY KEY,
-            description TEXT,
-            params TEXT DEFAULT '',
-            sql TEXT
-        );
-
-        CREATE VIRTUAL TABLE IF NOT EXISTS chunks_fts USING fts5(
-            content,
-            content='_raw_chunks',
-            content_rowid='rowid'
-        );
     """)
-    # FTS triggers — can't use IF NOT EXISTS, so check first
-    has_trigger = conn.execute(
-        "SELECT 1 FROM sqlite_master WHERE type='trigger' AND name='raw_chunks_ai'"
-    ).fetchone()
-    if not has_trigger:
-        conn.executescript("""
-            CREATE TRIGGER raw_chunks_ai AFTER INSERT ON _raw_chunks BEGIN
-                INSERT INTO chunks_fts(rowid, content) VALUES (new.rowid, new.content);
-            END;
-            CREATE TRIGGER raw_chunks_ad AFTER DELETE ON _raw_chunks BEGIN
-                INSERT INTO chunks_fts(chunks_fts, rowid, content) VALUES('delete', old.rowid, old.content);
-            END;
-            CREATE TRIGGER raw_chunks_au AFTER UPDATE ON _raw_chunks BEGIN
-                INSERT INTO chunks_fts(chunks_fts, rowid, content) VALUES('delete', old.rowid, old.content);
-                INSERT INTO chunks_fts(rowid, content) VALUES (new.rowid, new.content);
-            END;
-        """)
 
+
+def _ensure_core_tables(conn: sqlite3.Connection):
+    """Create all chunk-atom tables for a fresh cell. Idempotent.
+
+    Backward-compatible wrapper -- calls base + CC tables.
+    """
+    _ensure_base_tables(conn)
+    _ensure_cc_tables(conn)
 
 def _ensure_content_tables(conn: sqlite3.Connection):
     """Create content store tables if they don't exist."""
@@ -582,22 +603,37 @@ def _normalize_tool_result(content) -> str | None:
     return None
 
 
-def insert_chunk_atom(conn: sqlite3.Connection, chunk: dict):
-    """Insert a chunk into all chunk-atom tables."""
+def insert_base_chunk(conn: sqlite3.Connection, chunk: dict,
+                     source_type: str = 'claude-code'):
+    """Insert a chunk into base tables only. Module-agnostic.
+
+    Writes to _raw_chunks and _edges_source. Any flex module can call
+    this without requiring CC-specific extension tables.
+    """
     cur = conn.cursor()
     chunk_id = chunk['id']
 
-    # _raw_chunks
     cur.execute("""
         INSERT OR IGNORE INTO _raw_chunks (id, content, embedding, timestamp)
         VALUES (?, ?, ?, ?)
     """, (chunk_id, chunk['content'], chunk.get('embedding'), chunk['timestamp']))
 
-    # _edges_source
     cur.execute("""
         INSERT OR IGNORE INTO _edges_source (chunk_id, source_id, source_type, position)
-        VALUES (?, ?, 'claude-code', ?)
-    """, (chunk_id, chunk['doc_id'], chunk['chunk_number']))
+        VALUES (?, ?, ?, ?)
+    """, (chunk_id, chunk['doc_id'], source_type, chunk['chunk_number']))
+
+
+def insert_chunk_atom(conn: sqlite3.Connection, chunk: dict):
+    """Insert a chunk into all CC chunk-atom tables.
+
+    Calls insert_base_chunk() for generic storage, then writes
+    CC-specific extension tables (message types, tool ops, etc.).
+    """
+    insert_base_chunk(conn, chunk, source_type='claude-code')
+
+    cur = conn.cursor()
+    chunk_id = chunk['id']
 
     # _types_message
     cur.execute("""
@@ -1289,17 +1325,19 @@ _DEFAULT_CC_DESCRIPTION = (
 )
 
 
-def bootstrap_claude_code_cell(
+def bootstrap_cell(
     name: str = 'claude_code',
     cell_type: str = 'claude-code',
     description: str | None = None,
+    substrate: str = 'claude_code',
 ) -> Path:
-    """Create a coding-agent cell with the CC canonical schema. Idempotent.
+    """Create a flex cell with the appropriate schema. Idempotent.
+
+    substrate='claude_code' -- full coding-agent schema (base + CC + content + SOMA)
+    substrate='base'        -- generic chunk schema only (base + content)
 
     Defaults preserve the original behavior — existing CC callers pass
     nothing and get a cell named 'claude_code' / cell_type='claude-code'.
-    Compatible coding-agent modules pass their own name/cell_type to reuse
-    the same substrate.
     """
     desc = description or _DEFAULT_CC_DESCRIPTION
     existing = resolve_cell(name)
@@ -1314,10 +1352,14 @@ def bootstrap_claude_code_cell(
     conn = sqlite3.connect(str(db_path), timeout=30.0)
     conn.execute("PRAGMA journal_mode=WAL")
     conn.execute("PRAGMA busy_timeout=30000")
-    _ensure_core_tables(conn)
+
+    _ensure_base_tables(conn)
     _ensure_content_tables(conn)
-    if soma_ensure_tables:
-        soma_ensure_tables(conn)
+
+    if substrate == 'claude_code':
+        _ensure_cc_tables(conn)
+        if soma_ensure_tables:
+            soma_ensure_tables(conn)
 
     conn.execute("INSERT OR IGNORE INTO _meta VALUES ('description', ?)", (desc,))
     conn.execute("INSERT OR IGNORE INTO _meta VALUES ('cell_type', ?)", (cell_type,))
@@ -1326,6 +1368,10 @@ def bootstrap_claude_code_cell(
 
     register_cell(name, str(db_path), cell_type=cell_type, description=desc)
     return db_path
+
+
+# Backward-compatible alias
+bootstrap_claude_code_cell = bootstrap_cell
 
 
 def _batch_embed_chunks(conn, batch_size: int = 500, quiet: bool = False,
@@ -1802,8 +1848,15 @@ def _run_enrichment_cycle(conn, graph_threshold=50):
     print(f"[enrich] Cycle done in {elapsed:.1f}s", file=sys.stderr)
 
 
-def daemon_loop(interval=2):
-    """Main daemon loop."""
+def daemon_loop(interval=2, watcher=None):
+    """Main daemon loop.
+
+    Args:
+        interval: Polling interval in seconds (default 2). When watcher is
+                  active, the tick interval drops to 0.25s for responsiveness.
+        watcher: Optional FlexWatcher instance for inotify-based change detection.
+                 When provided, polling becomes a slow integrity scan.
+    """
     # Resolve cell
     cell_path = resolve_cell('claude_code')
     if not cell_path:
@@ -1834,6 +1887,11 @@ def daemon_loop(interval=2):
     if _corpus_drainer:
         print("  Corpus indexing: enabled", file=sys.stderr)
 
+    if watcher and watcher.active:
+        print("  Mode: event-driven (inotify + integrity scan)", file=sys.stderr)
+    else:
+        print("  Mode: polling", file=sys.stderr)
+
     ENRICHMENT_INTERVAL = 30 * 60   # 30 minutes — graph, fingerprints, repo_project
     GRAPH_STALENESS_THRESHOLD = 50  # sessions since last graph build
 
@@ -1842,16 +1900,61 @@ def daemon_loop(interval=2):
 
     # Size caches — empty dict triggers full initial scan on first tick
     size_cache: dict = {}
+    error_cache: dict = {}
+
+    # inotify mode: integrity scan cadence (full rglob as safety net)
+    INTEGRITY_INTERVAL = int(os.environ.get("FLEX_INTEGRITY_INTERVAL", "60"))
+    last_integrity = 0.0
+    inotify_active = watcher is not None and watcher.active
+    tick_interval = 0.25 if inotify_active else interval
 
     while True:
-        # Phase 0: stat() scan — sync any JSONLs that grew (replaces queue + backfill)
-        try:
-            stats = scan_sessions(conn, size_cache)
-            if stats['synced'] > 0:
-                print(f"[worker] synced={stats['synced']} chunks={stats['chunks']}",
+        now_mono = time.monotonic()
+
+        if inotify_active:
+            # Event-driven path: sync only files that inotify flagged as changed
+            changed_paths = watcher.drain()
+            ev_synced = 0
+            ev_chunks = 0
+            for p in changed_paths:
+                session_id = p.stem
+                try:
+                    count = sync_session_messages(session_id, conn)
+                    _update_warmup(conn, session_id)
+                    try:
+                        size_cache[session_id] = p.stat().st_size
+                    except OSError:
+                        pass
+                    if count > 0:
+                        ev_synced += 1
+                        ev_chunks += count
+                except Exception as e:
+                    print(f"[worker] inotify sync error {session_id[:12]}: {e}",
+                          file=sys.stderr)
+            if ev_chunks > 0:
+                conn.commit()
+                print(f"[worker] inotify synced={ev_synced} chunks={ev_chunks}",
                       file=sys.stderr)
-        except Exception as e:
-            print(f"[worker] Scan error: {e}", file=sys.stderr)
+
+            # Integrity scan on slow cadence — catches anything inotify missed
+            if now_mono - last_integrity > INTEGRITY_INTERVAL:
+                try:
+                    stats = scan_sessions(conn, size_cache, error_cache)
+                    if stats['synced'] > 0:
+                        print(f"[worker] integrity synced={stats['synced']} "
+                              f"chunks={stats['chunks']}", file=sys.stderr)
+                except Exception as e:
+                    print(f"[worker] Integrity scan error: {e}", file=sys.stderr)
+                last_integrity = now_mono
+        else:
+            # Polling fallback — original behavior, unchanged
+            try:
+                stats = scan_sessions(conn, size_cache, error_cache)
+                if stats['synced'] > 0:
+                    print(f"[worker] synced={stats['synced']} chunks={stats['chunks']}",
+                          file=sys.stderr)
+            except Exception as e:
+                print(f"[worker] Scan error: {e}", file=sys.stderr)
 
         # Sweep NULL embeddings every tick — catches interrupted flex init,
         # failed embeds, or any other orphaned chunks. Small batch (64) so
@@ -1935,7 +2038,7 @@ def daemon_loop(interval=2):
                 except Exception as e:
                     print(f"[worker] Corpus graph refresh error: {e}", file=sys.stderr)
 
-        time.sleep(interval)
+        time.sleep(tick_interval)
 
 
 if __name__ == "__main__":
