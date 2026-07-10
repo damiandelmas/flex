@@ -2,9 +2,9 @@
 Nomic API embedder — drop-in replacement for ONNXEmbedder during backfill.
 
 Uses the Nomic API (nomic-embed-text-v1.5) instead of local ONNX inference.
-Same model, same 128d Matryoshka vectors, 100% compatible with databases embedded
-by ONNXEmbedder. Intended for bulk embedding on CPU-only machines where local
-ONNX would take hours.
+Same model, same STORE_DIM-d Matryoshka vectors (see flex.onnx.embed.STORE_DIM),
+100% compatible with databases embedded by ONNXEmbedder. Intended for bulk
+embedding on CPU-only machines where local ONNX would take hours.
 
 Pure stdlib (urllib) — no nomic SDK required.
 """
@@ -15,6 +15,8 @@ import urllib.request
 
 import numpy as np
 from typing import Callable, List, Optional, Union
+
+from flex.onnx.embed import STORE_DIM
 
 _NOMIC_EMBED_URL = "https://api-atlas.nomic.ai/v1/embedding/text"
 
@@ -53,7 +55,7 @@ class NomicEmbedder:
             "texts": texts,
             "model": self.model,
             "task_type": "search_document",
-            "dimensionality": 128,
+            "dimensionality": STORE_DIM,
         }).encode()
         req = urllib.request.Request(
             _NOMIC_EMBED_URL,
@@ -90,7 +92,7 @@ class NomicEmbedder:
                     delay = min(delay * 2, 60)  # cap at 60s
                 elif e.code == 400:
                     # Bad request — return empty array so worker zip skips the write, chunks stay NULL
-                    return np.empty((0, 128), dtype=np.float32)
+                    return np.empty((0, STORE_DIM), dtype=np.float32)
                 else:
                     raise
         raise RuntimeError("Nomic API: max retries exceeded (429)")
@@ -99,11 +101,13 @@ class NomicEmbedder:
         self,
         sentences: Union[str, List[str]],
         prefix: str = "search_document: ",  # accepted for API compat; task_type handles it
-        matryoshka_dim: int = 128,
+        matryoshka_dim: Optional[int] = None,
         on_wait: Optional[Callable[[float], None]] = None,
         **kwargs,
     ) -> np.ndarray:
-        """Encode sentences via Nomic API. Returns (n, 128) float32 array."""
+        """Encode sentences via Nomic API. Returns (n, STORE_DIM) float32 array."""
+        if matryoshka_dim is None:
+            matryoshka_dim = STORE_DIM
         if isinstance(sentences, str):
             sentences = [sentences]
         all_embs = []
@@ -113,5 +117,5 @@ class NomicEmbedder:
             if len(result) > 0:
                 all_embs.append(result)
         if not all_embs:
-            return np.empty((0, 128), dtype=np.float32)
+            return np.empty((0, matryoshka_dim), dtype=np.float32)
         return np.vstack(all_embs)  # API returns unit-normalized vectors

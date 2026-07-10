@@ -48,6 +48,16 @@ try:
 except ImportError:
     HAS_ENGINE = False
 
+# Single source of truth for embed-off (same _meta.embed signal set_cell_embed
+# writes and @orient branches on). An embed-off cell has only NULL embeddings, so
+# warming a VectorCache would build a phantom empty matrix — skip it. Fails safe
+# to embed-on (never worse than today's unconditional warm) if the import breaks.
+try:
+    from flex.modules.docpac.compile.worker import cell_is_no_embed
+except Exception:
+    def cell_is_no_embed(conn):
+        return False
+
 # ============================================================
 # Configuration
 # ============================================================
@@ -117,6 +127,69 @@ def _enforce_vec_budget(current: str | None = None):
                   file=sys.stderr)
     except Exception:
         pass  # budget enforcement must never break a query
+
+
+# Background VectorCache refresh — the rebuild must NEVER run on the query
+# thread. A drifted cell serves its existing (slightly stale) matrix immediately
+# and refreshes in a daemon thread; the result swaps in atomically (append =
+# per-table dict swap; full rebuild = whole-state swap). One refresh per cell at
+# a time. This is what keeps warm queries at ~ms instead of paying a 30s rebuild.
+_vec_bg_inflight: set[str] = set()
+_vec_bg_guard = threading.Lock()
+
+
+def _schedule_vec_refresh(name: str, cell_lock: threading.Lock) -> None:
+    """Refresh a cell's VectorCache off the query thread. No-op if one is
+    already running for this cell. Uses its OWN connection — sqlite handles are
+    not shareable across threads."""
+    with _vec_bg_guard:
+        if name in _vec_bg_inflight:
+            return
+        _vec_bg_inflight.add(name)
+
+    def _worker():
+        try:
+            if not cell_lock.acquire(blocking=False):
+                return  # a build is already in progress; it will pick up the drift
+            try:
+                p = _db_path(name)
+                if not p.exists():
+                    return
+                cur_mtime = p.stat().st_mtime
+                state = _vec_state.get(name)
+                if state and state.get('mtime') == cur_mtime:
+                    return  # already fresh
+                bgdb = _open_query_cell(p)
+                try:
+                    refreshed = None
+                    if state:
+                        try:
+                            refreshed = _engine_refresh_vec_state(state, bgdb)
+                        except Exception:
+                            refreshed = None
+                    if refreshed == 'appended':
+                        state['mtime'] = cur_mtime
+                        state['last_used'] = time.time()
+                        print(f"[flex-mcp]   {name}: vec_cache appended (bg)", file=sys.stderr)
+                    else:
+                        new_state = _engine_build_vec_state(name, bgdb, cur_mtime)
+                        if new_state:
+                            new_state['last_used'] = time.time()
+                            _vec_state[name] = new_state
+                            print(f"[flex-mcp]   {name}: vec_cache rebuilt (bg)", file=sys.stderr)
+                            _enforce_vec_budget(current=name)
+                finally:
+                    bgdb.close()
+            finally:
+                cell_lock.release()
+        except Exception as e:
+            print(f"[flex-mcp]   {name}: bg vec refresh failed: {e}", file=sys.stderr)
+        finally:
+            with _vec_bg_guard:
+                _vec_bg_inflight.discard(name)
+
+    threading.Thread(target=_worker, name=f"vec-refresh-{name}", daemon=True).start()
+
 
 # Known cells (just names, for instructions). Populated at startup + lazily.
 _known_cells: set[str] = set()
@@ -220,7 +293,10 @@ def get_cell(name: str, warm_vec: bool = True):
         current_mtime = p.stat().st_mtime
         state = _vec_state.get(name)
 
-        if not warm_vec:
+        if not warm_vec or cell_is_no_embed(db):
+            # embed-off cell → only NULL embeddings; never warm a VectorCache
+            # (would be a phantom empty scoring surface). Serve FTS/SQL/structural
+            # only — the query surface @orient marks semantic-scoring INERT.
             pass
         elif HAS_ENGINE and state and state['mtime'] == current_mtime:
             # Cache is fresh — just register UDF on this connection
@@ -240,35 +316,31 @@ def get_cell(name: str, warm_vec: bool = True):
                         _vec_locks[name] = threading.Lock()
                     cell_lock = _vec_locks[name]
 
-                with cell_lock:
-                    # Re-check after acquiring lock (another thread may have built it)
-                    state = _vec_state.get(name)
-                    if state and (current_mtime - state['mtime']) < _VEC_REBUILD_DEBOUNCE_S:
-                        state['last_used'] = time.time()
-                        register_vec_udf(db, state)
-                    else:
-                        # Incremental first: embeddings mostly append, so a
-                        # successor-cache append avoids re-reading the whole
-                        # matrix (the RSS-ratchet source). Falls back to a
-                        # full rebuild on deletes, large drift, or age.
-                        refreshed = None
-                        if state:
-                            try:
-                                refreshed = _engine_refresh_vec_state(state, db)
-                            except Exception:
-                                refreshed = None
-                        if refreshed == 'appended':
-                            state['mtime'] = current_mtime
+                if state is not None:
+                    # WARM but drifted: serve the existing matrix NOW (~ms), and
+                    # refresh in the background. The query NEVER blocks on a
+                    # rebuild — staleness is bounded to the newest rows, never
+                    # wrong results. This is the fix for the 30s timeouts: the
+                    # fetchall+vstack rebuild no longer runs on the query thread.
+                    state['last_used'] = time.time()
+                    register_vec_udf(db, state)
+                    _schedule_vec_refresh(name, cell_lock)
+                else:
+                    # COLD (no cache yet — first warmup or post-eviction): there
+                    # is nothing to serve, so build synchronously under the lock.
+                    # Rare; only the very first touch of a cell pays this.
+                    with cell_lock:
+                        state = _vec_state.get(name)
+                        if state is not None:
                             state['last_used'] = time.time()
                             register_vec_udf(db, state)
-                            print(f"[flex-mcp]   {name}: vec_cache appended", file=sys.stderr)
                         else:
                             new_state = _engine_build_vec_state(name, db, current_mtime)
                             if new_state:
                                 new_state['last_used'] = time.time()
                                 _vec_state[name] = new_state
                                 register_vec_udf(db, new_state)
-                                print(f"[flex-mcp]   {name}: vec_cache {'refreshed' if state else 'warmed'}"
+                                print(f"[flex-mcp]   {name}: vec_cache warmed"
                                       f" ({list(new_state['caches'].keys())})", file=sys.stderr)
                                 _enforce_vec_budget(current=name)
 
@@ -691,10 +763,9 @@ def _relay_tool_available() -> bool:
 _RELAY_TOOL = types.Tool(
     name="flex_relay",
     description=(
-        "Enable or disable cloud access via the getflex.dev tunnel. "
-        "When enabled, this flex server is reachable via a stable "
-        "https://{id}.getflex.dev/sse endpoint usable from claude.ai "
-        "and any MCP client. Per-machine, opt-in, reversible. "
+        "Enable or disable remote MCP access. When enabled, this flex "
+        "server is reachable via a stable remote endpoint usable from "
+        "claude.ai and any MCP client. Per-machine, opt-in, reversible. "
         "The MCP service must be restarted (systemctl --user restart "
         "flex-mcp) for state changes to take effect — the tool returns "
         "restart_required=true on start/stop."
@@ -742,7 +813,6 @@ async def _handle_flex_relay(arguments: dict | None) -> list[types.TextContent]:
         return [types.TextContent(type="text", text=json.dumps({
             "error": "relay_unavailable",
             "message": "relay requires the websockets package",
-            "install": "pip install 'getflex[relay]'",
         }))]
 
     from flex.registry import FLEX_HOME
@@ -803,6 +873,8 @@ async def _handle_flex_relay(arguments: dict | None) -> list[types.TextContent]:
 
 
 _QUERY_TIMEOUT_S = 30  # max seconds per query before cancellation
+_QUERY_CONCURRENCY = max(1, int(os.environ.get("FLEX_QUERY_CONCURRENCY", "4")))
+_QUERY_SEMAPHORE = asyncio.Semaphore(_QUERY_CONCURRENCY)
 
 # Response gate — prevent large results from eating context window
 _CHARS_PER_TOKEN = 3.5
@@ -985,8 +1057,19 @@ async def handle_call_tool(
     if _is_ungated_preset(query):
         force = True
 
+    if _QUERY_SEMAPHORE.locked():
+        return [types.TextContent(type="text", text=json.dumps({
+            "error": "Flex query concurrency limit reached",
+            "limit": _QUERY_CONCURRENCY,
+            "hint": "Retry shortly; MCP handshakes and health checks remain available.",
+        }))]
+
     loop = asyncio.get_running_loop()
-    result = await loop.run_in_executor(None, _execute_cell_query, cell, query)
+    await _QUERY_SEMAPHORE.acquire()
+    try:
+        result = await loop.run_in_executor(None, _execute_cell_query, cell, query)
+    finally:
+        _QUERY_SEMAPHORE.release()
 
     # Token estimate header + gate
     row_count, est_tokens, header = _token_header(result)

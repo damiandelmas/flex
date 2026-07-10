@@ -28,15 +28,22 @@ Usage:
     embeddings = model.encode(["text1", "text2"])                    # index
     embeddings = model.encode(["query"], prefix='search_query: ')    # search
 """
+import os
 import numpy as np
 from pathlib import Path
-from typing import List, Union
+from typing import List, Optional, Union
 
 # Lazy imports
 _ort = None
 _tokenizer = None
 
 ONNX_DIR = Path(__file__).parent
+
+# Single source of truth for the effective embedding dimension used across
+# the embed/store/serve path (Matryoshka truncation target). Change this ONE
+# constant to propagate a new dimension everywhere it's read from — do not
+# hardcode 128 (or any other value) elsewhere.
+STORE_DIM = 128
 
 
 def _resolve_model_path() -> Path:
@@ -128,8 +135,11 @@ def _get_tokenizer():
 class ONNXEmbedder:
     """ONNX-based sentence embedder compatible with sentence-transformers API."""
 
-    def __init__(self, model_path: Path = None):
+    def __init__(self, model_path: Path = None, tokenizer_path: Path = None):
         self.model_path = model_path or _resolve_model_path()
+        # An explicit tokenizer_path is used for non-default (registered) models
+        # whose WordPiece/BPE vocab differs from the bundled one. None → bundled.
+        self._tokenizer_path = tokenizer_path
         self._session = None
         self._tokenizer = None
 
@@ -141,10 +151,16 @@ class ONNXEmbedder:
             # ORT_ENABLE_ALL: fuses QKV attention, layer norm, GELU, embedding
             # layers into single kernels. 2-5x speedup on transformers.
             opts.graph_optimization_level = ort.GraphOptimizationLevel.ORT_ENABLE_ALL
-            # Limit thread pool to 4 threads to prevent ONNX spin-wait burning
-            # CPU when idle. 0 = all cores, which creates 50+ threads that
-            # spin-wait at ~20% CPU even between batches.
-            opts.intra_op_num_threads = 4
+            # Thread pool size is configurable via FLEX_ONNX_THREADS.
+            # Default 4 keeps the always-on worker a quiet background citizen
+            # (0 = all cores spawns 50+ threads that spin-wait ~20% CPU idle).
+            # Bulk paths (flex init, backfill, cold catch-up) raise it — or set
+            # 0 for all physical cores. Measured ~1.4x on real long chunks
+            # (4->12 threads; flat beyond ~12 — long sequences cap it). GPU is
+            # NOT faster on real data; sequence length is the wall, not matmul.
+            # See context changelogs 260220 (thread throttle) and 260331 (GPU
+            # benchmark correction).
+            opts.intra_op_num_threads = int(os.environ.get("FLEX_ONNX_THREADS", "4"))
             opts.inter_op_num_threads = 1
             # Disable thread spin-wait to prevent idle CPU burn in daemon mode
             opts.add_session_config_entry("session.intra_op.allow_spinning", "0")
@@ -165,7 +181,11 @@ class ONNXEmbedder:
     @property
     def tokenizer(self):
         if self._tokenizer is None:
-            self._tokenizer = _get_tokenizer()
+            if self._tokenizer_path is not None:
+                from tokenizers import Tokenizer
+                self._tokenizer = Tokenizer.from_file(str(self._tokenizer_path))
+            else:
+                self._tokenizer = _get_tokenizer()
         return self._tokenizer
 
     def _encode_batch(self, batch: list, normalize: bool) -> np.ndarray:
@@ -201,7 +221,7 @@ class ONNXEmbedder:
         normalize: bool = True,
         prefix: str = 'search_document: ',
         show_progress_bar: bool = False,  # noqa: ARG002 — sentence-transformers API compat
-        matryoshka_dim: int = 128,
+        matryoshka_dim: Optional[int] = None,
     ) -> np.ndarray:
         """
         Encode sentences to embeddings with adaptive batching.
@@ -218,12 +238,14 @@ class ONNXEmbedder:
                     use 'search_query: ' for retrieval). Empty string for no prefix.
             show_progress_bar: Ignored. Exists for sentence-transformers API compatibility.
             matryoshka_dim: Truncate output to this many dimensions (Matryoshka).
-                    Default 128. Set to 768 for full embeddings. Re-normalizes after
-                    truncation so cosine similarity remains valid.
+                    Defaults to STORE_DIM (128). Set to 768 for full embeddings.
+                    Re-normalizes after truncation so cosine similarity remains valid.
 
         Returns:
             numpy array of shape (n_sentences, matryoshka_dim)
         """
+        if matryoshka_dim is None:
+            matryoshka_dim = STORE_DIM
         if isinstance(sentences, str):
             sentences = [sentences]
         if prefix:

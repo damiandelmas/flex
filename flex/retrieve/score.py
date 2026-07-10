@@ -244,6 +244,24 @@ def score_candidates(
     # 1. Matrix multiply — all similarities at once
     similarities = active_matrix @ query_vec
 
+    # === ABSENT-TOPIC SIGNAL (Issue 3) ===
+    # Capture the raw cosine distribution over the (pre-filtered) candidate pool
+    # BEFORE any modulation mutates `similarities`. A per-result z-score against
+    # this background gives the caller a corpus-relative reference frame: a top
+    # hit only ~1 std above the pool mean is the noise floor (topic absent),
+    # whereas a genuine hit sits many std above. Absolute cosine (0.65) cannot
+    # convey this; z can.
+    _raw_sims = similarities.copy()
+    _bg_mean = float(_raw_sims.mean()) if _raw_sims.size else 0.0
+    _bg_std = float(_raw_sims.std()) if _raw_sims.size else 0.0
+
+    def _z_for(idx):
+        # float() is mandatory — a numpy float would crash json.dumps in the
+        # vec_ops UDF and turn every query into an error.
+        if _bg_std <= 1e-9:
+            return None
+        return float((_raw_sims[idx] - _bg_mean) / _bg_std)
+
     # Trajectory blend: 0.5 * query_score + 0.5 * direction_score
     if _traj_direction is not None:
         traj_scores = active_matrix @ _traj_direction
@@ -353,13 +371,15 @@ def score_candidates(
     if diverse and len(top_indices) > 1:
         mmr_results = _mmr_select(
             top_indices, similarities, active_matrix, limit, lambda_=mmr_lambda)
-        results = [{'id': active_ids[idx], 'score': float(score)}
+        results = [{'id': active_ids[idx], 'score': float(score),
+                    '_z': _z_for(idx)}
                    for idx, score in mmr_results]
         _attach_enrichments(results)
         return results
 
     # Build results (cosine/modulated scores)
-    results = [{'id': active_ids[idx], 'score': float(similarities[idx])}
+    results = [{'id': active_ids[idx], 'score': float(similarities[idx]),
+                '_z': _z_for(idx)}
                for idx in top_indices[:limit]]
     _attach_enrichments(results)
     return results

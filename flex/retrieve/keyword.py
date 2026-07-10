@@ -126,7 +126,11 @@ def materialize_keyword(db, sql: str) -> str:
         if not pf_rows:
             # Pre-filter matched nothing — return empty results
             tmp_name = f"_kw_results_{uuid.uuid4().hex[:8]}"
-            db.execute(f"CREATE TEMP TABLE [{tmp_name}] (id TEXT PRIMARY KEY, rank REAL, snippet TEXT)")
+            db.execute(
+                f"CREATE TEMP TABLE [{tmp_name}] "
+                "(id TEXT PRIMARY KEY, rank REAL, snippet TEXT, "
+                "matched_tokens TEXT, dropped_tokens TEXT)"
+            )
             return sql[:start.start()] + tmp_name + sql[end_pos:]
 
         # Materialize pre-filter IDs into a temp table so FTS can JOIN against it.
@@ -165,6 +169,8 @@ def materialize_keyword(db, sql: str) -> str:
             "LIMIT ?"
         )
 
+    matched_words: list = []
+    dropped_words: list = []
     try:
         try:
             rows = db.execute(fts_sql, (sanitized, limit)).fetchall()
@@ -180,6 +186,13 @@ def materialize_keyword(db, sql: str) -> str:
                 rows = db.execute(fts_sql, (escaped or '""', limit)).fetchall()
             else:
                 rows = []
+        # Per-token match probe — surfaces which tokens matched ZERO rows so a
+        # bare multi-word query that silently collapsed to its matchable subset
+        # (e.g. 'zzzgrumblefish stenographer' driven entirely by 'stenographer')
+        # is no longer indistinguishable from a real match. Runs while the scope
+        # temp table is still alive (before the finally drops it).
+        matched_words, dropped_words = _probe_keyword_tokens(
+            db, term, sanitized, scope_table)
     except Exception as e:
         return json.dumps({"error": f"keyword() search failed: {e}"})
     finally:
@@ -204,16 +217,69 @@ def materialize_keyword(db, sql: str) -> str:
         rows = [(rows[0][0], 0.5, rows[0][2])]  # single result → 0.5 (uncertain)
 
     # Create temp table (always — even on empty results)
+    # matched_tokens / dropped_tokens are query-level facts repeated on every
+    # row (JSON arrays). dropped_tokens names the terms that matched nothing in
+    # the corpus — the in-band signal Issue 1 was missing.
+    matched_json = json.dumps(matched_words)
+    dropped_json = json.dumps(dropped_words)
     tmp_name = f"_kw_results_{uuid.uuid4().hex[:8]}"
-    db.execute(f"CREATE TEMP TABLE [{tmp_name}] (id TEXT PRIMARY KEY, rank REAL, snippet TEXT)")
+    db.execute(
+        f"CREATE TEMP TABLE [{tmp_name}] "
+        "(id TEXT PRIMARY KEY, rank REAL, snippet TEXT, "
+        "matched_tokens TEXT, dropped_tokens TEXT)"
+    )
     if rows:
         db.executemany(
-            f"INSERT INTO [{tmp_name}] VALUES (?, ?, ?)",
-            [(r[0], r[1], r[2]) for r in rows]
+            f"INSERT INTO [{tmp_name}] VALUES (?, ?, ?, ?, ?)",
+            [(r[0], r[1], r[2], matched_json, dropped_json) for r in rows]
         )
 
     # Rewrite: replace keyword(...) with temp table name
     return sql[:start.start()] + tmp_name + sql[end_pos:]
+
+
+def _probe_keyword_tokens(db, term: str, sanitized: str, scope_table):
+    """Probe each query token individually to find which matched ZERO rows.
+
+    Returns (matched, dropped) word lists. This is the in-band signal for the
+    silent-drop failure: under the AND→OR fallback an unmatchable token simply
+    contributes nothing and the query collapses to its matchable subset with no
+    trace. Probing each token against the (scoped) FTS index recovers that fact.
+
+    Two real tokens that never co-occur in one chunk still both report as
+    matched (dropped=[]) — the AND→OR fallback fires for them too, but neither
+    token is actually absent from the index, so neither is "dropped".
+
+    Returns ([], []) when the query uses explicit FTS5 operators (cannot be
+    decomposed into independent tokens) or is a single token (a zero-match
+    single token already returns an empty, loud result set).
+    """
+    if re.search(r'\b(AND|OR|NOT|NEAR)\b', term) or '*' in term:
+        return [], []
+    words = [w for w in sanitized.split() if w]
+    if len(words) < 2:
+        return words, []
+
+    if scope_table is not None:
+        probe_sql = (
+            "SELECT 1 FROM chunks_fts "
+            "JOIN _raw_chunks c ON chunks_fts.rowid = c.rowid "
+            f"JOIN [{scope_table}] s ON c.id = s.id "
+            "WHERE chunks_fts MATCH ? LIMIT 1"
+        )
+    else:
+        probe_sql = "SELECT 1 FROM chunks_fts WHERE chunks_fts MATCH ? LIMIT 1"
+
+    matched, dropped = [], []
+    for w in words:
+        try:
+            hit = db.execute(probe_sql, (w,)).fetchone()
+        except sqlite3.OperationalError:
+            # Token isn't independently MATCH-able (rare) — don't claim it dropped.
+            matched.append(w)
+            continue
+        (matched if hit else dropped).append(w)
+    return matched, dropped
 
 
 def _sanitize_fts5(term: str) -> str:

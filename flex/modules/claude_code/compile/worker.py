@@ -87,6 +87,12 @@ except ImportError:
 
 CLAUDE_PROJECTS = Path.home() / ".claude/projects"
 
+# Reconciliation cadence when filesystem events are enabled (flex.watch owns
+# the same default for the observer side — kept here too so worker.py has no
+# hard import-time dependency on flex.watch, whose Watcher/observer machinery
+# imports watchdog lazily).
+DEFAULT_RECONCILE_INTERVAL = 60.0
+
 # Warmup threshold — imported at module level for fast per-session checks
 try:
     from flex.modules.claude_code.manage.noise import WARMUP_MESSAGE_THRESHOLD
@@ -346,6 +352,11 @@ def _ensure_core_tables(conn: sqlite3.Connection):
             entry_uuid TEXT,
             branch_id INTEGER DEFAULT 0
         );
+        -- Index the mask path: type(...) resolves to _types_message.type. Without
+        -- this it is a full SCAN (~33ms on 551K); with it, a covering range seek
+        -- (~2ms). Pays off only when the mask queries this base table directly,
+        -- not via the chunks view (which CASE-computes type and can't use it).
+        CREATE INDEX IF NOT EXISTS idx_types_message_type ON _types_message(type);
 
         CREATE TABLE IF NOT EXISTS _edges_delegations (
             id INTEGER PRIMARY KEY,
@@ -1195,11 +1206,74 @@ def sync_session_messages(session_id: str, conn: sqlite3.Connection,
     return inserted
 
 
+def _sync_one_jsonl(
+    conn: sqlite3.Connection,
+    jsonl: Path,
+    size_cache: dict,
+    error_cache: dict,
+    now: float,
+) -> tuple[int, int, int]:
+    """Shared per-path sync primitive.
+
+    Both the full-tree reconciliation scan (scan_sessions) and the
+    path-targeted event sync (sync_session_paths) call this — identical
+    size-cache and error-backoff semantics on both routes, per the
+    technical contract. Symlinks are rejected here so neither route can be
+    tricked into following one.
+
+    Returns (synced_delta, chunks, failed_delta) — synced_delta/failed_delta
+    are 0 or 1 (one path, one outcome); chunks is the actual insert count.
+    """
+    if jsonl.is_symlink():
+        return (0, 0, 0)
+    try:
+        current_size = jsonl.stat().st_size
+    except (FileNotFoundError, OSError):
+        return (0, 0, 0)
+
+    session_id = jsonl.stem
+    last_size = size_cache.get(session_id, -1)
+    error_state = error_cache.get(session_id)
+
+    if current_size == last_size:
+        return (0, 0, 0)  # unchanged — skip
+    if (
+        error_state
+        and error_state.get("size") == current_size
+        and now < error_state.get("retry_after", 0)
+    ):
+        return (0, 0, 0)
+
+    # New or grown file — sync it
+    try:
+        count = sync_session_messages(session_id, conn)
+        _update_warmup(conn, session_id)
+        size_cache[session_id] = current_size
+        error_cache.pop(session_id, None)
+        return (1 if count > 0 else 0, count, 0)
+    except Exception as e:
+        failures = int(error_state.get("failures", 0)) + 1 if error_state else 1
+        delay = min(300, 5 * (2 ** min(failures - 1, 6)))
+        error_cache[session_id] = {
+            "size": current_size,
+            "failures": failures,
+            "retry_after": now + delay,
+        }
+        print(
+            f"[worker] sync error {session_id[:12]}: {e} "
+            f"(retry in {delay}s)",
+            file=sys.stderr,
+        )
+        return (0, 0, 1)
+
+
 def scan_sessions(conn: sqlite3.Connection, size_cache: dict, error_cache: dict | None = None) -> dict:
     """Scan all JSONLs by file size, sync only those that grew.
 
     Replaces the old queue-drain and startup-backfill paths. Pure stat()-based
-    polling — the Filebeat pattern.
+    polling — the Filebeat pattern. Also serves as the periodic reconciliation
+    pass when filesystem events are enabled: same full-tree scan, just run on
+    a slower cadence instead of every tick.
 
     Args:
         conn: Open cell connection.
@@ -1208,62 +1282,104 @@ def scan_sessions(conn: sqlite3.Connection, size_cache: dict, error_cache: dict 
                     full initial scan.
 
     Returns:
-        dict with 'synced' (sessions touched) and 'chunks' (new chunks inserted).
+        dict with 'synced' (sessions touched), 'chunks' (new chunks inserted),
+        and 'failed' (sessions that errored and are in backoff).
     """
     synced = 0
     chunks = 0
+    failed = 0
     error_cache = error_cache if error_cache is not None else {}
     now = time.monotonic()
 
     for jsonl in CLAUDE_PROJECTS.rglob("*.jsonl"):
-        # Reject symlinks — prevent ingestion of arbitrary files
-        if jsonl.is_symlink():
-            continue
-        try:
-            current_size = jsonl.stat().st_size
-        except (FileNotFoundError, OSError):
-            continue
-
-        session_id = jsonl.stem
-        last_size = size_cache.get(session_id, -1)
-        error_state = error_cache.get(session_id)
-
-        if current_size == last_size:
-            continue  # unchanged — skip
-        if (
-            error_state
-            and error_state.get("size") == current_size
-            and now < error_state.get("retry_after", 0)
-        ):
-            continue
-
-        # New or grown file — sync it
-        try:
-            count = sync_session_messages(session_id, conn)
-            _update_warmup(conn, session_id)
-            size_cache[session_id] = current_size
-            error_cache.pop(session_id, None)
-            if count > 0:
-                synced += 1
-                chunks += count
-        except Exception as e:
-            failures = int(error_state.get("failures", 0)) + 1 if error_state else 1
-            delay = min(300, 5 * (2 ** min(failures - 1, 6)))
-            error_cache[session_id] = {
-                "size": current_size,
-                "failures": failures,
-                "retry_after": now + delay,
-            }
-            print(
-                f"[worker] sync error {session_id[:12]}: {e} "
-                f"(retry in {delay}s)",
-                file=sys.stderr,
-            )
+        s, c, f = _sync_one_jsonl(conn, jsonl, size_cache, error_cache, now)
+        synced += s
+        chunks += c
+        failed += f
+        if s:
+            # Chunked commit. On a cold start the size_cache is empty, so
+            # the first tick syncs the entire backlog (e.g. 6 days down =
+            # ~1400 grown files) in ONE transaction that only committed at
+            # end-of-scan — all-or-nothing, invisible until done, unbounded
+            # WAL, and any kill mid-scan loses everything and restarts from
+            # scratch. Commit every 50 synced sessions so catch-up is
+            # incremental, crash-safe, and observable. Steady-state ticks
+            # sync 1-2 files and hit the end-of-loop commit as before.
+            if synced % 50 == 0:
+                conn.commit()
 
     if chunks > 0:
         conn.commit()
 
-    return {'synced': synced, 'chunks': chunks}
+    return {'synced': synced, 'chunks': chunks, 'failed': failed}
+
+
+def sync_session_paths(
+    conn: sqlite3.Connection,
+    paths,
+    size_cache: dict,
+    error_cache: dict | None = None,
+) -> dict:
+    """Path-targeted Claude Code sync — the event-driven counterpart to
+    scan_sessions(). Calls the same _sync_one_jsonl() primitive, so event
+    delivery and full reconciliation share identical size-cache and
+    error-backoff semantics.
+
+    Re-validates every path itself (regular file, non-symlink, .jsonl,
+    resolved beneath CLAUDE_PROJECTS) rather than trusting the caller —
+    this function rejects paths outside CLAUDE_PROJECTS even if an
+    invalidation was forged or a registration/pattern check upstream had a
+    bug.
+
+    Args:
+        paths: iterable of candidate JSONL paths (str or Path).
+
+    Returns:
+        dict with 'synced', 'chunks', 'failed' — same shape as scan_sessions().
+    """
+    synced = 0
+    chunks = 0
+    failed = 0
+    error_cache = error_cache if error_cache is not None else {}
+    now = time.monotonic()
+
+    try:
+        claude_root = CLAUDE_PROJECTS.resolve()
+    except OSError:
+        return {'synced': 0, 'chunks': 0, 'failed': 0}
+
+    for raw_path in paths:
+        jsonl = Path(raw_path)
+        if jsonl.suffix != '.jsonl':
+            continue
+        if jsonl.is_symlink():
+            continue
+        try:
+            resolved = jsonl.resolve()
+        except OSError:
+            continue
+        try:
+            resolved.relative_to(claude_root)
+        except ValueError:
+            continue  # escapes CLAUDE_PROJECTS — reject even if it was "invalidated"
+        if not resolved.is_file():
+            continue  # deleted/moved away before we got to it — reconciliation will notice
+
+        s, c, f = _sync_one_jsonl(conn, resolved, size_cache, error_cache, now)
+        synced += s
+        chunks += c
+        failed += f
+        if s:
+            # Same chunked-commit safety net as scan_sessions: a large event
+            # backlog must not hold one unbounded uncommitted transaction.
+            # Commit every 50 synced so catch-up is incremental and crash-safe.
+            if synced % 50 == 0:
+                conn.commit()
+
+    if chunks > 0:
+        conn.commit()
+
+    return {'synced': synced, 'chunks': chunks, 'failed': failed}
 
 
 # Compatibility wrapper for background-indexer callers.
@@ -1329,8 +1445,10 @@ def bootstrap_claude_code_cell(
 
 
 def _batch_embed_chunks(conn, batch_size: int = 500, quiet: bool = False,
-                        progress_cb=None, embedder=None) -> int:
-    """Phase 2 of decoupled backfill: batch embed all NULL-embedding chunks.
+                        progress_cb=None, embedder=None,
+                        max_chunks: int | None = None,
+                        deadline: float | None = None) -> int:
+    """Phase 2 of decoupled backfill: batch embed NULL-embedding chunks.
 
     SELECT content WHERE embedding IS NULL → encode(batch) → UPDATE.
     Commits after each batch. Returns total embedded count.
@@ -1342,6 +1460,14 @@ def _batch_embed_chunks(conn, batch_size: int = 500, quiet: bool = False,
         progress_cb: Optional callback(done, total) called after each batch.
         embedder: Optional embedder instance (e.g. NomicEmbedder). If None,
                   uses the default ONNX singleton via encode().
+        max_chunks: Optional cap on chunks embedded in this call. None (the
+                    default) preserves full-drain behavior — every existing
+                    direct caller (initial_backfill, enrichment sweep, CLI
+                    recompile) keeps draining the whole NULL backlog unless
+                    it opts into a budget.
+        deadline: Optional time.time()-style wall-clock deadline. None means
+                  no time limit. The daemon's per-tick sweep passes a real
+                  budget so a large backlog cannot monopolize the process.
     """
     _enc = embedder.encode if embedder is not None else encode
     # Use embedder's preferred batch size if it exposes one (e.g. NomicEmbedder=64)
@@ -1353,17 +1479,33 @@ def _batch_embed_chunks(conn, batch_size: int = 500, quiet: bool = False,
     total = conn.execute(
         "SELECT count(*) FROM _raw_chunks WHERE embedding IS NULL AND content IS NOT NULL"
     ).fetchone()[0]
+    # Bounded calls report against the selected work allowance, not the
+    # global backlog — a capped sweep must never claim it will finish the
+    # whole backlog in this call.
+    if max_chunks is not None:
+        total = min(total, max_chunks)
 
     if progress_cb:
         progress_cb(0, total)
 
     while True:
+        if max_chunks is not None and done >= max_chunks:
+            break
+        if deadline is not None and time.time() >= deadline:
+            break
+
+        limit = batch_size
+        if max_chunks is not None:
+            limit = min(limit, max_chunks - done)
+            if limit <= 0:
+                break
+
         rows = conn.execute("""
             SELECT id, content FROM _raw_chunks
             WHERE embedding IS NULL AND content IS NOT NULL
             ORDER BY id
             LIMIT ?
-        """, (batch_size,)).fetchall()
+        """, (limit,)).fetchall()
 
         if not rows:
             break
@@ -1802,8 +1944,58 @@ def _run_enrichment_cycle(conn, graph_threshold=50):
     print(f"[enrich] Cycle done in {elapsed:.1f}s", file=sys.stderr)
 
 
-def daemon_loop(interval=2):
-    """Main daemon loop."""
+_WATCH_HEALTH_META_KEY = 'watch_health'
+_EMBED_TICK_BUDGET_S = 1.5  # real per-tick embed budget — bounded, not full-drain
+
+
+def _snapshot_watch_health(conn, invalidation_queue, watcher, last_reconcile_ts,
+                           phase_durations: dict) -> None:
+    """Persist watcher/queue/phase telemetry to _meta for cross-process health
+    reads (flex health / /health run in a separate process from the worker).
+    Best-effort only — never load-bearing for ingestion correctness, so any
+    failure here is swallowed rather than raised.
+    """
+    try:
+        payload = {
+            'enabled': invalidation_queue is not None,
+            'healthy': bool(watcher.healthy) if watcher is not None else None,
+            'backend': watcher.backend if watcher is not None else None,
+            'last_error': watcher.last_error if watcher is not None else None,
+            'last_reconcile_ts': last_reconcile_ts,
+            'reconciliation_required': (
+                invalidation_queue.reconciliation_required()
+                if invalidation_queue is not None else None
+            ),
+            'queue': invalidation_queue.stats() if invalidation_queue is not None else None,
+            'phase_durations_s': dict(phase_durations),
+            'updated_at': time.time(),
+        }
+        from flex.core import set_meta as _set_meta
+        _set_meta(conn, _WATCH_HEALTH_META_KEY, json.dumps(payload))
+    except Exception as e:
+        print(f"[worker] watch health snapshot error: {e}", file=sys.stderr)
+
+
+def daemon_loop(interval=2, invalidation_queue=None, watcher=None,
+                reconcile_interval: float | None = None):
+    """Main daemon loop.
+
+    Args:
+        interval: Scheduling heartbeat in seconds (default 2). Legacy
+                  scanners (docpac, markdown, coding-agent watch) and the
+                  polling fallback keep ticking at this cadence unchanged.
+        invalidation_queue: Optional flex.watch.InvalidationQueue. When
+                  None (the default), Claude Code ingestion uses the
+                  original every-tick full-tree scan_sessions() — exact
+                  legacy polling behavior, unchanged. When provided, each
+                  tick drains ready invalidations for path-targeted sync
+                  and a slower periodic scan_sessions() call becomes the
+                  reconciliation authority instead.
+        watcher: Optional flex.watch.Watcher — used only to read/refresh
+                  backend health each tick and to react to backend death.
+        reconcile_interval: Reconciliation cadence in seconds when
+                  invalidation_queue is provided. Defaults to 60s.
+    """
     # Resolve cell
     cell_path = resolve_cell('claude_code')
     if not cell_path:
@@ -1838,26 +2030,119 @@ def daemon_loop(interval=2):
     GRAPH_STALENESS_THRESHOLD = 50  # sessions since last graph build
 
     last_soma_heal = time.time()
-    last_enrichment = 0  # run enrichment immediately after first startup
+    worker_start = time.time()
+    ENRICHMENT_STARTUP_GRACE = 120  # capture must run + prove stable before enriching
 
-    # Size caches — empty dict triggers full initial scan on first tick
+    # Enrichment cadence PERSISTS across restarts (in _meta) so a (re)start does
+    # NOT reset the 30-min clock. Seeding to 0 fired the heavy cycle on the FIRST
+    # tick of every restart → fat (~2.9G) python → external SIGKILL under memory
+    # pressure → restart → re-fire → crash-loop, and capture never reached steady
+    # state. With a persisted timestamp the cycle runs only when genuinely due;
+    # absent a stored value (existing cell's first run / fresh cell) we defer one
+    # interval rather than firing immediately. The startup grace below keeps the
+    # heavy pass off the vulnerable first ticks, so a kill mid-cycle (before the
+    # timestamp can be re-persisted) cannot instantly re-trigger it on restart.
+    from flex.core import get_meta, set_meta
+    try:
+        _le = get_meta(conn, 'last_enrichment_ts')
+        last_enrichment = float(_le) if _le else time.time()
+    except (TypeError, ValueError):
+        last_enrichment = time.time()
+
+    # Size/error caches — empty dicts trigger full initial scan on first tick.
+    # Shared identically between the polling path and (when enabled) the
+    # event + reconciliation paths, per the technical contract.
     size_cache: dict = {}
+    error_cache: dict = {}
+
+    use_events = invalidation_queue is not None
+    RECONCILE_INTERVAL = reconcile_interval or DEFAULT_RECONCILE_INTERVAL
+    # 0.0 forces an immediate reconciliation on the very first tick — a
+    # restart must reconcile before relying on events, never assume an
+    # empty cache means "nothing to do".
+    last_reconcile = 0.0
+    _phase_durations: dict = {}
+
+    if use_events:
+        _snapshot_watch_health(conn, invalidation_queue, watcher, None, _phase_durations)
 
     while True:
-        # Phase 0: stat() scan — sync any JSONLs that grew (replaces queue + backfill)
-        try:
-            stats = scan_sessions(conn, size_cache)
-            if stats['synced'] > 0:
-                print(f"[worker] synced={stats['synced']} chunks={stats['chunks']}",
-                      file=sys.stderr)
-        except Exception as e:
-            print(f"[worker] Scan error: {e}", file=sys.stderr)
+        if use_events:
+            # Phase 0a: drain ready invalidations — cheap, wake-driven.
+            # Observer callbacks only enqueued; all I/O happens here.
+            try:
+                now_mono = time.monotonic()
+                ready = invalidation_queue.drain_ready(now_mono)
+                claude_paths = [inv.source_path for inv in ready if inv.cell_name == 'claude_code']
+                if claude_paths:
+                    _t0 = time.time()
+                    stats = sync_session_paths(conn, claude_paths, size_cache, error_cache)
+                    _phase_durations['targeted_sync_s'] = time.time() - _t0
+                    if stats['synced'] > 0:
+                        print(
+                            f"[worker] event-synced={stats['synced']} chunks={stats['chunks']}",
+                            file=sys.stderr,
+                        )
+            except Exception as e:
+                print(f"[worker] Event drain error: {e}", file=sys.stderr)
+
+            # Watcher backend health — a dead observer thread forces
+            # reconciliation to become the sole correctness path, without
+            # restarting the daemon.
+            if watcher is not None:
+                try:
+                    watcher.check_health()
+                except Exception as e:
+                    watcher.mark_unhealthy(str(e))
+
+            # Phase 0b: periodic full reconciliation — the correctness
+            # authority. Runs on RECONCILE_INTERVAL, immediately on startup,
+            # and whenever the queue overflowed or the watcher is unhealthy.
+            due_reconcile = (
+                time.time() - last_reconcile > RECONCILE_INTERVAL
+                or invalidation_queue.reconciliation_required()
+                or (watcher is not None and not watcher.healthy)
+            )
+            if due_reconcile:
+                try:
+                    _t0 = time.time()
+                    stats = scan_sessions(conn, size_cache, error_cache)
+                    _phase_durations['reconcile_s'] = time.time() - _t0
+                    if stats['synced'] > 0:
+                        print(
+                            f"[worker] reconcile synced={stats['synced']} chunks={stats['chunks']}",
+                            file=sys.stderr,
+                        )
+                    last_reconcile = time.time()
+                    invalidation_queue.clear_reconciliation_required()
+                except Exception as e:
+                    print(f"[worker] Reconcile error: {e}", file=sys.stderr)
+                    # Do NOT advance last_reconcile on failure — a failed
+                    # reconcile is exactly when the backstop is needed, so leave
+                    # the clock so due_reconcile fires again on a near tick
+                    # instead of waiting the full RECONCILE_INTERVAL.
+                _snapshot_watch_health(conn, invalidation_queue, watcher, last_reconcile, _phase_durations)
+        else:
+            # Phase 0: no event source wired — exact legacy polling behavior.
+            try:
+                stats = scan_sessions(conn, size_cache, error_cache)
+                if stats['synced'] > 0:
+                    print(f"[worker] synced={stats['synced']} chunks={stats['chunks']}",
+                          file=sys.stderr)
+            except Exception as e:
+                print(f"[worker] Scan error: {e}", file=sys.stderr)
 
         # Sweep NULL embeddings every tick — catches interrupted flex init,
-        # failed embeds, or any other orphaned chunks. Small batch (64) so
-        # the 2s loop stays responsive. Backlog clears in a few ticks.
+        # failed embeds, or any other orphaned chunks. Bounded to a real
+        # per-tick wall-clock budget (not just a small ONNX batch size) so a
+        # large backlog cannot monopolize the 2s loop; the remainder is
+        # picked up on the next tick and the 30min enrichment sweep.
         try:
-            swept = _batch_embed_chunks(conn, batch_size=64, quiet=True)
+            _t0 = time.time()
+            swept = _batch_embed_chunks(
+                conn, batch_size=64, quiet=True, deadline=_t0 + _EMBED_TICK_BUDGET_S,
+            )
+            _phase_durations['embed_sweep_s'] = time.time() - _t0
             if swept > 0:
                 conn.commit()
                 print(f"[worker] Embedded {swept} orphaned chunks", file=sys.stderr)
@@ -1919,14 +2204,24 @@ def daemon_loop(interval=2):
             except Exception as e:
                 print(f"[worker] eternity backup error: {e}", file=sys.stderr)
 
-        # Enrichment cycle — full heal pass (30min)
-        if time.time() - last_enrichment > ENRICHMENT_INTERVAL:
+        # Enrichment cycle — full heal pass (30-min cadence, persisted across
+        # restarts). Startup grace keeps the heavy pass off the first ticks:
+        # capture runs first and the worker proves it survives, so a kill
+        # mid-cycle cannot instantly re-trigger it on the next start.
+        if (time.time() - worker_start > ENRICHMENT_STARTUP_GRACE
+                and time.time() - last_enrichment > ENRICHMENT_INTERVAL):
             try:
                 _run_enrichment_cycle(conn, GRAPH_STALENESS_THRESHOLD)
                 last_enrichment = time.time()
             except Exception as e:
                 print(f"[worker] Enrichment error: {e}", file=sys.stderr)
                 last_enrichment = time.time()  # don't retry immediately
+            # Persist the cadence so a restart doesn't reset the clock and
+            # re-fire on the next first tick.
+            try:
+                set_meta(conn, 'last_enrichment_ts', str(last_enrichment))
+            except Exception as e:
+                print(f"[worker] persist last_enrichment error: {e}", file=sys.stderr)
 
             # Corpus graph refresh — same 30min cadence
             if _corpus_graph_refresher:

@@ -85,7 +85,8 @@ def install_cell(cell_name: str, preset_dirs: list[Path] = None):
                 name TEXT PRIMARY KEY,
                 description TEXT,
                 params TEXT DEFAULT '',
-                sql TEXT
+                sql TEXT,
+                source TEXT
             )
         """)
         try:

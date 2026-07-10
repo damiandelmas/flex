@@ -85,7 +85,7 @@ Use direct SQL when the path or filename is known:
 ```sql
 SELECT file, section, ext, substr(content, 1, 240) AS preview
 FROM chunks
-WHERE type = 'file' AND file LIKE '%context/current/release%'
+WHERE type = 'file' AND file LIKE '%docs/release%'
 ORDER BY created_at DESC
 LIMIT 20;
 ```

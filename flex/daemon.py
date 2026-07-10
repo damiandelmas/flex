@@ -94,6 +94,56 @@ def _refresh_loop(interval: int = 60):
         time.sleep(interval)
 
 
+def _build_claude_watcher():
+    """Phase 1 composition: build the Claude Code filesystem observer.
+
+    Returns (queue, watcher, config). queue/watcher are None when events are
+    explicitly disabled (FLEX_WATCH_DISABLE), the Claude projects directory
+    doesn't exist yet, or the watchdog backend fails to start — daemon_loop()
+    falls back to its original every-tick polling behavior whenever queue is
+    None, so a watch failure here degrades latency, never correctness.
+    """
+    from flex.watch import WatchRegistration, InvalidationQueue, Watcher, load_watch_config
+
+    config = load_watch_config()
+    if config.disabled:
+        print("[flex-daemon] Filesystem events disabled via FLEX_WATCH_DISABLE — polling fallback",
+              file=sys.stderr)
+        return None, None, config
+
+    try:
+        from flex.modules.claude_code.compile.worker import CLAUDE_PROJECTS
+    except ImportError:
+        return None, None, config
+
+    if not CLAUDE_PROJECTS.exists():
+        print("[flex-daemon] Claude projects dir not found — filesystem events unavailable, polling fallback",
+              file=sys.stderr)
+        return None, None, config
+
+    registration = WatchRegistration(
+        cell_name='claude_code',
+        root=CLAUDE_PROJECTS,
+        pattern='**/*.jsonl',
+        recursive=True,
+    )
+    queue = InvalidationQueue(
+        quiet_window=config.quiet_window,
+        max_latency=config.max_latency,
+        max_size=config.queue_max,
+    )
+    watcher = Watcher(registration, queue)
+    if not watcher.start():
+        print(
+            f"[flex-daemon] Filesystem watcher failed to start ({watcher.last_error}) — polling fallback",
+            file=sys.stderr,
+        )
+        return None, None, config
+
+    print(f"[flex-daemon] Filesystem events enabled (backend={watcher.backend})", file=sys.stderr)
+    return queue, watcher, config
+
+
 def main():
     _load_secrets()
     from flex.registry import load_plugins
@@ -149,10 +199,30 @@ def main():
         )
         t.start()
 
+    # Phase 1 filesystem observer (Claude Code JSONLs only). Built before the
+    # worker loop starts; stopped/joined on every exit path below, including
+    # a signal-driven shutdown.
+    queue, watcher, _watch_config = _build_claude_watcher()
+
+    def _shutdown_watcher(signum=None, frame=None):
+        if watcher is not None:
+            watcher.stop()
+        if signum is not None:
+            sys.exit(0)
+
+    import signal
+    signal.signal(signal.SIGTERM, _shutdown_watcher)
+    signal.signal(signal.SIGINT, _shutdown_watcher)
+
     # Main thread: local cell scan (blocks if module available)
     try:
         from flex.modules.claude_code.compile.worker import daemon_loop
-        daemon_loop(interval=args.interval)
+        daemon_loop(
+            interval=args.interval,
+            invalidation_queue=queue,
+            watcher=watcher,
+            reconcile_interval=_watch_config.reconcile_interval if queue else None,
+        )
     except ImportError:
         print("[flex-daemon] claude_code module not installed — running background services only",
               file=sys.stderr)
@@ -160,6 +230,8 @@ def main():
         import time
         while True:
             time.sleep(60)
+    finally:
+        _shutdown_watcher()
 
 
 if __name__ == "__main__":

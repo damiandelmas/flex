@@ -130,8 +130,9 @@ def _register_udf(db: sqlite3.Connection, state: dict):
     """Register vec_ops UDF on a connection using cached VectorCache."""
     embedder = _get_embedder()
     if embedder:
-        embed_query = lambda text: embedder.encode(text, prefix='search_query: ')
-        embed_doc = lambda text: embedder.encode(text, prefix='search_document: ')
+        from flex.onnx.embed import STORE_DIM
+        embed_query = lambda text: embedder.encode(text, prefix='search_query: ', matryoshka_dim=STORE_DIM)
+        embed_doc = lambda text: embedder.encode(text, prefix='search_document: ', matryoshka_dim=STORE_DIM)
         register_vec_ops(db, state['caches'], embed_query, state['config'],
                          embed_doc_fn=embed_doc)
 

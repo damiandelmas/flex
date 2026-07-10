@@ -43,6 +43,7 @@ class ChunkEntry:
     word_count: int = 0
     char_start: int = 0
     char_end: int = 0
+    _only_chunk: bool = False  # True when this is the note's sole chunk (→ full_note)
 
 
 # ─── Cleaning (ephemeral — never modifies source files) ──────────────────────
@@ -160,6 +161,7 @@ def chunk_markdown(body: str, note_title: str) -> list[ChunkEntry]:
             heading_chain=[],
             position=0,
             word_count=len(body.split()),
+            _only_chunk=True,
         )]
 
     normalized = normalize_headers(body)
@@ -176,17 +178,22 @@ def chunk_markdown(body: str, note_title: str) -> list[ChunkEntry]:
             heading_chain=[],
             position=0,
             word_count=len(body.split()),
+            _only_chunk=True,
         )]
 
     chunks = []
-    heading_slots = [None] * 6  # H1-H6
+    # size to the deepest heading, not a fixed 6 — a heading >H6 else IndexErrors
+    # on heading_slots[depth-1] and drops the whole file (deep-heading content
+    # loss). This is the embed-prep chunker (the 6th/last site of the class).
+    n_slots = max(6, max((d for _, _, _, d in sections if d > 0), default=0))
+    heading_slots = [None] * n_slots  # H1..deepest
     position = 0
 
     for title, section_body, _pos, depth in sections:
         # Update heading slots
         if depth > 0:
             heading_slots[depth - 1] = title
-            for i in range(depth, 6):
+            for i in range(depth, n_slots):
                 heading_slots[i] = None
 
         heading_chain = [h for h in heading_slots if h is not None]
@@ -224,6 +231,8 @@ def chunk_markdown(body: str, note_title: str) -> list[ChunkEntry]:
         ))
         position += 1
 
+    if len(chunks) == 1:
+        chunks[0]._only_chunk = True
     return chunks
 
 

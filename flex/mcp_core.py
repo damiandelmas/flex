@@ -88,10 +88,36 @@ def materialize_authorizer(action, arg1, arg2, db_name, trigger_name):
     return _SQLITE_OK if action in _MATERIALIZE_ALLOW else _SQLITE_DENY
 
 
+# Query-prefix registry — optional materializers register the call-style
+# prefixes they own (e.g. "somefn(") so is_bare_text() can recognize them
+# as queries rather than bare text. Empty by default: a prefix is only
+# recognized once its owning materializer registers it at load time. This
+# stays a plain local set/function, with no outside imports added here, so
+# the module keeps the copy-safe property described at the top of this file.
+_QUERY_PREFIXES: set[str] = set()
+
+
+def register_query_prefix(prefix: str) -> None:
+    """Register a call-style query prefix owned by an optional materializer.
+
+    An optional materializer that is not always installed calls this when
+    it loads, to claim the prefix it handles. Builds that never load such a
+    materializer leave the registry empty, so unrecognized prefixes fall
+    through to bare-text handling.
+    """
+    _QUERY_PREFIXES.add(prefix.lower())
+
+
 def is_bare_text(query: str) -> bool:
     """Return True when a query is neither SQL nor a preset expression."""
     q = query.strip()
     if q.startswith("@"):
+        return False
+    ql = q.lower()
+    if any(ql.startswith(prefix) for prefix in _QUERY_PREFIXES):
+        # A registered materializer owns this call-style prefix — it IS a
+        # query (the materializer synthesizes the host SELECT internally).
+        # Not bare text.
         return False
     upper = q.upper().lstrip()
     sql_starts = (

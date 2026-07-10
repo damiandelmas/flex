@@ -4,8 +4,12 @@ import re
 
 from flex.modules.markdown.compile.tags import strip_code_blocks
 
-# Block fields: key:: value at start of line
-BLOCK_FIELD_RE = re.compile(r'(?:^|\n)(\w[\w-]*)::[ \t]+(.+?)(?:\n|$)')
+# Block fields: key:: value at start of line.
+# The trailing boundary is a LOOKAHEAD `(?=\n|$)`, not a consuming `(?:\n|$)`:
+# without MULTILINE, `^` is string-start only, so the leading `(?:^|\n)` relies on
+# the previous line's newline still being present. Consuming it dropped every
+# other stacked block field (odd lines only). `[ \t]*` tolerates indentation.
+BLOCK_FIELD_RE = re.compile(r'(?:^|\n)[ \t]*(\w[\w-]*)::[ \t]+(.+?)(?=\n|$)')
 
 # Inline fields: [key:: value] within brackets
 INLINE_FIELD_RE = re.compile(r'\[(\w[\w-]*)::[ \t]+([^\]]+)\]')

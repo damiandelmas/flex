@@ -265,7 +265,7 @@ def upgrade_from_git_root(db) -> int:
     For sessions that have git_root but no SOMA repo_root entry,
     join git_root to _enrich_repo_identity.repo_path to get SOMA project name.
 
-    Fixes path-derived names that were wrong (e.g. fleet → soma for worktrees).
+    Fixes path-derived names that were wrong (e.g. worktree-dir → canonical-name).
     Pure SQL — no subprocess.
     """
     result = db.execute("""

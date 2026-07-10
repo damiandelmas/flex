@@ -28,6 +28,7 @@ from pathlib import Path
 from typing import Optional
 
 from flex.core import open_cell, set_meta, get_meta, log_op, validate_cell
+from flex.onnx.embed import STORE_DIM
 from flex.registry import CELLS_DIR, register_cell as _register_cell, resolve_cell
 from flex.views import regenerate_views, install_views
 
@@ -124,7 +125,8 @@ CREATE TABLE IF NOT EXISTS _presets (
     name        TEXT PRIMARY KEY,
     description TEXT,
     params      TEXT DEFAULT '',
-    sql         TEXT
+    sql         TEXT,
+    source      TEXT              -- provenance: 'stock' | 'cell' (.flexpresets.json); NULL→'stock' via @orient COALESCE
 );
 
 CREATE VIRTUAL TABLE IF NOT EXISTS chunks_fts USING fts5(
@@ -287,7 +289,7 @@ def create(
     set_meta(db, 'cell_type', cell_type or name)
     set_meta(db, 'created_at', datetime.now(timezone.utc).isoformat())
     set_meta(db, 'embedding_model', 'nomic-embed-text-v1.5')
-    set_meta(db, 'embedding_dim', '128')
+    set_meta(db, 'embedding_dim', str(STORE_DIM))
 
     _cell_meta[id(db)] = {'path': str(db_path), 'name': name}
 
@@ -536,7 +538,7 @@ def register(
     from flex.retrieve.presets import install_presets
     db.execute("""CREATE TABLE IF NOT EXISTS _presets (
         name TEXT PRIMARY KEY, description TEXT,
-        params TEXT DEFAULT '', sql TEXT
+        params TEXT DEFAULT '', sql TEXT, source TEXT
     )""")
     for pd in all_preset_dirs:
         if pd.exists():

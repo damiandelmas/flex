@@ -83,7 +83,7 @@ Use `decay:N` when the question is time-sensitive. Column names differ by cell, 
 ```sql
 SELECT file, section, substr(content, 1, 300) AS preview
 FROM chunks
-WHERE type = 'file' AND file LIKE '%context/current%'
+WHERE type = 'file' AND file LIKE '%docs/architecture%'
 ORDER BY file
 LIMIT 50;
 ```

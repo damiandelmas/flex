@@ -642,7 +642,9 @@ def discover_watched() -> list[dict]:
             WHERE lifecycle = 'watch'
               AND watch_path IS NOT NULL
               AND COALESCE(active, 1) = 1
-              AND COALESCE(unlisted, 0) = 0
+              AND (COALESCE(unlisted, 0) = 0
+                   OR refresh_module IS NOT NULL
+                   OR refresh_script IS NOT NULL)
         """).fetchall()
         db.close()
         for r in rows:

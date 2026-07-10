@@ -41,7 +41,8 @@ def restore_instructions_orient(db: sqlite3.Connection) -> None:
             name TEXT PRIMARY KEY,
             description TEXT,
             params TEXT DEFAULT '',
-            sql TEXT
+            sql TEXT,
+            source TEXT
         )
         """
     )

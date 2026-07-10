@@ -47,6 +47,129 @@ def _registered_token_names():
         return _EXTRA_BOUNDARIES
 
 
+# ── Modulation-token validation (Issue 2) ──────────────────────────────────
+# Directive names that take an integer value.
+_INT_DIRECTIVES = {'decay', 'pool', 'recent', 'limit'}
+# All recognized directive names (canonical + legacy aliases).
+_KNOWN_DIRECTIVES = {
+    'similar', 'decay', 'suppress', 'centroid', 'pool', 'from', 'to',
+    'diverse', 'recent', 'unlike', 'like', 'limit',
+}
+# Names eligible for typo (edit-distance) matching. Short names (from, to, pool,
+# like) are excluded — they false-positive against ordinary colon tokens
+# (e.g. 'foo:' is edit-distance 2 from 'pool'). Only names len>=5 participate,
+# and only candidate tokens len>=5 are checked, so kind:/community:/frobnicate:
+# stay treated as query text, not flagged.
+_FUZZY_DIRECTIVES = {
+    'similar', 'suppress', 'centroid', 'diverse', 'recent', 'unlike', 'decay',
+    'limit',
+}
+
+
+def _is_int(value: str) -> bool:
+    try:
+        int(value)
+        return True
+    except (TypeError, ValueError):
+        return False
+
+
+def _levenshtein(a: str, b: str) -> int:
+    if a == b:
+        return 0
+    if not a:
+        return len(b)
+    if not b:
+        return len(a)
+    prev = list(range(len(b) + 1))
+    for i, ca in enumerate(a, 1):
+        cur = [i]
+        for j, cb in enumerate(b, 1):
+            cur.append(min(prev[j] + 1, cur[j - 1] + 1,
+                           prev[j - 1] + (ca != cb)))
+        prev = cur
+    return prev[-1]
+
+
+def _strip_text_directive_bodies(token_str, known_names):
+    """Remove the multi-word free-text bodies of the text directives
+    (similar:/suppress:/centroid: and the from:…to: trajectory) up to the next
+    directive boundary, mirroring parse_modifiers()'s span extraction. Those
+    bodies are query text, not structured tokens, so the validator must not
+    inspect the `word:value` shapes inside them (e.g. 'similar:car decal:sticker
+    printing' — 'decal:sticker' is query text, not a typo'd directive)."""
+    s = token_str.replace('unlike:', 'suppress:').replace('like:', 'centroid:') \
+                 .replace('limit:', 'pool:')
+    s = re.sub(r'\brecent:', 'decay:', s)
+    core = r'diverse|decay:|suppress:|centroid:|pool:|from:|similar:'
+    if known_names:
+        core = core + '|' + '|'.join(re.escape(n) for n in known_names)
+    # from:…to:… trajectory (spans two directives) then the single-body directives
+    s = re.sub(r'from:.*?\s+to:.*?(?=\s+(?:' + core + r')\b|\s*$)', ' ', s)
+    for name in ('similar', 'suppress'):
+        s = re.sub(name + r':.*?(?=\s+(?:' + core + r')\b|\s*$)', ' ', s)
+    # centroid: is a SINGLE whitespace-delimited token (centroid:id1,id2), not a
+    # multi-word span — mirror parse_modifiers()'s split() so a typo directly
+    # following it (centroid:id1 decey:5) is not absorbed and still gets flagged.
+    s = re.sub(r'\bcentroid:\S*', ' ', s)
+    return s
+
+
+def _validate_modulation_tokens(token_str, known_names):
+    """Detect typo'd or malformed modulation tokens BEFORE they silently
+    degrade a vec_ops query (Issue 2). Returns an error dict, or None if clean.
+
+    Flags only high-confidence mistakes:
+      - a known integer directive with a non-integer value (decay:notanumber),
+      - a colon token (len>=5) that is edit-distance <=2 from a known directive
+        but not an exact match (decey: -> decay, supress: -> suppress).
+
+    Arbitrary unknown colon tokens far from any directive (kind:, community:,
+    frobnicate:) and the multi-word values of text directives (similar:/suppress:
+    /from:/to:/centroid:) are left untouched as query text.
+    """
+    if not token_str:
+        return None
+    # Text-directive bodies are free query text — strip them first so their
+    # word:value spans aren't validated as structured tokens (parity with parser).
+    token_str = _strip_text_directive_bodies(token_str, known_names)
+    known = set(_KNOWN_DIRECTIVES)
+    known.update(n.lower() for n in (known_names or []))
+    problems = []
+    for tok in token_str.split():
+        if ':' not in tok:
+            continue
+        name, _, value = tok.partition(':')
+        name_l = name.lower()
+        if name_l in _INT_DIRECTIVES:
+            if value != '' and not _is_int(value):
+                problems.append({
+                    "token": tok,
+                    "reason": f"'{name}:' expects an integer value, got '{value}'",
+                })
+            continue
+        if name_l in known:
+            continue  # recognized directive or registered structural token
+        if len(name_l) >= 5:
+            best_d, best_name = min(
+                ((_levenshtein(name_l, d), d) for d in _FUZZY_DIRECTIVES),
+                default=(99, None))
+            if best_d <= 2:
+                problems.append({
+                    "token": tok,
+                    "reason": f"unknown directive '{name}:' — did you mean "
+                              f"'{best_name}:'?",
+                })
+    if problems:
+        return {
+            "error": "vec_ops: unrecognized or malformed modulation token(s). "
+                     "Fix or remove the token — it would otherwise be embedded "
+                     "as query noise or silently ignored.",
+            "unrecognized_tokens": problems,
+        }
+    return None
+
+
 def _coerce_timestamp(value) -> Optional[float]:
     """Best-effort timestamp coercion for mixed-format legacy cells."""
     if value is None:
@@ -161,6 +284,82 @@ class VectorCache:
         elapsed = (self.loaded_at - start) * 1000
         self._load_msg = f"VectorCache: {len(self.ids)} vectors ({self.dims}d) in {elapsed:.1f}ms"
 
+        self._memmap_matrix(db, table)
+        return self
+
+    def _memmap_matrix(self, db, table: str) -> None:
+        """turbovec (opt-in via FLEX_VEC_MEMMAP): persist the normalized matrix to
+        a flat .npy and replace self.matrix with a read-only memmap of it. Resident
+        RAM drops to the working set (kernel pages hot rows); cold cells cost ~0 RSS.
+
+        Default OFF — no behavior change unless the env flag is set. Scoring is
+        unchanged: `matrix @ q` and `matrix[indices]` work identically on a memmap
+        (fancy-indexing copies only the selected subset — the pushdown path)."""
+        import os
+        import tempfile
+        if not os.environ.get('FLEX_VEC_MEMMAP') or self.matrix is None:
+            return
+        if isinstance(self.matrix, np.memmap):
+            return
+        base = None
+        try:
+            for r in db.execute("PRAGMA database_list").fetchall():
+                if r[1] == 'main' and r[2]:
+                    base = r[2]
+                    break
+        except Exception:
+            pass
+        if base:
+            path = f"{base}.vec_{table}_{self.dims}.npy"
+        else:  # in-memory / unknown db (e.g. tests) → per-process temp file
+            path = os.path.join(
+                tempfile.gettempdir(),
+                f"flexvec_{table}_{self.dims}_{os.getpid()}_{id(self)}.npy")
+        try:
+            tmp = f"{path}.{os.getpid()}.tmp"
+            with open(tmp, 'wb') as f:                       # file handle → no .npy munging
+                np.save(f, np.ascontiguousarray(self.matrix, dtype=np.float32))
+            os.replace(tmp, path)                            # atomic: safe across MCP/worker
+            self.matrix = np.load(path, mmap_mode='r')       # resident → working set
+        except Exception as e:
+            print(f"VectorCache: memmap persist failed ({e}); staying in RAM",
+                  file=sys.stderr)
+
+    def load_from_embeddings(self, db, model: str, serve_dim: int = None,
+                             kind: str = 'chunk') -> 'VectorCache':
+        """Load the matrix from the multi-model `_embeddings` table (active model),
+        Matryoshka-sliced to serve_dim. Opt-in serving path. Marks self._model so the
+        refresh path full-rebuilds (the incremental append assumes _raw_chunks rowids).
+        Scoring is unchanged — the matrix is the same normalized float32 (n, dim)."""
+        start = time.time()
+        rows = db.execute(
+            "SELECT id, vector FROM _embeddings WHERE model = ? AND kind = ?",
+            (model, kind)).fetchall()
+        if not rows:
+            return self
+        self.ids = [r[0] for r in rows]
+        vectors = [np.frombuffer(r[1], dtype=np.float32) for r in rows]
+        dims = [v.shape[0] for v in vectors]
+        dominant = max(set(dims), key=dims.count)
+        if any(d != dominant for d in dims):
+            kept = [(i, v) for i, v, d in zip(self.ids, vectors, dims) if d == dominant]
+            self.ids = [k[0] for k in kept]
+            vectors = [k[1] for k in kept]
+        self.matrix = np.vstack(vectors)
+        if serve_dim and serve_dim < self.matrix.shape[1]:        # Matryoshka slice
+            self.matrix = np.ascontiguousarray(self.matrix[:, :serve_dim])
+        self.dims = self.matrix.shape[1]
+        norms = np.linalg.norm(self.matrix, axis=1, keepdims=True)
+        norms[norms == 0] = 1
+        self.matrix = self.matrix / norms                         # renormalize (slice or stored)
+        self._id_to_idx = {id_: i for i, id_ in enumerate(self.ids)}
+        self.embedded_count = len(self.ids)
+        self.max_rowid = 0          # no rowid alignment -> append falls back to rebuild
+        self._model = model
+        self.loaded_at = time.time()
+        self._load_msg = (f"VectorCache[{model}@{self.dims}]: {len(self.ids)} vectors "
+                          f"({(self.loaded_at - start) * 1000:.1f}ms)")
+        self._memmap_matrix(db, f"emb_{model}_{self.dims}")
         return self
 
     def append_from_db(self, db, table: str, embedding_col: str = 'embedding',
@@ -270,6 +469,7 @@ class VectorCache:
                     print(f"VectorCache: append timestamps load failed: {e}",
                           file=sys.stderr)
 
+        succ._memmap_matrix(db, table)   # re-persist+mmap so appends keep the RAM win
         return succ
 
     def load_columns(self, db, table: str, id_col: str = 'id'):
@@ -543,6 +743,13 @@ def register_vec_ops(conn, caches: dict, embed_fn, cell_config: dict = None,
             modifiers_preview = parse_modifiers(token_str, extra_boundaries=_registered_token_names())
             query_text = modifiers_preview.get('similar')
             modifier_str = token_str
+
+        # Validate modulation tokens before doing any work — fail loud on typo'd
+        # or malformed directives instead of silently degrading the query.
+        token_problem = _validate_modulation_tokens(
+            modifier_str, _registered_token_names())
+        if token_problem is not None:
+            return json.dumps(token_problem)
 
         cache = caches.get(table)
         if cache is None or cache.matrix is None:

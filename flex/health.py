@@ -2,11 +2,27 @@
 
 from __future__ import annotations
 
+import json
+import time
 from collections import Counter
+from pathlib import Path
 import subprocess
 from typing import Iterable
 
 from flex.registry import classify_refresh_state, list_cells
+
+_UNKNOWN_WATCH_STATE = {
+    "known": False,
+    "enabled": None,
+    "healthy": None,
+    "backend": None,
+    "last_error": None,
+    "last_reconcile_ts": None,
+    "reconciliation_required": None,
+    "queue": None,
+    "phase_durations_s": None,
+    "updated_at": None,
+}
 
 
 def _fmt_age(seconds: int | None) -> str:
@@ -225,6 +241,130 @@ def watch_problems(
         if problem:
             problems.append(problem)
     return problems
+
+
+def claude_watch_state(cell_name: str = 'claude_code', *, cell_path=None) -> dict:
+    """Read the local Claude Code filesystem-watcher telemetry.
+
+    The worker daemon's daemon_loop() (flex/modules/claude_code/compile/
+    worker.py) persists a `watch_health` blob into the cell's own _meta
+    table so a separate process (this one — `flex health` / `/health`) can
+    read it without talking to the running daemon directly.
+
+    Best-effort and forward/backward compatible: a cell with no watcher
+    telemetry (older worker, or filesystem events never wired up) returns
+    the same shape with known=False rather than raising, so callers can't
+    tell "polling-only install" apart from "error" by an exception.
+
+    Args:
+        cell_path: Explicit path to the claude_code cell db, when the
+            caller already resolved it (e.g. from a `list_cells()` result
+            it's already working with). Falls back to `resolve_cell()`
+            only when not given.
+    """
+    from flex.core import get_meta, open_cell_readonly
+
+    path = cell_path
+    if path is None:
+        from flex.registry import resolve_cell
+        path = resolve_cell(cell_name)
+    if not path or not Path(path).exists():
+        return dict(_UNKNOWN_WATCH_STATE)
+
+    raw = None
+    try:
+        conn = open_cell_readonly(path)
+        try:
+            raw = get_meta(conn, 'watch_health')
+        finally:
+            conn.close()
+    except Exception:
+        raw = None
+
+    if not raw:
+        return dict(_UNKNOWN_WATCH_STATE)
+
+    try:
+        data = json.loads(raw)
+    except (TypeError, ValueError):
+        return dict(_UNKNOWN_WATCH_STATE)
+
+    result = dict(_UNKNOWN_WATCH_STATE)
+    result.update(data)
+    result["known"] = True
+    return result
+
+
+def watcher_summary(
+    state: dict | None = None,
+    *,
+    cell_name: str = 'claude_code',
+    cell_path=None,
+    now: float | None = None,
+    stale_after: float = 180.0,
+) -> dict:
+    """Classify local filesystem-watcher state into a stable summary.
+
+    Statuses:
+      "polling"  — no telemetry (older/polling-only worker) or events
+                   explicitly disabled. Not an error.
+      "degraded" — backend unhealthy, or reconciliation hasn't run recently
+                   enough to trust event delivery alone.
+      "ok"       — healthy backend, recent reconciliation.
+    """
+    state = state if state is not None else claude_watch_state(cell_name, cell_path=cell_path)
+    now = now if now is not None else time.time()
+
+    if not state.get("known") or state.get("enabled") is False:
+        return {
+            "status": "polling",
+            "reason": (
+                "filesystem events disabled" if state.get("enabled") is False
+                else "no watcher telemetry — polling fallback or older worker"
+            ),
+            "enabled": bool(state.get("enabled")) if state.get("known") else False,
+            "healthy": None,
+            "backend": None,
+            "pending": None,
+            "reconcile_age_s": None,
+        }
+
+    if not state.get("healthy"):
+        return {
+            "status": "degraded",
+            "reason": state.get("last_error") or "watcher backend unhealthy",
+            "enabled": True,
+            "healthy": False,
+            "backend": state.get("backend"),
+            "pending": (state.get("queue") or {}).get("pending"),
+            "reconcile_age_s": None,
+        }
+
+    last_reconcile = state.get("last_reconcile_ts")
+    age = (now - last_reconcile) if last_reconcile else None
+    queue = state.get("queue") or {}
+    pending = queue.get("pending") if isinstance(queue, dict) else None
+
+    if age is not None and age > stale_after:
+        return {
+            "status": "degraded",
+            "reason": f"reconciliation stale ({int(age)}s > {int(stale_after)}s)",
+            "enabled": True,
+            "healthy": True,
+            "backend": state.get("backend"),
+            "pending": pending,
+            "reconcile_age_s": age,
+        }
+
+    return {
+        "status": "ok",
+        "reason": None,
+        "enabled": True,
+        "healthy": True,
+        "backend": state.get("backend"),
+        "pending": pending,
+        "reconcile_age_s": age,
+    }
 
 
 def watch_summary(

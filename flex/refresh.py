@@ -215,6 +215,46 @@ def run_due_refreshes(force: bool = False) -> dict:
             results[name] = f'error: {e}'
             print(f"[refresh] finish {name}: {results[name]}", file=sys.stderr)
 
+    # Poll lifecycle='watch' cells too (signature-driven regen). Wired here so
+    # both the daemon _refresh_loop and the flex-refresh timer drive watches.
+    try:
+        results.update(run_due_watches())
+    except Exception as e:  # never let watch polling break the refresh cycle
+        print(f"[watch] error: {e}", file=sys.stderr)
+
+    return results
+
+
+def run_due_watches() -> dict:
+    """Poll lifecycle='watch' cells; regen only when the source signature changed.
+
+    discover_watched() returns instant cells that carry a refresh_module. A cheap
+    dry-run probes the msize signature (selection size + count + newest mtime); a
+    real regen runs only on change, so this is safe to call every refresh tick.
+    Fixes the wiring gap: discover_watched() existed but had no caller, so watched
+    cells never auto-refreshed.
+    """
+    from flex.registry import discover_watched
+
+    results = {}
+    try:
+        watched = discover_watched()
+    except Exception:
+        return results
+
+    for cell in watched:
+        name = cell['name']
+        try:
+            probe = refresh_cell(name, dry_run=True, quiet=True)
+            if not probe or not probe.get('changed'):
+                continue
+            print(f"[watch] {name}: source changed, regenerating", file=sys.stderr)
+            stats = refresh_cell(name, quiet=True)
+            results[name] = 'ok' if stats is not None else 'error: no stats'
+        except Exception as e:
+            results[name] = f'error: {e}'
+            print(f"[watch] {name}: {results[name]}", file=sys.stderr)
+
     return results
 
 

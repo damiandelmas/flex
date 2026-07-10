@@ -230,13 +230,27 @@ def _install_systemd():
         "flex-worker.service": (
             "[Unit]\n"
             "Description=Flex Local Capture Worker\n"
-            "After=network.target\n\n"
+            "After=network.target\n"
+            # Backstop so a genuine crash-loop can't respawn forever.
+            "StartLimitIntervalSec=300\n"
+            "StartLimitBurst=5\n\n"
             "[Service]\n"
             "Type=simple\n"
             f"ExecStart={worker_cmd}\n"
-            "Restart=on-failure\n"
+            # Restart=always (not on-failure): a clean SIGTERM — WSL shutdown,
+            # an external pkill — must still bring the worker back.
+            "Restart=always\n"
             "RestartSec=5\n"
-            "Environment=PYTHONUNBUFFERED=1\n\n"
+            "Environment=PYTHONUNBUFFERED=1\n"
+            "Environment=MALLOC_ARENA_MAX=2\n"
+            # memmap the embedding matrix → file-backed, reclaimable pages.
+            "Environment=FLEX_VEC_MEMMAP=1\n"
+            # 64GB box: the cap is a RUNAWAY BACKSTOP, not a ration (working
+            # set ~6G; the graph build peaks ~4.2G). MemorySwapMax=0 is the
+            # real guard — a runaway is cgroup-OOM'd cleanly in RAM instead of
+            # spilling into swap and thrashing WSL to death (the 2026-06 mode).
+            "MemoryMax=24G\n"
+            "MemorySwapMax=0\n\n"
             "[Install]\n"
             "WantedBy=default.target\n"
         ),
@@ -253,10 +267,13 @@ def _install_systemd():
             # Cap glibc malloc arenas: VectorCache full-matrix rebuilds churn
             # large allocations; unbounded arenas fragment and ratchet RSS.
             "Environment=MALLOC_ARENA_MAX=2\n"
-            # Memory backstop: VectorCache has no eviction; a runaway resident
-            # set restarts the service (warm-up is ~seconds) instead of
-            # pressuring the host.
-            "MemoryMax=8G\n"
+            # memmap the embedding matrix → file-backed, reclaimable pages.
+            "Environment=FLEX_VEC_MEMMAP=1\n"
+            # 64GB box: the cap is a RUNAWAY BACKSTOP, not a ration (warm set
+            # is a few G with memmap). MemorySwapMax=0 forces a runaway to
+            # cgroup-OOM cleanly in RAM rather than thrash WSL via swap.
+            "MemoryMax=24G\n"
+            "MemorySwapMax=0\n"
             # KillMode=mixed: SIGTERM to main only, then SIGKILL the whole
             # cgroup after TimeoutStopSec. Ensures python children get
             # reaped cleanly on restart.
@@ -515,16 +532,57 @@ def _start_services_direct():
                FLEX_HOME / "mcp.pid", log_dir / "mcp.log")
 
 
+def _flex_home_of_pid(pid: int) -> "Path | None":
+    """Best-effort effective FLEX_HOME of a running process, resolved exactly as
+    this module resolves its own (the ``FLEX_HOME`` env var, else ``~/.flex``).
+
+    Returns ``None`` when the process's environment can't be read (it exited, or
+    it belongs to another user) — callers treat ``None`` as "not ours" and never
+    kill it. This is what lets the ``_kill_pid_services`` process-table fallback
+    scope to THIS install instead of every flex process on the box.
+    """
+    home_val = None
+    if os.path.isdir("/proc"):  # Linux/WSL
+        try:
+            raw = Path(f"/proc/{pid}/environ").read_bytes()
+        except OSError:
+            return None
+        for kv in raw.split(b"\x00"):
+            if kv.startswith(b"FLEX_HOME="):
+                home_val = kv[len(b"FLEX_HOME="):].decode(errors="replace")
+                break
+    else:  # macOS/BSD: `ps -E` appends the environment to the command column
+        try:
+            out = subprocess.run(
+                ["ps", "-wwE", "-o", "command=", "-p", str(pid)],
+                capture_output=True, text=True, timeout=5,
+            )
+        except (FileNotFoundError, subprocess.TimeoutExpired):
+            return None
+        if out.returncode != 0:
+            return None
+        for tok in out.stdout.split():
+            if tok.startswith("FLEX_HOME="):
+                home_val = tok[len("FLEX_HOME="):]
+                break
+    try:
+        return (Path(home_val) if home_val else Path.home() / ".flex").resolve()
+    except (OSError, RuntimeError, ValueError):
+        return None
+
+
 def _kill_pid_services():
     """Stop any directly-started services and reap stragglers.
 
     Three-step cleanup so the next startup binds cleanly:
 
     1. SIGTERM via PID file (the happy path)
-    2. ``pkill -f`` against our known command-line patterns, covering
-       orphans adopted by init after the CLI process exited, stale PID
-       files, and children that escaped their caller's process group
-       via ``start_new_session=True``
+    2. A process-table fallback (``pgrep`` by command-line pattern) for orphans
+       adopted by init after the CLI process exited, stale PID files, and
+       children that escaped their caller's process group via
+       ``start_new_session=True`` — but SIGTERM only those whose effective
+       FLEX_HOME matches ours, so a second install / a test / a concurrent
+       ``flex init`` is never touched
     3. Poll port 7134 for release before returning, so callers don't
        race a still-closing socket
 
@@ -545,24 +603,43 @@ def _kill_pid_services():
                 pass
             pid_file.unlink(missing_ok=True)
 
-    # 2. Pattern scan — catches escaped children and init-adopted orphans.
-    # Patterns are scoped to the exact invocations we start, so this never
-    # catches unrelated processes. Silent failure is fine: pkill exits 1
-    # when nothing matches, which is the normal idle case.
+    # 2. Process-table fallback — reap escaped children and init-adopted
+    # orphans that step 1's PID files no longer point at. SCOPED to THIS
+    # FLEX_HOME: a bare `pkill -f` here is system-wide and kills every
+    # flex.daemon on the box — any concurrent `flex init`, a test suite, or a
+    # second install — which is the production half of the crash-loop bug. So
+    # we resolve each candidate's effective FLEX_HOME and SIGTERM only on an
+    # exact match; anything we can't attribute to this install is left alone.
     patterns = [
         "flex\\.mcp_server.*--port 7134",
         "flex\\.serve.*--port 7134",
         "flex\\.daemon",
     ]
+    try:
+        our_home = FLEX_HOME.resolve()
+    except (OSError, RuntimeError):
+        our_home = FLEX_HOME
+    self_pid = os.getpid()
     for pattern in patterns:
         try:
-            subprocess.run(
-                ["pkill", "-f", pattern],
-                capture_output=True,
-                timeout=5,
+            res = subprocess.run(
+                ["pgrep", "-f", pattern],
+                capture_output=True, text=True, timeout=5,
             )
         except (FileNotFoundError, subprocess.TimeoutExpired):
-            pass
+            continue
+        for tok in res.stdout.split():
+            try:
+                pid = int(tok)
+            except ValueError:
+                continue
+            if pid == self_pid:
+                continue
+            if _flex_home_of_pid(pid) == our_home:
+                try:
+                    os.kill(pid, signal.SIGTERM)
+                except OSError:
+                    pass
 
     # 3. Wait for port 7134 to actually release (up to 5s). Prevents
     # EADDRINUSE on the next start when uvicorn is still unbinding.
@@ -676,6 +753,41 @@ def _run_enrichment_quiet(conn, progress_cb=None) -> tuple[int, list[str]]:
 
 
 
+# ── Surface routing ───────────────────────────────────────────────────────
+# Present `filesystem` and `codegraph` as the user-facing install verbs over
+# the two existing engines. This is a routing LAYER only — the engines stay two
+# separate modules under the hood (instant + markdown/obsidian); nothing merges.
+#
+#   filesystem  (default / --no-embed) -> instant  engine  (structural: FTS+SQL+node tree)
+#   filesystem  --embed                -> obsidian engine  (semantic embeddings)
+#   codegraph                          -> instant  engine, --code (call/import graph)
+#
+# Permanent aliases (old commands keep working):
+#   instant            -> filesystem --no-embed  (instant engine)
+#   obsidian / markdown-> filesystem --embed     (markdown engine, auto-detects a vault)
+#   code               -> codegraph              (instant --code)
+def _resolve_module_surface(module: str, args) -> tuple[str, dict]:
+    """Map a user-facing verb/alias to (engine_cli_name, forced_flags).
+
+    engine_cli_name is a real discovered `--module` value ('instant' or
+    'obsidian'); forced_flags are applied onto `args` before dispatch. A name
+    that is neither a surface verb nor an alias passes through untouched.
+    """
+    embed = bool(getattr(args, "embed", False))
+    if module in ("filesystem", "instant", "obsidian", "markdown"):
+        if module == "filesystem":
+            # default is Instant (structural); --embed routes to the Vector engine
+            return ("obsidian" if embed else "instant"), {}
+        if module == "instant":
+            return "instant", {}
+        return "obsidian", {}  # obsidian / markdown -> the markdown engine (vector)
+    if module in ("codegraph", "code"):
+        # code-extension filter + tree mode: the call/import graph (and the
+        # @callers/@callees/@impact presets) only build in nest/tree mode.
+        return "instant", {"code": True, "nest": True}
+    return module, {}
+
+
 def cmd_init(args):
     """Initialize flex. Dispatches to the requested module's install hook."""
     import io
@@ -688,8 +800,24 @@ def cmd_init(args):
     _warnings: list[str] = []
     _module = getattr(args, 'module', None)
 
-    # Stop running worker/MCP before install to avoid DB lock contention
+    # Route the user-facing surface verbs/aliases to the underlying engine module
+    # and apply any forced flags (e.g. codegraph -> instant --code). Surface + routing
+    # only; the two engines stay separate modules.
     if _module:
+        _resolved, _forced = _resolve_module_surface(_module, args)
+        _module = _resolved
+        for _k, _v in _forced.items():
+            setattr(args, _k, _v)
+
+    # Stop running worker/MCP before a FULL module install to avoid DB lock
+    # contention. Skip for lightweight instant recompiles (--regen/--path/--remove):
+    # they write their own no-embed cell and never touch the worker/mcp DBs. On the
+    # 60s instant-regen cron, this kill flapped flex-mcp every minute (it never
+    # stayed up long enough to finish warming). A regen recompiles the cell; it must
+    # not bounce the daemons.
+    _regen_op = (getattr(args, 'regen', None) or getattr(args, 'path', None)
+                 or getattr(args, 'remove', None))
+    if _module and not _regen_op:
         _kill_pid_services()
 
     console.print()
@@ -790,17 +918,140 @@ def cmd_init(args):
 
 
 # ============================================================
-# flex relay
+# flex hub — cell distribution: view/pull/push/status
 # ============================================================
 
-def cmd_relay(args):
-    """Toggle cloud access via the getflex.dev tunnel.
+def cmd_hub(args):
+    """Dispatch `flex hub <view|pull|push|status>` subcommands.
+
+    `relay` is still dispatchable (undocumented — superseded, retained for
+    compatibility with an existing consumer) but deliberately not listed
+    here or in any help text; see cmd_hub_relay.
+    """
+    action = getattr(args, "hub_action", None)
+    if action == "view":
+        return cmd_hub_view(args)
+    if action == "pull":
+        return cmd_hub_pull(args)
+    if action == "push":
+        return cmd_hub_push(args)
+    if action == "relay":
+        return cmd_hub_relay(args)
+    if action == "status":
+        return cmd_hub_status(args)
+    print("  Expected one of: view, pull, push, status")
+
+
+def cmd_hub_view(args):
+    """List remote cells (register) and local sync status."""
+    from flex.hub.manifest import fetch_manifest, diff_manifest
+    from flex.registry import list_cells
+
+    remote = fetch_manifest()
+    local = list_cells()
+    diffs = diff_manifest(remote, local)
+    if getattr(args, "json", False):
+        import json
+        out = {n: {"url": e.url, "size": e.size, "status": diffs.get(n, "new")}
+               for n, e in remote.items()}
+        print(json.dumps(out, indent=2))
+        return
+    for name in sorted(remote):
+        entry = remote[name]
+        status = diffs.get(name, "new")
+        print(f"  {name:<20s} {status}")
+
+
+def cmd_hub_pull(args):
+    """Install a specific cell, or (with --all) refresh all stale installed cells.
+
+    No arg: pull the named cell(s) unconditionally (install or re-fetch).
+    --all: refresh installed cells that are stale vs the remote manifest,
+    optionally filtered to the named cell(s) — this is the folded
+    `cmd_update` behavior, cell-filter fix included.
+    """
+    from flex.hub.manifest import fetch_manifest, diff_manifest, download_cell
+    from flex.registry import list_cells, register_cell, CELLS_DIR
+
+    remote = fetch_manifest()
+    cells = list(getattr(args, "cells", None) or [])
+
+    if getattr(args, "all", False):
+        local = list_cells()
+        installed = [c for c in local if c.get("source_url")]
+        if cells:
+            installed = [c for c in installed if c.get("name") in cells]
+        diffs = diff_manifest(remote, installed)
+        for name, status in diffs.items():
+            if status == "stale":
+                entry = remote.get(name)
+                if entry:
+                    dest = download_cell(entry, CELLS_DIR)
+                    register_cell(name=name, path=str(dest), source_url=entry.url, checksum=entry.checksum)
+                    print(f"  {name}: updated")
+        return
+
+    if not cells:
+        print("  Specify cell name(s) to pull, or use --all to refresh installed cells.", file=sys.stderr)
+        sys.exit(1)
+
+    for name in cells:
+        entry = remote.get(name)
+        if not entry:
+            continue
+        dest = download_cell(entry, CELLS_DIR)
+        register_cell(name=name, path=str(dest), cell_type=entry.cell_type,
+                      source_url=entry.url, checksum=entry.checksum)
+        print(f"  {name}: installed")
+
+
+def cmd_hub_push(args):
+    """Publish cells via the flex.hub push submodule.
+
+    An optional capability, unavailable unless publishing support is
+    installed. Without it, this prints a clear message and exits
+    non-zero instead of tracebacking.
+
+    Note: no --public/--private scope semantics here. Access-scoped
+    serving is out of scope for this CLI.
+    """
+    from flex.hub import _push_api
+
+    _, _, push_all = _push_api()
+    if push_all is None:
+        print("  publishing requires the private flex.hub push submodule", file=sys.stderr)
+        sys.exit(1)
+
+    cell_names = list(getattr(args, "cells", None) or []) or None
+    try:
+        push_all(cell_names=cell_names, dry_run=getattr(args, "dry_run", False))
+    except EnvironmentError as e:
+        print(f"  {e}", file=sys.stderr)
+        sys.exit(1)
+
+
+def cmd_hub_status(args):
+    """Show relay + publish state."""
+    from argparse import Namespace
+    from rich.console import Console
+
+    console = Console()
+    cmd_hub_relay(Namespace(status=True, stop=False))
+
+    from flex.hub import _push_api
+    _, _, push_all = _push_api()
+    if push_all is not None:
+        console.print("  Publish   [green]available[/green] (private push submodule present)")
+    else:
+        console.print("  Publish   [dim]unavailable[/dim] (private push submodule not installed)")
+
+
+def cmd_hub_relay(args):
+    """Toggle remote MCP access.
 
     Creates or removes ``~/.flex/machine_id`` and restarts services so the
-    MCP server picks up the new state. The MCP server reads this file on
-    startup and opens an outbound WebSocket to the relay Durable Object
-    when present, exposing a stable ``https://{id}.getflex.dev/sse``
-    endpoint that claude.ai and other MCP clients can connect to.
+    MCP server picks up the new state on next startup, exposing a stable
+    remote endpoint that MCP clients can connect to.
     """
     from rich.console import Console
     from rich.panel import Panel
@@ -808,12 +1059,13 @@ def cmd_relay(args):
 
     console = Console()
 
-    # Dependency check — websockets is an optional extra
+    # Superseded, retained for compatibility with an existing consumer,
+    # not advertised.
+    # Dependency check — websockets is not a declared package dependency.
     try:
         import websockets  # noqa: F401
     except ImportError:
         console.print("  [red]relay requires the websockets package.[/red]")
-        console.print("  Install: [bold]pip install 'getflex\\[relay]'[/bold]")
         return
 
     if sys.platform == "win32":
@@ -916,6 +1168,15 @@ def cmd_relay(args):
     console.print()
 
 
+def cmd_relay(args):
+    """Thin top-level `flex relay` alias for `flex hub relay`.
+
+    `flex hub relay` is the canonical form; this alias is kept because an
+    existing consumer references the top-level `flex relay` command directly.
+    """
+    return cmd_hub_relay(args)
+
+
 # ============================================================
 # raw search implementation
 # ============================================================
@@ -937,6 +1198,7 @@ def _open_cell_for_search(cell_name: str):
     try:
         from flex.retrieve.vec_ops import VectorCache, register_vec_ops
         from flex.onnx import get_model
+        from flex.onnx.embed import STORE_DIM
 
         try:
             embedder = get_model()
@@ -963,8 +1225,8 @@ def _open_cell_for_search(cell_name: str):
                 config = {r[0]: r[1] for r in rows}
             except Exception:
                 pass
-            embed_query = lambda text: embedder.encode(text, prefix='search_query: ')
-            embed_doc   = lambda text: embedder.encode(text, prefix='search_document: ')
+            embed_query = lambda text: embedder.encode(text, prefix='search_query: ', matryoshka_dim=STORE_DIM)
+            embed_doc   = lambda text: embedder.encode(text, prefix='search_document: ', matryoshka_dim=STORE_DIM)
             register_vec_ops(db, caches, embed_query, config, embed_doc_fn=embed_doc)
     except ImportError:
         pass  # vec_ops won't work but plain SQL is fine
@@ -1499,6 +1761,28 @@ def cmd_module_remove(args):
     print(f"  {args.name}: removed")
 
 
+# ============================================================
+# flex soma
+# ============================================================
+
+def cmd_soma(args):
+    """Dispatch SOMA maintenance subcommands."""
+    action = getattr(args, "soma_action", None)
+    if action == "backfill-identity":
+        return cmd_soma_backfill_identity(args)
+    print("  Expected one of: backfill-identity")
+
+
+def cmd_soma_backfill_identity(args):
+    """Stamp _edges_fs_identity on existing cells without a rebuild."""
+    from flex.modules.soma.manage.backfill_identity import report, run
+
+    results = run([args.cell] if args.cell else None, dry_run=args.dry_run)
+    code = report(results, dry_run=args.dry_run)
+    if code:
+        sys.exit(code)
+
+
 def cmd_status(args):
     """Show cell health, lifecycle, and refresh status."""
     from flex.health import refresh_problems, watch_problem, watch_problems
@@ -1636,22 +1920,89 @@ def cmd_status(args):
     )
 
 
+def cmd_warm(args):
+    """Manage the startup warm-set: which cells build VectorCaches at startup
+    (instant first query) vs lazy-load on first use. The lazy path is cheap now
+    that drifted caches refresh off the query thread — an unused cell costs no
+    RAM until queried, and only its first query pays a one-time build."""
+    from flex import registry
+
+    cells = registry.list_cells()
+    names = {c['name'] for c in cells}
+    targets = list(getattr(args, 'cells', []) or [])
+
+    if not targets:
+        active = sorted(c['name'] for c in cells
+                        if c.get('active', 1) and not c.get('unlisted', 0))
+        lazy = sorted(c['name'] for c in cells if not c.get('active', 1))
+        print(f"Warm at startup ({len(active)}):")
+        for n in active:
+            print(f"  ● {n}")
+        print(f"\nLazy — load on first query ({len(lazy)}):")
+        for n in lazy:
+            print(f"  ○ {n}")
+        print("\nflex warm <name...>          mark warm   "
+              "| --off lazy | --only set the whole warm-set | --restart apply now")
+        return
+
+    unknown = [t for t in targets if t not in names]
+    if unknown:
+        print(f"Unknown cell(s): {', '.join(unknown)}")
+        return
+
+    if getattr(args, 'only', False):
+        changed = 0
+        for c in cells:
+            want = c['name'] in targets
+            if bool(c.get('active', 1)) != want:
+                registry.set_active(c['name'], want)
+                changed += 1
+        print(f"Warm-set is now exactly ({len(targets)}): {', '.join(sorted(targets))}"
+              f"  [{changed} changed]")
+    else:
+        on = not getattr(args, 'off', False)
+        for t in targets:
+            registry.set_active(t, on)
+        print(f"Set {len(targets)} cell(s) {'warm at startup' if on else 'lazy'}: "
+              f"{', '.join(targets)}")
+
+    if getattr(args, 'restart', False):
+        import subprocess
+        subprocess.run(["systemctl", "--user", "restart", "flex-mcp"], check=False)
+        print("Restarted flex-mcp — warm-set applied.")
+    else:
+        print("Restart to apply: systemctl --user restart flex-mcp")
+
+
 def cmd_health(args):
     """Show compact operational health."""
-    from flex.health import refresh_problems, refresh_summary, watch_problems, watch_summary
+    from flex.health import (
+        refresh_problems, refresh_summary, watch_problems, watch_summary, watcher_summary,
+    )
     from flex.registry import list_cells
     import json
 
-    cells = list_cells()
+    all_cells = list_cells()
+    cells = all_cells
     if not args.all:
         cells = [c for c in cells if not c.get('unlisted') and c.get('active', 1)]
     refresh = refresh_summary(cells, include_unlisted=True)
     watch = watch_summary(cells, include_unlisted=True)
+    # Locate claude_code via the already-fetched (and, in tests, mocked)
+    # cell list rather than calling resolve_cell() independently — keeps
+    # this call from bypassing test isolation around the registry.
+    claude_cell = next((c for c in all_cells if c.get('name') == 'claude_code'), None)
+    watcher = watcher_summary(cell_path=claude_cell.get('path') if claude_cell else None)
     problems = refresh_problems(cells, include_unlisted=True) + watch_problems(cells, include_unlisted=True, worker=watch["worker"])
     summary = {
-        "status": "degraded" if refresh["status"] == "degraded" or watch["status"] == "degraded" else "ok",
+        "status": "degraded" if (
+            refresh["status"] == "degraded"
+            or watch["status"] == "degraded"
+            or watcher["status"] == "degraded"
+        ) else "ok",
         "refresh": refresh,
         "watch": watch,
+        "watcher": watcher,
         "problems": problems,
     }
 
@@ -1665,6 +2016,8 @@ def cmd_health(args):
         f"{refresh['due']} due, {refresh['stale_running']} stale-running, "
         f"{refresh['overdue']} overdue, {refresh['errors']} errors"
     )
+    print(f"watcher (claude_code): {watcher['status']}"
+          + (f" — {watcher['reason']}" if watcher.get('reason') else ""))
     if not problems:
         return
     print()
@@ -1697,7 +2050,7 @@ def _gnu_flex_proxy():
     # Our commands — definitely not GNU flex
     our_commands = {
         "init", "search", "sync", "remove", "status", "health",
-        "module", "relay", "index",
+        "module", "relay", "hub", "index",
         "-h", "--help",
     }
     if argv[0] in our_commands:
@@ -1781,9 +2134,10 @@ def main():
     load_plugins()
     # Register built-in SDK commands such as `flex index` before CLI parsing.
     import flex.sdk  # noqa: F401
-    # Register public downloadable-cell commands such as `flex catalog` and `flex add`.
+    # Register cell-distribution hooks (daemon refresh, private publish-on-refresh)
+    # backing `flex hub`.
     try:
-        import flex.catalog  # noqa: F401
+        import flex.hub  # noqa: F401
     except ImportError:
         pass
 
@@ -1817,17 +2171,33 @@ def main():
     for _name in sorted(_install_modules):
         _sum = _install_modules[_name]['summary']
         _module_help_lines.append(f"{_name}: {_sum}" if _sum else _name)
-    _module_help = "Module to install. Available: " + (
-        ", ".join(sorted(_install_modules)) or "(none)"
+    _module_help = (
+        "Module to install. Surface verbs: "
+        "filesystem <path> [--embed|--no-embed] (structural Instant, default; "
+        "or semantic Vector with --embed), codegraph <path> (a repo's call/import "
+        "graph). Engines/aliases: " + (", ".join(sorted(_install_modules)) or "(none)")
     )
+    _surface_help_lines = [
+        "filesystem: index a folder — Instant (structural FTS+SQL+node tree, default / --no-embed) "
+        "or Vector (semantic embeddings, --embed)",
+        "codegraph: compile a repository into a call/import graph (instant --code)",
+    ]
     init_p = sub.add_parser(
         "init",
         help="Initialize flex (base or with a module)",
         description="Initialize flex. Without --module, installs base flex.\n\n"
+                    "Surface verbs:\n  " + "\n  ".join(_surface_help_lines) + "\n\n"
                     "Installable modules:\n  " + "\n  ".join(_module_help_lines),
         formatter_class=argparse.RawDescriptionHelpFormatter,
     )
     init_p.add_argument("--module", default=None, help=_module_help)
+    # Surface flags for the `filesystem` verb — select the engine the folder routes to.
+    init_p.add_argument("--embed", action="store_true",
+                        help="filesystem: build a Vector cell (semantic embeddings) — "
+                             "routes to the markdown/obsidian engine")
+    init_p.add_argument("--no-embed", action="store_true",
+                        help="filesystem: build an Instant cell (structural FTS+SQL+node "
+                             "tree) — the default; routes to the instant engine")
     for _entry in _install_modules.values():
         _reg = getattr(_entry['module'], 'register_args', None)
         if callable(_reg):
@@ -1862,11 +2232,65 @@ def main():
     module_remove_p = module_sub.add_parser("remove", help="Remove an installed external module")
     module_remove_p.add_argument("name", help="Installed module name")
 
-    # flex relay — toggle getflex.dev cloud tunnel
-    relay_p = sub.add_parser(
-        "relay",
-        help="Enable cloud access via getflex.dev tunnel",
+    # flex soma — SOMA identity maintenance utilities
+    soma_p = sub.add_parser("soma", help="SOMA identity maintenance utilities")
+    soma_sub = soma_p.add_subparsers(dest="soma_action")
+    soma_backfill_p = soma_sub.add_parser(
+        "backfill-identity",
+        help="Stamp _edges_fs_identity on existing cells without a rebuild",
     )
+    soma_backfill_p.add_argument("--cell", default=None,
+                                  help="Only this cell (default: all registered cells)")
+    soma_backfill_p.add_argument("--dry-run", action="store_true",
+                                  help="Report per-cell coverage only, write nothing")
+
+    # flex hub — view/pull/push cells + status (two-level dispatch,
+    # mirroring the `soma`/`module` groups above)
+    hub_p = sub.add_parser("hub", help="Browse, pull, and publish cells")
+    # metavar override hides the undocumented `relay` choice (below) from the
+    # `flex hub --help` choices summary entirely — hub_action has no plugin
+    # extensibility, so a static list here is safe (unlike the top-level parser).
+    hub_sub = hub_p.add_subparsers(dest="hub_action", metavar="{view,pull,push,status}")
+
+    hub_view_p = hub_sub.add_parser("view", help="List remote cells and local sync status")
+    hub_view_p.add_argument("--json", action="store_true", help="Machine-readable output")
+
+    hub_pull_p = hub_sub.add_parser(
+        "pull",
+        help="Install cell(s), or refresh stale installed cells with --all",
+    )
+    hub_pull_p.add_argument("cells", nargs="*", help="Cell name(s) to pull/refresh")
+    hub_pull_p.add_argument("--all", action="store_true",
+                            help="Refresh all stale installed cells (filtered to any named cells)")
+
+    hub_push_p = hub_sub.add_parser(
+        "push",
+        help="Publish cell(s) (requires publishing support to be installed)",
+    )
+    hub_push_p.add_argument("cells", nargs="*", help="Cell name(s) to push")
+    hub_push_p.add_argument("--all", action="store_true", help="Push all configured cells")
+    hub_push_p.add_argument("--dry-run", action="store_true", help="Show what would be uploaded")
+
+    # relay is superseded and slated for retirement. Kept dispatchable (not
+    # removed — an existing consumer still calls this form) but not
+    # advertised: no help text (omitted from the detailed listing) and
+    # excluded from hub_sub's choices metavar above (omitted from the
+    # summary line too).
+    hub_relay_p = hub_sub.add_parser("relay")
+    hub_relay_p.add_argument("--stop", action="store_true",
+                             help="Disable relay and restart services")
+    hub_relay_p.add_argument("--status", action="store_true",
+                             help="Show current relay URL if enabled")
+
+    hub_status_p = hub_sub.add_parser("status", help="Show hub connection + publish state")
+
+    # flex relay — thin top-level alias for `flex hub relay` (kept because an
+    # existing consumer references this form directly). Superseded; no help
+    # text so it's absent from the detailed top-level listing (the top-level
+    # parser takes plugin-registered commands too, so unlike hub_sub it can't
+    # safely use a static metavar override — the bare name may still appear
+    # in the top-level choices summary, but with zero description).
+    relay_p = sub.add_parser("relay")
     relay_p.add_argument("--stop", action="store_true",
                          help="Disable relay and restart services")
     relay_p.add_argument("--status", action="store_true",
@@ -1889,6 +2313,13 @@ def main():
     health_p.add_argument("--json", action="store_true", help="Machine-readable output")
     health_p.add_argument("--all", action="store_true", help="Include unlisted cells")
 
+    # flex warm — which cells build VectorCaches at startup vs lazy-load
+    warm_p = sub.add_parser("warm", help="Manage the startup warm-set (vs lazy-load)")
+    warm_p.add_argument("cells", nargs="*", help="Cell names to toggle (none = show current warm-set)")
+    warm_p.add_argument("--off", action="store_true", help="Mark the named cells lazy (load on first query)")
+    warm_p.add_argument("--only", action="store_true", help="Warm ONLY the named cells; mark all others lazy")
+    warm_p.add_argument("--restart", action="store_true", help="Restart flex-mcp to apply now")
+
     _register_extra = get_hook("register_extra_commands")
     if _register_extra:
         _register_extra(sub)
@@ -1903,12 +2334,18 @@ def main():
             cmd_sync(args)
         elif args.command == "module":
             cmd_module(args)
+        elif args.command == "soma":
+            cmd_soma(args)
+        elif args.command == "hub":
+            cmd_hub(args)
         elif args.command == "remove":
             cmd_remove(args)
         elif args.command == "status":
             cmd_status(args)
         elif args.command == "health":
             cmd_health(args)
+        elif args.command == "warm":
+            cmd_warm(args)
         elif args.command == "relay":
             cmd_relay(args)
         elif hasattr(args, 'func'):

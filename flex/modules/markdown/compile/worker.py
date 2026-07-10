@@ -130,7 +130,10 @@ def _index_file(db, entry: VaultEntry, embed_fn=None) -> bool:
 
     # Heading hierarchy
     if len(chunk_ids) > 1:
-        parent_slots = [None] * 6
+        # size to the deepest heading, not a fixed 6 — a heading >H6 else
+        # IndexErrors and drops the whole file (deep-heading content loss)
+        n_slots = max(6, max((c.heading_depth for c in chunks), default=0))
+        parent_slots = [None] * n_slots
         for ci, c in enumerate(chunks):
             if ci >= len(chunk_ids):
                 break
@@ -138,7 +141,7 @@ def _index_file(db, entry: VaultEntry, embed_fn=None) -> bool:
             depth = c.heading_depth
             if depth > 0:
                 parent_slots[depth - 1] = cid
-                for d in range(depth, 6):
+                for d in range(depth, n_slots):
                     parent_slots[d] = None
                 if depth > 1 and parent_slots[depth - 2]:
                     link(db, child_id=cid, parent_id=parent_slots[depth - 2],

@@ -85,7 +85,10 @@ def cmd_heal(args):
     fi = FileIdentity()
     print("Healing file identities...\n")
     stats = fi.heal(verbose=args.verbose)
-    print(f"\nHealed: {stats['ok']} ok, {stats['moved']} moved, {stats['missing']} missing")
+    print(
+        f"\nHealed: {stats['ok']} ok, {stats['moved']} moved, {stats['missing']} missing, "
+        f"{stats.get('conflict', 0)} conflict, {stats.get('error', 0)} error"
+    )
 
 
 def cmd_scan(args):

@@ -155,16 +155,21 @@ def run_http_server(port: int = 7134, active_names: list[str] | None = None, no_
             )
 
     async def health(request: Request) -> JSONResponse:
-        from flex.health import refresh_summary
+        from flex.health import refresh_summary, watcher_summary
 
         all_on_disk = discover_cells()
         # If cells were explicitly selected, only report those
         on_disk = sorted(set(all_on_disk) & _known_cells) if _known_cells != set(all_on_disk) else all_on_disk
         refresh = refresh_summary()
         warmup = get_warmup_state()
+        try:
+            watcher = watcher_summary()
+        except Exception:
+            watcher = {"status": "polling", "reason": "watcher summary unavailable"}
         status = "degraded" if (
             refresh.get("status") == "degraded"
             or warmup.get("status") == "error"
+            or watcher.get("status") == "degraded"
         ) else "ok"
         return JSONResponse({
             "status": status,
@@ -173,6 +178,7 @@ def run_http_server(port: int = 7134, active_names: list[str] | None = None, no_
             "vec_cached": {k: list(v['caches'].keys()) for k, v in _vec_state.items()},
             "warmup": warmup,
             "refresh": refresh,
+            "watcher": watcher,
         })
 
     from contextlib import asynccontextmanager
@@ -219,15 +225,18 @@ def run_http_server(port: int = 7134, active_names: list[str] | None = None, no_
 
     signal.signal(signal.SIGTERM, _handle_sigterm)
 
+    http_concurrency = int(os.environ.get("FLEX_HTTP_CONCURRENCY", "200"))
+    uvicorn_kwargs = {
+        "host": "127.0.0.1",
+        "port": port,
+        "timeout_keep_alive": 120,
+        "timeout_graceful_shutdown": 1,
+    }
+    if http_concurrency > 0:
+        uvicorn_kwargs["limit_concurrency"] = http_concurrency
+
     try:
-        uvicorn.run(
-            app,
-            host="127.0.0.1",
-            port=port,
-            timeout_keep_alive=120,
-            timeout_graceful_shutdown=1,
-            limit_concurrency=20,
-        )
+        uvicorn.run(app, **uvicorn_kwargs)
     except SystemExit as e:
         code = e.code if e.code is not None else 0
         print(f"[flex-mcp] exit {code}", file=sys.stderr)

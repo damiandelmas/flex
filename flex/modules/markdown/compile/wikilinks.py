@@ -12,16 +12,37 @@ def is_template_target(target: str) -> bool:
     return '<%' in target or '{{' in target
 
 
+# Bash test conditionals pasted as RAW PROSE (no code fence/indent — so
+# strip_code_blocks can't catch them) look like `[[ -z "$X" ]]` / `[[ "$A" != "b" ]]`
+# and become phantom wikilinks. Reject by shape: a real note name never has a shell
+# variable ref, shell-string quotes, a comparison operator, or a leading test flag.
+_SHELL_CONDITIONAL_RE = re.compile(
+    r'[$]'                     # shell variable reference — decisive
+    r'|"'                      # double quotes (bash string tests)
+    r'|(?:==|!=|=~)'           # comparison operators
+    r'|^-[a-zA-Z]{1,2}\b'      # target starts with a test flag (-z -n -f -e -d …)
+)
+
+
+def is_shell_conditional(target: str) -> bool:
+    """True if a [[...]] target is a bash test conditional, not a wikilink."""
+    return bool(_SHELL_CONDITIONAL_RE.search(target))
+
+
 def extract_raw_wikilinks(body: str) -> list[str]:
     """Return list of raw link targets from [[...]] syntax.
 
     Deduplicates within a single file.
     Filters out template syntax targets.
     """
+    # Strip fenced + inline code BEFORE matching so code never produces phantom
+    # wikilinks — bash test syntax `[[ -z "$x" ]]` / `[[ -f f ]]` in a code block is
+    # not a wikilink. (BUG: on a code-heavy vault this fabricated 240 ghost links.)
+    from flex.modules.markdown.compile.tags import strip_code_blocks
     seen = set()
-    for match in WIKILINK_RE.finditer(body):
+    for match in WIKILINK_RE.finditer(strip_code_blocks(body)):
         target = match.group(1).strip()
-        if target and not is_template_target(target):
+        if target and not is_template_target(target) and not is_shell_conditional(target):
             seen.add(target)
     return list(seen)
 

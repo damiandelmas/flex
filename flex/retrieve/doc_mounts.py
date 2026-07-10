@@ -67,7 +67,7 @@ def resolve_doc_rows(db: sqlite3.Connection) -> list[tuple[str, str, str, str, i
     cell_name = registry_meta.get("name")
 
     docs: list[tuple[str, str, Path, Path]] = []
-    docs.extend(_packaged_instruction_paths(cell_type))
+    docs.extend(_packaged_instruction_paths(cell_type, _cell_is_no_embed(db)))
     docs.extend(_local_note_paths(cell_name, cell_type))
 
     out: list[tuple[str, str, str, str, int, str]] = []
@@ -84,7 +84,23 @@ def resolve_doc_rows(db: sqlite3.Connection) -> list[tuple[str, str, str, str, i
     return out
 
 
-def _packaged_instruction_paths(cell_type: str | None) -> list[tuple[str, str, Path, Path]]:
+def _cell_is_no_embed(db: sqlite3.Connection) -> bool:
+    """True if the cell self-declares embed-off (_meta.embed in {false,0,off,no}).
+
+    Reads the same _meta.embed signal used by the compiler's cell_is_no_embed, the
+    generated @orient embed_mode branch, and the serve VectorCache warm-guard — one flag,
+    read here via get_meta so retrieve/ keeps its zero-private-module-import boundary.
+    """
+    try:
+        val = get_meta(db, "embed")
+    except Exception:
+        return False
+    return val is not None and str(val).lower() in ("false", "0", "off", "no")
+
+
+def _packaged_instruction_paths(
+    cell_type: str | None, no_embed: bool = False
+) -> list[tuple[str, str, Path, Path]]:
     if not cell_type:
         return []
     module_names: list[str] = []
@@ -102,6 +118,12 @@ def _packaged_instruction_paths(cell_type: str | None) -> list[tuple[str, str, P
             Path(__file__).resolve().parents[1] / "modules" / module_name
         )
         path = root / "stock" / "instructions.md"
+        # Embed-off cells mount the structural-surface instructions when the module ships
+        # one, so cell_docs never advertises vec_ops/semantic scoring the cell can't back.
+        if no_embed:
+            no_embed_path = root / "stock" / "instructions-noembed.md"
+            if no_embed_path.exists():
+                path = no_embed_path
         docs.append(("cell_instructions", module_name, path, root))
     return docs
 

@@ -70,6 +70,7 @@ def compile_vault(
     cell_type: str = 'markdown',
     description: str | None = None,
     exclude: list[str] | None = None,
+    profile=None,
 ) -> 'sqlite3.Connection':
     """Compile a markdown vault into a queryable flex cell.
 
@@ -79,6 +80,12 @@ def compile_vault(
         cell_type: 'obsidian' or 'markdown'.
         description: Optional cell description.
         exclude: Additional exclude patterns (dirs ending /, else fnmatch).
+        profile: IngestProfile seam (markdown/obsidian/docpac). The default
+            (None) runs today's markdown/obsidian behavior unchanged. The docpac
+            flavor currently drives its own pipeline (docpac/compile/init.py) off
+            `docpac_profile()`; structural routing of docpac registration/embed
+            through this function is deferred to S6 (needs sdk.register to forward
+            corpus_path/unlisted + docpac schema alignment — see the S3 receipt).
 
     Returns:
         Open sqlite3.Connection. Cell is registered and MCP-queryable.
@@ -213,7 +220,11 @@ def compile_vault(
 
         # ── Heading hierarchy ─────────────────────────────────────────
         if len(chunk_ids) > 1:
-            parent_slots = [None] * 6
+            # Size parent_slots to the deepest heading, not a fixed 6 — verbatim
+            # content can carry headings past H6 (a fixed [None]*6 IndexErrors and
+            # drops the whole file). Kept identical to the docpac worker path.
+            n_slots = max(6, max((c.heading_depth for c in chunks), default=0))
+            parent_slots = [None] * n_slots
             for ci, c in enumerate(chunks):
                 if ci >= len(chunk_ids):
                     break
@@ -222,7 +233,7 @@ def compile_vault(
 
                 if depth > 0:
                     parent_slots[depth - 1] = cid
-                    for d in range(depth, 6):
+                    for d in range(depth, n_slots):
                         parent_slots[d] = None
 
                     if depth > 1 and parent_slots[depth - 2]:

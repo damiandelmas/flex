@@ -117,7 +117,8 @@ Codex, and Obsidian do — compiled into a cell behind the one query surface.
 |---|---|
 | [`claude-code`](https://github.com/damiandelmas/flex/blob/main/flex/modules/claude_code/README.md) | Claude Code sessions: prompts, tool calls, file evidence |
 | [`codex`](https://github.com/damiandelmas/flex/blob/main/flex/modules/codex/README.md) | Codex CLI sessions, same surface |
-| [`obsidian`](https://github.com/damiandelmas/flex/blob/main/flex/modules/markdown/README.md) | vaults and markdown trees: sections, wikilinks, backlinks |
+| [`filesystem`](https://github.com/damiandelmas/flex/tree/main/flex/modules/instant) | any folder or document tree — Instant (`--no-embed`, structural FTS+SQL+node tree; the default) or Vector (`--embed`, semantic embeddings; auto-detects an Obsidian vault). Aliases: `instant` = `filesystem --no-embed`, `obsidian`/`markdown` = `filesystem --embed` |
+| [`codegraph`](https://github.com/damiandelmas/flex/tree/main/flex/modules/instant) | a code repository as a queryable graph: symbol tree, call graph, import graph (Python + JS/TS). Alias: `code` = `codegraph` |
 | [`tools`](https://github.com/damiandelmas/flex/blob/main/flex/modules/skills/README.md) | the agentic ecosystem catalog: skills, MCP servers, frameworks |
 
 **Beta**

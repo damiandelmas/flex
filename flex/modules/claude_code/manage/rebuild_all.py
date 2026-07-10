@@ -14,7 +14,8 @@ import numpy as np
 FLEX_ROOT = Path(__file__).resolve().parent.parent.parent.parent.parent
 sys.path.insert(0, str(FLEX_ROOT))
 
-from flex.core import open_cell, log_op
+from flex.core import open_cell, log_op, get_meta
+from flex.onnx.embed import STORE_DIM
 from flex.views import regenerate_views
 from flex.manage.meditate import build_similarity_graph, compute_scores, persist
 from flex.modules.claude_code.manage.noise import graph_filter_sql
@@ -91,15 +92,21 @@ def reembed_sources(db):
     t0 = time.time()
 
     # Null out any chunk embeddings with wrong dimension (e.g. legacy 384d MiniLM).
-    # The worker re-embeds NULL chunks at 128d on its next cycle.
-    # length(embedding) / 4 = dims (float32). Expected: 128d = 512 bytes.
+    # The worker re-embeds NULL chunks at the configured dim on its next cycle.
+    # length(embedding) / 4 = dims (float32). Read the expected dim from _meta,
+    # falling back to STORE_DIM if the cell predates that key.
+    try:
+        target_dim = int(get_meta(db, 'embedding_dim') or STORE_DIM)
+    except (TypeError, ValueError):
+        target_dim = STORE_DIM
+    target_bytes = target_dim * 4
     nulled = db.execute("""
         UPDATE _raw_chunks SET embedding = NULL
-        WHERE embedding IS NOT NULL AND length(embedding) != 512
-    """).rowcount
+        WHERE embedding IS NOT NULL AND length(embedding) != ?
+    """, (target_bytes,)).rowcount
     if nulled:
         db.commit()
-        print(f"  Nulled {nulled} chunks with wrong embedding dimension (will re-embed at 128d)")
+        print(f"  Nulled {nulled} chunks with wrong embedding dimension (will re-embed at {target_dim}d)")
         sys.stdout.flush()
 
     # Compute corpus centroid from existing source embeddings.
