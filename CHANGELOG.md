@@ -4,6 +4,26 @@ Public changes to **flex** ([getflex.dev](https://getflex.dev)).
 
 ---
 
+## 0.53.0 — Unreleased
+
+### Unified filesystem compiler
+
+- `flex init --module filesystem --path PATH` now compiles Markdown, Python,
+  JS/TS, and readable text into one watched cell. Nomic v1.5 fp32/768 storage
+  with serve-256 is the default; `--no-embed` preserves identical structure
+  with NULL vectors, and `--obsidian` adds vault semantics only to Markdown.
+- One atomic per-file writer owns initial build and refresh. Empty files remove
+  their stale searchable version, unreadable or failed files preserve the last
+  good version, and required embedding/enrichment failures cannot claim freshness.
+- Filesystem reconciliation compares against durable source state on cold start,
+  catches edits made while the daemon was stopped, and uses events only as the
+  latency path. Deletes and missed events remain reconciliation-owned.
+- `instant`, `markdown`, `obsidian`, `codegraph`, and `code` remain compatibility
+  aliases with their former narrow/no-embed behavior. Existing legacy cells are
+  not relabeled or rewritten.
+
+---
+
 ## 0.52.0 — July 14, 2026
 
 This release makes a cell's declared contracts executable: one reproducible

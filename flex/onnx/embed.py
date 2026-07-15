@@ -145,7 +145,8 @@ class ONNXEmbedder:
     def __init__(self, model_path: Path = None, tokenizer_path: Path = None):
         self.model_path = model_path or _resolve_model_path()
         # An explicit tokenizer_path is used for non-default (registered) models
-        # whose WordPiece/BPE vocab differs from the bundled one. None → bundled.
+        # whose WordPiece/BPE vocab differs from the installed default. None uses
+        # the tokenizer fetched alongside the pinned model by `flex init`.
         self._tokenizer_path = tokenizer_path
         self._session = None
         self._tokenizer = None

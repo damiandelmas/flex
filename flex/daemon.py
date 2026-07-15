@@ -190,6 +190,22 @@ def _build_local_watchers():
     return queue, watchers, config
 
 
+def _run_local_worker(*, interval, queue, watcher, reconcile_interval):
+    """Choose the coding-session owner when present, otherwise filesystem-only."""
+    from flex.registry import resolve_cell
+
+    if resolve_cell("claude_code"):
+        from flex.modules.claude_code.compile.worker import daemon_loop
+    else:
+        from flex.modules.fs.compile.worker import daemon_loop
+    daemon_loop(
+        interval=interval,
+        invalidation_queue=queue,
+        watcher=watcher,
+        reconcile_interval=reconcile_interval,
+    )
+
+
 def main():
     _load_secrets()
     from flex.registry import load_plugins
@@ -245,9 +261,8 @@ def main():
         )
         t.start()
 
-    # Phase 1 filesystem observer (Claude Code JSONLs only). Built before the
-    # worker loop starts; stopped/joined on every exit path below, including
-    # a signal-driven shutdown.
+    # Typed local observers are built before the worker loop and stopped on
+    # every exit path, including signal-driven shutdown.
     queue, watcher, _watch_config = _build_local_watchers()
 
     def _shutdown_watcher(signum=None, frame=None):
@@ -262,15 +277,14 @@ def main():
 
     # Main thread: local cell scan (blocks if module available)
     try:
-        from flex.modules.claude_code.compile.worker import daemon_loop
-        daemon_loop(
+        _run_local_worker(
             interval=args.interval,
-            invalidation_queue=queue,
+            queue=queue,
             watcher=watcher,
             reconcile_interval=_watch_config.reconcile_interval if queue else None,
         )
     except ImportError:
-        print("[flex-daemon] claude_code module not installed — running background services only",
+        print("[flex-daemon] no local worker installed — running background services only",
               file=sys.stderr)
         # Block main thread so daemon stays alive for background services
         import time

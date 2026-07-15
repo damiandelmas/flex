@@ -150,6 +150,8 @@ def _install_claude_assets(skill_names=None):
         "flex:github": ("skills/flex-github/", "skills/flex-github/"),
         "flex:arxiv": ("skills/flex-arxiv/", "skills/flex-arxiv/"),
         "flex:markdown": ("skills/flex-markdown/", "skills/flex-markdown/"),
+        "flex:filesystem": ("skills/flex-filesystem/", "skills/flex-filesystem/"),
+        "flex:codegraph": ("skills/flex-codegraph/", "skills/flex-codegraph/"),
         "flex:tools": ("skills/flex-tools/", "skills/flex-tools/"),
     }
 
@@ -754,42 +756,39 @@ def _run_enrichment_quiet(conn, progress_cb=None) -> tuple[int, list[str]]:
 
 
 # ── Surface routing ───────────────────────────────────────────────────────
-# Present `filesystem` and `codegraph` as user-facing install verbs over the
-# structural instant engine. Markdown/Obsidian remains an explicit, separate
-# module until the unified filesystem compiler lands.
+# Present one filesystem compiler with compatibility aliases for the former
+# Instant, Markdown/Obsidian, and codegraph installation surfaces.
 #
-#   filesystem -> instant engine (structural: FTS+SQL+node tree)
-#   codegraph   -> instant engine, --code (call/import graph)
+#   filesystem -> mixed filesystem engine (embedded by default)
+#   codegraph   -> filesystem, code-only + no-embed compatibility mode
 #
 # Permanent aliases (old commands keep working):
-#   instant             -> filesystem (instant engine)
-#   obsidian / markdown -> markdown engine
-#   code                -> codegraph (instant --code)
+#   instant             -> filesystem, no-embed (except legacy regen/remove)
+#   obsidian / markdown -> filesystem, markdown-only
+#   code                -> codegraph compatibility mode
 def _resolve_module_surface(module: str, args) -> tuple[str, dict]:
     """Map a user-facing verb/alias to (engine_cli_name, forced_flags).
 
-    engine_cli_name is a real discovered `--module` value ('instant' or
-    'obsidian'); forced_flags are applied onto `args` before dispatch. A name
+    engine_cli_name is a real discovered `--module` value; forced flags are
+    applied onto `args` before dispatch. A name
     that is neither a surface verb nor an alias passes through untouched.
     """
-    embed = bool(getattr(args, "embed", False))
     if module in ("filesystem", "instant", "obsidian", "markdown"):
         if module == "filesystem":
-            if embed:
-                raise SystemExit(
-                    "`flex init --module filesystem --embed` is not supported: "
-                    "the 0.52 filesystem cell is structural (FTS + SQL, no embeddings). "
-                    "For a Markdown or Obsidian vault, use the explicit "
-                    "`--module obsidian --vault PATH` surface."
-                )
-            return "instant", {}
+            return "filesystem", {}
         if module == "instant":
-            return "instant", {}
-        return "obsidian", {}  # obsidian / markdown -> the markdown engine (vector)
+            if getattr(args, "regen", None) or getattr(args, "remove", None):
+                return "instant", {}
+            return "filesystem", {"no_embed": True}
+        return "filesystem", {
+            "obsidian": module == "obsidian",
+            "_filesystem_file_kinds": ("markdown",),
+        }
     if module in ("codegraph", "code"):
-        # code-extension filter + tree mode: the call/import graph (and the
-        # @callers/@callees/@impact presets) only build in nest/tree mode.
-        return "instant", {"code": True, "nest": True}
+        return "filesystem", {
+            "no_embed": True,
+            "_filesystem_file_kinds": ("code",),
+        }
     return module, {}
 
 
@@ -805,9 +804,8 @@ def cmd_init(args):
     _warnings: list[str] = []
     _module = getattr(args, 'module', None)
 
-    # Route the user-facing surface verbs/aliases to the underlying engine module
-    # and apply any forced flags (e.g. codegraph -> instant --code). Surface + routing
-    # only; the two engines stay separate modules.
+    # Route legacy surface verbs into the unified filesystem engine and apply
+    # their compatibility flags before dispatch.
     if _module:
         _resolved, _forced = _resolve_module_surface(_module, args)
         _module = _resolved
@@ -820,8 +818,11 @@ def cmd_init(args):
     # 60s instant-regen cron, this kill flapped flex-mcp every minute (it never
     # stayed up long enough to finish warming). A regen recompiles the cell; it must
     # not bounce the daemons.
-    _regen_op = (getattr(args, 'regen', None) or getattr(args, 'path', None)
-                 or getattr(args, 'remove', None))
+    _regen_op = _module == "instant" and (
+        getattr(args, "regen", None)
+        or getattr(args, "path", None)
+        or getattr(args, "remove", None)
+    )
     if _module and not _regen_op:
         _kill_pid_services()
 
@@ -2395,14 +2396,13 @@ def main():
         _module_help_lines.append(f"{_name}: {_sum}" if _sum else _name)
     _module_help = (
         "Module to install. Surface verbs: "
-        "filesystem <path> (structural FTS+SQL+node tree; no embeddings), "
-        "codegraph <path> (a repo's call/import graph). Markdown/Obsidian vaults "
-        "use the explicit obsidian or markdown module. Engines/aliases: "
+        "filesystem --path PATH (mixed Markdown/code/text, embedded by default; "
+        "add --obsidian or --no-embed). Compatibility aliases: "
         + (", ".join(sorted(_install_modules)) or "(none)")
     )
     _surface_help_lines = [
-        "filesystem: index a folder as structural FTS+SQL+node tree (no embeddings)",
-        "codegraph: compile a repository into a call/import graph (instant --code)",
+        "filesystem: compile a mixed folder into one watched Nomic cell",
+        "  add --obsidian for vault semantics; add --no-embed for structural-only",
     ]
     init_p = sub.add_parser(
         "init",
@@ -2413,14 +2413,11 @@ def main():
         formatter_class=argparse.RawDescriptionHelpFormatter,
     )
     init_p.add_argument("--module", default=None, help=_module_help)
-    # Compatibility flags for the `filesystem` verb. --embed is rejected rather
-    # than silently changing the source semantics to Markdown-only indexing.
+    # --embed is a one-cycle compatibility no-op: embedding is now the default.
     init_p.add_argument("--embed", action="store_true",
-                        help="filesystem: unsupported in 0.52; use the explicit "
-                             "obsidian or markdown module for a vault")
+                        help="filesystem: compatibility no-op (embeddings are the default)")
     init_p.add_argument("--no-embed", action="store_true",
-                        help="filesystem: structural FTS+SQL+node tree (the default; "
-                             "accepted for compatibility)")
+                        help="filesystem: disable semantic vectors; keep identical structure")
     for _entry in _install_modules.values():
         _reg = getattr(_entry['module'], 'register_args', None)
         if callable(_reg):

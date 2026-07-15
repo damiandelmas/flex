@@ -348,14 +348,17 @@ def _mint_file_identity(conn: sqlite3.Connection, source_id: str, file_path: str
     return False
 
 
-def _extract_imports(abs_path: str, ext: str) -> list[tuple]:
+def _extract_imports(abs_path: str, ext: str, text: str | None = None) -> list[tuple]:
     """(source_id, module, name) rows for this one file (py ast / ts tree-sitter).
     Mirrors instant/install.py's import extraction, scoped to one path."""
     rows: list[tuple] = []
     if ext == "py":
         import ast as _ast
         try:
-            tree = _ast.parse(Path(abs_path).read_text(encoding="utf-8", errors="ignore"))
+            body = text if text is not None else Path(abs_path).read_text(
+                encoding="utf-8", errors="ignore"
+            )
+            tree = _ast.parse(body)
         except Exception:
             return rows
         for nd in _ast.walk(tree):
@@ -376,7 +379,10 @@ def _extract_imports(abs_path: str, ext: str) -> list[tuple]:
         return rows
     try:
         from tree_sitter import Parser
-        src = Path(abs_path).read_text(encoding="utf-8", errors="ignore").encode("utf-8")
+        body = text if text is not None else Path(abs_path).read_text(
+            encoding="utf-8", errors="ignore"
+        )
+        src = body.encode("utf-8")
         root = Parser(lang).parse(src).root_node
     except Exception:
         return rows

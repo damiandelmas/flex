@@ -37,6 +37,19 @@ try:
 except ImportError:
     pass
 
+# The aggregate lifecycle module is optional. The filesystem compiler owns a
+# narrow fallback so watched cells still receive event invalidations and
+# periodic reconciliation in minimal installations.
+_filesystem_scanner = None
+_filesystem_path_drainer = None
+try:
+    from flex.modules.fs.compile.worker import (
+        drain_filesystem_invalidations as _filesystem_path_drainer,
+        scan_filesystem_cells as _filesystem_scanner,
+    )
+except ImportError:
+    pass
+
 _markdown_scanner = None
 try:
     from flex.modules.markdown.compile.worker import scan_markdown_cells as _markdown_scanner
@@ -52,6 +65,9 @@ except ImportError:
     pass
 
 CODING_AGENT_WATCH_INTERVAL = float(os.environ.get("FLEX_CODING_AGENT_WATCH_INTERVAL_SEC", "30"))
+FILESYSTEM_RECONCILE_INTERVAL = float(
+    os.environ.get("FLEX_CORPUS_RECONCILE_INTERVAL_S", "45")
+)
 
 try:
     from flex.modules.soma.compile import enrich as soma_enrich
@@ -2200,13 +2216,14 @@ def daemon_loop(interval=2, invalidation_queue=None, watcher=None,
     if soma_ensure_tables:
         soma_ensure_tables(conn)
 
-    if _corpus_drainer:
+    if _corpus_drainer or _filesystem_scanner:
         print("  Corpus indexing: enabled", file=sys.stderr)
 
     ENRICHMENT_INTERVAL = 30 * 60   # 30 minutes — graph, fingerprints, repo_project
     GRAPH_STALENESS_THRESHOLD = 50  # sessions since last graph build
 
     last_soma_heal = time.time()
+    last_filesystem_reconcile = 0.0
     worker_start = time.time()
     ENRICHMENT_STARTUP_GRACE = 120  # capture must run + prove stable before enriching
 
@@ -2261,9 +2278,13 @@ def daemon_loop(interval=2, invalidation_queue=None, watcher=None,
                             file=sys.stderr,
                         )
                 corpus_events = [inv for inv in ready if inv.cell_name != 'claude_code']
-                if corpus_events and _corpus_path_drainer:
+                corpus_event_drainer = _corpus_path_drainer or _filesystem_path_drainer
+                if corpus_events and corpus_event_drainer:
                     _t0 = time.time()
-                    event_stats = _corpus_path_drainer(corpus_events, encode_fn=encode)
+                    if _corpus_path_drainer:
+                        event_stats = corpus_event_drainer(corpus_events, encode_fn=encode)
+                    else:
+                        event_stats = corpus_event_drainer(corpus_events)
                     _phase_durations['corpus_targeted_sync_s'] = time.time() - _t0
                     if event_stats['indexed']:
                         print(f"[worker] corpus event-indexed={event_stats['indexed']}",
@@ -2340,6 +2361,14 @@ def daemon_loop(interval=2, invalidation_queue=None, watcher=None,
                 _corpus_drainer(encode_fn=encode)
             except Exception as e:
                 print(f"[worker] Corpus drain error: {e}", file=sys.stderr)
+        elif (_filesystem_scanner
+              and time.monotonic() - last_filesystem_reconcile
+              >= FILESYSTEM_RECONCILE_INTERVAL):
+            try:
+                _filesystem_scanner()
+                last_filesystem_reconcile = time.monotonic()
+            except Exception as e:
+                print(f"[worker] Filesystem drain error: {e}", file=sys.stderr)
 
         # Secondary local cells (e.g. chat exports)
         if _secondary_cell_drainer:

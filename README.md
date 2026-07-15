@@ -37,11 +37,33 @@ curl -sSL https://getflex.dev/install.sh | bash -s -- codex
 Obsidian / Markdown:
 
 ```bash
-curl -sSL https://getflex.dev/install.sh | bash -s -- obsidian
+curl -sSL https://getflex.dev/install.sh | bash
+flex init --module filesystem --path /path/to/vault --obsidian
 ```
+
+Any mixed folder or repository:
+
+```bash
+flex init --module filesystem --path /path/to/folder
+```
+
+This walks Markdown, Python, JS/TS, and readable text into one watched cell.
+Embeddings default on; add `--no-embed` for the same structure without vectors,
+or `--obsidian` to add vault semantics to Markdown files.
 
 New cells use the pinned Nomic v1.5 fp32 model automatically. The model runs
 locally; no API key or hosted embedding account is required.
+
+To have an agent create the cell, paste:
+
+```text
+Install Flex if needed, then run `flex init --module filesystem --path PATH`.
+Add `--obsidian` only when I ask for Obsidian semantics, and add `--no-embed`
+only when I explicitly want structural-only retrieval. Treat the caller path as
+the sole corpus root. When it finishes, run `flex core search --cell NAME
+"@orient"` and report the indexed file kinds, embedding model, serve dimension,
+and refresh lifecycle.
+```
 
 ### upgrading existing cells to 0.52
 
@@ -131,16 +153,15 @@ Coding memory is the sharpest use of flex, not its edge. Underneath, flex is a
 substrate: any source that compiles into the cell format becomes queryable through
 the same MCP tool, and adding a source never adds a new tool.
 
-Obsidian and Markdown ship as a ready-made module today:
+Folders, repositories, Markdown, and Obsidian share one filesystem compiler:
 
 ```bash
-VAULT=/path/to/vault curl -sSL https://getflex.dev/install.sh | bash -s -- obsidian
+flex init --module filesystem --path /path/to/folder [--obsidian] [--no-embed]
 ```
 
-flex indexes notes, sections, frontmatter, aliases, wikilinks, ghost notes, and
-heading hierarchy without touching your files, then exposes backlinks and note
-communities as queryable columns. New sources arrive the same way Claude Code,
-Codex, and Obsidian do — compiled into a cell behind the one query surface.
+flex indexes Markdown headings and metadata, code symbols/calls/imports, and
+generic text without touching your files. `--obsidian` adds aliases, wikilinks,
+and ghost targets to Markdown sources without narrowing the rest of the folder.
 
 ### source modules
 
@@ -150,8 +171,8 @@ Codex, and Obsidian do — compiled into a cell behind the one query surface.
 |---|---|
 | [`claude-code`](https://github.com/damiandelmas/flex/blob/main/flex/modules/claude_code/README.md) | Claude Code sessions: prompts, tool calls, file evidence |
 | [`codex`](https://github.com/damiandelmas/flex/blob/main/flex/modules/codex/README.md) | Codex CLI sessions, same surface |
-| [`filesystem`](https://github.com/damiandelmas/flex/tree/main/flex/modules/instant) | any folder or document tree as structural FTS+SQL+node tree, without embeddings. `instant` remains a compatibility alias. Use the explicit `obsidian` or `markdown` module for a Markdown vault. |
-| [`codegraph`](https://github.com/damiandelmas/flex/tree/main/flex/modules/instant) | a code repository as a queryable graph: symbol tree, call graph, import graph (Python + JS/TS). Alias: `code` = `codegraph` |
+| [`filesystem`](https://github.com/damiandelmas/flex/tree/main/flex/modules/fs) | one mixed folder cell: Markdown, code graph, generic text, Nomic semantic retrieval, watched refresh; optional `--obsidian` or `--no-embed` |
+| `instant`, `markdown`, `obsidian`, `codegraph` | compatibility aliases preserving their former narrow/no-embed behavior; new workflows should use `filesystem` |
 | [`tools`](https://github.com/damiandelmas/flex/blob/main/flex/modules/skills/README.md) | the agentic ecosystem catalog: skills, MCP servers, frameworks |
 
 **Beta**
@@ -349,7 +370,7 @@ curl -sSL https://getflex.dev/install.sh | bash -s -- codex
 ```
 
 ```bash
-curl -sSL https://getflex.dev/install.sh | bash -s -- obsidian
+flex init --module filesystem --path /path/to/folder --obsidian
 ```
 
 MIT · Python 3.12 · SQLite · [getflex.dev](https://getflex.dev) · [paper](https://arxiv.org/abs/2603.22587) · [x](https://x.com/damian_delmas)
