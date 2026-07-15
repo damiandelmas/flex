@@ -51,6 +51,7 @@ Wire format observations (codex CLI 0.125+):
 from __future__ import annotations
 
 import json
+import os
 import sqlite3
 import sys
 import time
@@ -60,6 +61,7 @@ from typing import Mapping, Optional
 
 # Vendored CC helpers — used as a dependency, not modified.
 from flex.modules.claude_code.compile.worker import (
+    _batch_embed_chunks,
     _ingest_file_body,
     _store_content_raw,
     ensure_source_exists,
@@ -789,11 +791,11 @@ def _sync_session_jsonl(
     for chunk in new_chunks:
         chunk["embedding"] = None
         try:
-            insert_chunk_atom(conn, chunk)
-            update_source_stats(conn, session_id, chunk)
-            inserted += 1
-            if first_chunk_id is None:
-                first_chunk_id = chunk["id"]
+            if insert_chunk_atom(conn, chunk):
+                update_source_stats(conn, session_id, chunk)
+                inserted += 1
+                if first_chunk_id is None:
+                    first_chunk_id = chunk["id"]
         except Exception as e:
             print(f"[codex] chunk insert error: {e}", file=sys.stderr)
 
@@ -1043,6 +1045,13 @@ def _sync_session_jsonl(
         except Exception as e:
             print(f"[codex] source provenance insert error: {e}", file=sys.stderr)
 
+    from flex.modules.claude_code.manage.observations import upsert_observation
+    for chunk_id in {c['id'] for c in new_chunks}:
+        try:
+            upsert_observation(conn, chunk_id)
+        except Exception as e:
+            print(f"[codex] observation upsert error for {chunk_id}: {e}", file=sys.stderr)
+
     if inserted == 0 and last_num == 0 and not forked_from_id:
         conn.execute(
             "DELETE FROM _raw_sources WHERE source_id = ? AND message_count = 0",
@@ -1250,6 +1259,13 @@ CODEX_OPTIONAL_TABLES_DDL: tuple[str, ...] = (
     )
     """,
     "CREATE INDEX IF NOT EXISTS idx_codex_source_home ON _types_codex_source(codex_home)",
+    """
+    CREATE TABLE IF NOT EXISTS _codex_source_state (
+        source_path TEXT PRIMARY KEY,
+        size_bytes INTEGER NOT NULL,
+        mtime_ns INTEGER NOT NULL
+    )
+    """,
 )
 
 
@@ -1258,6 +1274,107 @@ def ensure_codex_tables(conn: sqlite3.Connection) -> None:
     for ddl in CODEX_OPTIONAL_TABLES_DDL:
         conn.execute(ddl)
     conn.commit()
+
+
+def sync_rollout_path(
+    conn: sqlite3.Connection,
+    rollout_path: Path,
+    *,
+    state_db: Path | None = None,
+    source_meta: Mapping[str, object] | None = None,
+) -> int:
+    """Incrementally sync one rollout and durably receipt its stat state."""
+    rollout_path = Path(rollout_path).resolve()
+    try:
+        stat = rollout_path.stat()
+    except OSError:
+        return 0
+    ensure_codex_tables(conn)
+    prior = conn.execute(
+        "SELECT size_bytes,mtime_ns FROM _codex_source_state WHERE source_path=?",
+        (str(rollout_path),),
+    ).fetchone()
+    if prior == (stat.st_size, stat.st_mtime_ns):
+        return 0
+
+    state_path = Path(state_db) if state_db is not None else DEFAULT_CODEX_STATE_DB
+    added = _sync_session_jsonl(
+        rollout_path,
+        conn,
+        _load_thread_meta(state_path),
+        _load_spawn_edges(state_path),
+        _load_session_memories(state_path),
+        _load_job_items(state_path),
+        source_meta=source_meta,
+    )
+    conn.execute(
+        "INSERT OR REPLACE INTO _codex_source_state VALUES (?,?,?)",
+        (str(rollout_path), stat.st_size, stat.st_mtime_ns),
+    )
+    conn.commit()
+    return added
+
+
+def scan_codex_cells() -> dict:
+    """Bounded fair reconciliation and NULL-vector repair for local Codex cells."""
+    from flex.registry import list_cells, update_refresh_status
+    from flex.modules.codex.sources import resolve_sources
+    from flex.watch import fair_batch
+
+    stats = {'indexed': 0, 'skipped': 0, 'embedded': 0}
+    cells = [c for c in list_cells() if c.get('cell_type') == 'codex'
+             and c.get('lifecycle') == 'watch' and c.get('active', 1)]
+    limit = max(1, int(os.environ.get('FLEX_DRAIN_FILES_PER_CELL', '200')))
+    embed_limit = max(1, int(os.environ.get('FLEX_CODEX_EMBED_PER_TICK', '128')))
+    for cell in cells:
+        conn = sqlite3.connect(cell['path'], timeout=30)
+        conn.execute("PRAGMA journal_mode=WAL")
+        conn.execute("PRAGMA busy_timeout=30000")
+        ensure_codex_tables(conn)
+        candidates = []
+        source_by_path = {}
+        for source in resolve_sources(conn):
+            if not source.usable:
+                continue
+            for path in source.sessions_dir.rglob('rollout-*.jsonl'):
+                resolved = str(path.resolve())
+                source_by_path[resolved] = source
+                try:
+                    stat = path.stat()
+                except OSError:
+                    continue
+                prior = conn.execute(
+                    "SELECT size_bytes,mtime_ns FROM _codex_source_state WHERE source_path=?",
+                    (resolved,),
+                ).fetchone()
+                if prior != (stat.st_size, stat.st_mtime_ns):
+                    candidates.append((resolved, resolved))
+        batch = fair_batch(conn, 'codex', candidates, limit)
+        if batch:
+            conn.commit()
+        changed = 0
+        for _, resolved in batch:
+            source = source_by_path[resolved]
+            changed += sync_rollout_path(
+                conn, Path(resolved), state_db=source.state_db,
+                source_meta={
+                    'source_kind': source.source_kind,
+                    'codex_home': str(source.codex_home),
+                    'sessions_dir': str(source.sessions_dir),
+                    'state_db': str(source.state_db),
+                    'rollout_path': resolved,
+                },
+            )
+        embedded = _batch_embed_chunks(
+            conn, batch_size=64, quiet=True, max_chunks=embed_limit,
+        )
+        stats['indexed'] += changed
+        stats['embedded'] += embedded
+        stats['skipped'] += max(0, len(batch) - changed)
+        if changed or embedded:
+            update_refresh_status(cell['name'], 'ok')
+        conn.close()
+    return stats
 
 
 # Back-compat alias — earlier callers (and the smoke tests) used _load_titles

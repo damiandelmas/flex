@@ -112,6 +112,17 @@ def _pass_file(conn, dry_run=False, limit=0):
     if dry_run:
         return
 
+    # Lazy import — claude_code.compile.worker imports this module (heal),
+    # so importing worker at module load time here would be circular. By
+    # call time both modules are fully loaded, so a function-scoped import
+    # is safe. Cells with no claude_code module installed simply skip the
+    # rollup refresh; the next enrichment cycle's rebuild_chunk_rollup()
+    # picks up the edge either way.
+    try:
+        from flex.modules.claude_code.compile.worker import _upsert_chunk_rollup
+    except ImportError:
+        _upsert_chunk_rollup = None
+
     resolved = unresolvable = 0
     for chunk_id, target_file in gaps:
         try:
@@ -122,6 +133,12 @@ def _pass_file(conn, dry_run=False, limit=0):
                     (chunk_id, file_uuid)
                 )
                 resolved += 1
+                if _upsert_chunk_rollup:
+                    # _upsert_chunk_rollup already narrows/logs its own
+                    # sqlite3.OperationalError internally — it never raises
+                    # for the expected missing-table case, so no wrapping
+                    # try/except needed here.
+                    _upsert_chunk_rollup(conn, chunk_id)
             else:
                 unresolvable += 1
         except Exception:

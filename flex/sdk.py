@@ -28,7 +28,6 @@ from pathlib import Path
 from typing import Optional
 
 from flex.core import open_cell, set_meta, get_meta, log_op, validate_cell
-from flex.onnx.embed import STORE_DIM
 from flex.registry import CELLS_DIR, register_cell as _register_cell, resolve_cell
 from flex.views import regenerate_views, install_views
 
@@ -89,6 +88,12 @@ CREATE TABLE IF NOT EXISTS _raw_sources (
     created_at  INTEGER DEFAULT (strftime('%s','now'))
 );
 
+-- Deliberately NOT the flex.compile.edges_schema shared DDL: this table
+-- predates it, already carries a real key (PRIMARY KEY(chunk_id) — stricter
+-- than the module tables' UNIQUE(chunk_id, source_id), since the generic
+-- SDK contract is one source per chunk), and lacks the source_type/position
+-- columns those modules use. Swapping in the shared shape would weaken
+-- this constraint, not fix a bug, so it's left as-is.
 CREATE TABLE IF NOT EXISTS _edges_source (
     chunk_id    TEXT NOT NULL,
     source_id   TEXT NOT NULL,
@@ -288,8 +293,9 @@ def create(
     set_meta(db, 'description', description)
     set_meta(db, 'cell_type', cell_type or name)
     set_meta(db, 'created_at', datetime.now(timezone.utc).isoformat())
-    set_meta(db, 'embedding_model', 'nomic-embed-text-v1.5')
-    set_meta(db, 'embedding_dim', str(STORE_DIM))
+    # The embedding contract is stamped by embed_new() when the first vectors
+    # are actually produced. A structural or not-yet-embedded cell must not
+    # claim a model space it does not contain.
 
     _cell_meta[id(db)] = {'path': str(db_path), 'name': name}
 

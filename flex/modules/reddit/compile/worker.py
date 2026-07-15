@@ -24,7 +24,9 @@ from pathlib import Path
 from datetime import datetime, timezone
 
 from flex.core import open_cell, get_meta, set_meta, validate_cell, log_op
+from flex.compile.edges_schema import edges_source_ddl
 from flex.modules.reddit.compile.scope import should_skip_post, should_skip_comment
+from flex.manage.chunk_type import upsert_chunk_type
 
 
 # ═════════════════════════════════════════════════════
@@ -79,7 +81,8 @@ def build_graph_where(db) -> str:
 # SCHEMA DDL
 # ═════════════════════════════════════════════════════
 
-SCHEMA_DDL = """
+SCHEMA_DDL = f"""
+{edges_source_ddl('reddit')}
 -- RAW LAYER
 CREATE TABLE IF NOT EXISTS _raw_chunks (
     id TEXT PRIMARY KEY,
@@ -100,16 +103,6 @@ CREATE TABLE IF NOT EXISTS _raw_sources (
     url TEXT,
     embedding BLOB
 );
-
--- EDGE LAYER
-CREATE TABLE IF NOT EXISTS _edges_source (
-    chunk_id TEXT NOT NULL,
-    source_id TEXT NOT NULL,
-    source_type TEXT DEFAULT 'reddit',
-    position INTEGER
-);
-CREATE INDEX IF NOT EXISTS idx_es_chunk ON _edges_source(chunk_id);
-CREATE INDEX IF NOT EXISTS idx_es_source ON _edges_source(source_id);
 
 -- TYPES LAYER (reddit-specific metadata per chunk)
 CREATE TABLE IF NOT EXISTS _types_reddit (
@@ -281,6 +274,7 @@ def ingest(threads, db, subreddit):
             (chunk_id, post_type, author, subreddit, score, parent_id, depth, permalink)
             VALUES (?, 'post', ?, ?, ?, NULL, 0, ?)
         """, (chunk_id, author, subreddit, score, post.get('permalink', '')))
+        upsert_chunk_type(db, chunk_id, 'post')
 
         total_chunks += 1
 
@@ -318,6 +312,7 @@ def ingest(threads, db, subreddit):
                 VALUES (?, 'comment', ?, ?, ?, ?, ?, ?)
             """, (c_chunk_id, c_author, subreddit, c_score,
                   c_parent, c_depth, c_permalink))
+            upsert_chunk_type(db, c_chunk_id, 'comment')
 
             total_chunks += 1
 
@@ -401,6 +396,12 @@ def main():
     if not args.append:
         db.executescript(SCHEMA_DDL)
         print("  Schema created.")
+
+    # Table/index/trigger for _enrich_chunk_type — unconditional (not
+    # gated on args.append) so an append-mode ingest against a cell built
+    # before this fix also gets the guard.
+    from flex.manage.chunk_type import ensure_chunk_type_schema
+    ensure_chunk_type_schema(db)
 
     # Write scope defaults to _meta (the lever). Non-destructive — keeps
     # existing values if a user has already tuned them.

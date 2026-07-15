@@ -71,6 +71,7 @@ def compile_vault(
     description: str | None = None,
     exclude: list[str] | None = None,
     profile=None,
+    embed_vectors: bool = True,
 ) -> 'sqlite3.Connection':
     """Compile a markdown vault into a queryable flex cell.
 
@@ -90,6 +91,9 @@ def compile_vault(
     Returns:
         Open sqlite3.Connection. Cell is registered and MCP-queryable.
     """
+    from flex.modules.markdown.compile.profile import markdown_profile, obsidian_profile
+    profile = profile or (obsidian_profile() if cell_type == 'obsidian' else markdown_profile())
+    cell_type = profile.cell_type
     root = Path(root).resolve()
     entries = list(walk_vault(root, exclude=exclude))
 
@@ -101,6 +105,13 @@ def compile_vault(
     print(f"  {len(entries)} markdown files found")
 
     db = create(name, desc, cell_type=cell_type, schema=SCHEMA_DDL)
+    db.execute("INSERT OR REPLACE INTO _meta (key,value) VALUES ('profile',?)",
+               (profile.cell_type,))
+    db.execute("INSERT OR REPLACE INTO _meta (key,value) VALUES ('cell_type',?)",
+               (profile.cell_type,))
+    db.execute("INSERT OR REPLACE INTO _meta (key,value) VALUES ('embed',?)",
+               ('true' if embed_vectors else 'false',))
+    db.commit()
 
     t0 = time.time()
     total_chunks = 0
@@ -277,18 +288,19 @@ def compile_vault(
         print(f"  Wikilinks: {resolved} resolved, {unresolved} unresolved")
 
     # ── Embed ─────────────────────────────────────────────────────────
-    print("  Embedding...")
-    try:
-        embed(db)
-    except RuntimeError as e:
-        if 'model not found' in str(e).lower() or 'embedding model' in str(e).lower():
-            print(
-                f"  [warning] Embedding model not found. Run 'flex init' first.\n"
-                f"  Cell created with {total_chunks} chunks (unembedded).",
-                file=sys.stderr
-            )
-        else:
-            raise
+    if embed_vectors:
+        print("  Embedding...")
+        try:
+            embed(db)
+        except RuntimeError as e:
+            if 'model not found' in str(e).lower() or 'embedding model' in str(e).lower():
+                print(
+                    f"  [warning] Embedding model not found. Run 'flex init' first.\n"
+                    f"  Cell created with {total_chunks} chunks (unembedded).",
+                    file=sys.stderr
+                )
+            else:
+                raise
 
     # ── Combined Graph ────────────────────────────────────────────────
     print("  Building graph...")
@@ -304,9 +316,8 @@ def compile_vault(
 
     # ── Register with curated views + presets ─────────────────────────
     print("  Registering...")
-    stock_dir = Path(__file__).resolve().parent.parent / 'stock'
-    views_dir = stock_dir / 'views' if (stock_dir / 'views').exists() else None
-    presets_dirs = [stock_dir / 'presets'] if (stock_dir / 'presets').exists() else None
+    views_dir = profile.views_dir
+    presets_dirs = list(profile.presets_dirs)
 
     register(db, name, desc, cell_type=cell_type,
              views_dir=views_dir,

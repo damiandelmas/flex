@@ -1,6 +1,6 @@
 # Hacker News Cell Instructions
 
-Public HN stories and comments via Algolia HN Search API. No credentials.
+Public HN stories and comments via the no-auth Algolia HN Search API. No credentials.
 Coverage is bounded by queries and date range set at init.
 
 ```bash

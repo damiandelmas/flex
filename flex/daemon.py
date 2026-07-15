@@ -144,6 +144,52 @@ def _build_claude_watcher():
     return queue, watcher, config
 
 
+def _build_local_watchers():
+    """Build one observer per declared local root, sharing one bounded queue."""
+    from flex.registry import list_cells
+    from flex.watch import (
+        InvalidationQueue, WatchRegistration, WatcherSet,
+        load_watch_config, registrations_for_cells,
+    )
+
+    config = load_watch_config()
+    if config.disabled:
+        return None, None, config
+    registrations = registrations_for_cells(list_cells())
+
+    # Claude's legacy registry row may not carry lifecycle/watch_path even though
+    # its source authority is known. Preserve that first-party registration while
+    # the registry metadata converges.
+    try:
+        from flex.modules.claude_code.compile.worker import CLAUDE_PROJECTS
+        root = CLAUDE_PROJECTS.resolve()
+        if root.is_dir() and not any(
+            r.cell_name == "claude_code" and r.root == root for r in registrations
+        ):
+            registrations.append(WatchRegistration(
+                "claude_code", root, "**/*.jsonl", recursive=True,
+            ))
+    except (ImportError, OSError):
+        pass
+
+    if not registrations:
+        print("[flex-daemon] No local watch roots — polling fallback", file=sys.stderr)
+        return None, None, config
+    queue = InvalidationQueue(
+        quiet_window=config.quiet_window,
+        max_latency=config.max_latency,
+        max_size=config.queue_max,
+    )
+    watchers = WatcherSet(registrations, queue)
+    watchers.start()
+    print(
+        f"[flex-daemon] Filesystem events enabled for {len(registrations)} roots "
+        f"(backend={watchers.backend or 'degraded'})",
+        file=sys.stderr,
+    )
+    return queue, watchers, config
+
+
 def main():
     _load_secrets()
     from flex.registry import load_plugins
@@ -202,7 +248,7 @@ def main():
     # Phase 1 filesystem observer (Claude Code JSONLs only). Built before the
     # worker loop starts; stopped/joined on every exit path below, including
     # a signal-driven shutdown.
-    queue, watcher, _watch_config = _build_claude_watcher()
+    queue, watcher, _watch_config = _build_local_watchers()
 
     def _shutdown_watcher(signum=None, frame=None):
         if watcher is not None:

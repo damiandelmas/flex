@@ -25,6 +25,34 @@ def regenerate_views(db: sqlite3.Connection, views: dict = None):
         views: Dict of {name: level} where level is 'chunk' or 'source'.
                If None, re-creates existing views by inspecting sqlite_master.
     """
+    # Health defects are part of the self-describing cell substrate. Keeping
+    # this table at the schema-healing boundary lets old cells adopt newer
+    # validators without making read-only orientation presets conditional.
+    db.execute("""
+        CREATE TABLE IF NOT EXISTS _health_defects (
+            kind TEXT NOT NULL,
+            subject_id TEXT NOT NULL,
+            observed_value TEXT,
+            detail TEXT,
+            PRIMARY KEY (kind, subject_id)
+        )
+    """)
+    # _edges_tree is a base SDK edge, not a docpac extension. Older fixtures
+    # and pre-SDK cells may lack it; an empty table means a flat hierarchy and
+    # keeps depth-aware views valid without inventing rows.
+    db.executescript("""
+        CREATE TABLE IF NOT EXISTS _edges_tree (
+            id TEXT NOT NULL,
+            parent_id TEXT,
+            branch_at TEXT,
+            relation TEXT NOT NULL,
+            depth INTEGER DEFAULT 0,
+            PRIMARY KEY (id, parent_id)
+        );
+        CREATE INDEX IF NOT EXISTS idx_tree_parent ON _edges_tree(parent_id);
+        CREATE INDEX IF NOT EXISTS idx_tree_relation ON _edges_tree(relation);
+    """)
+
     all_tables = (
         _discover_tables(db, '_edges_%') +
         _discover_tables(db, '_types_%') +
@@ -492,6 +520,145 @@ def parse_view_file(path: Path) -> tuple[str, str, str]:
     return name, description, content
 
 
+def _ensure_chunk_rollup_fresh(db: sqlite3.Connection) -> None:
+    """Self-heal _enrich_chunk_rollup before a (re)installed view can read it.
+
+    The claude_code/coding-agent chunks/messages views PK-probe
+    _enrich_chunk_rollup instead of an inline aggregate subquery (perf fix —
+    see flex.modules.claude_code.manage.chunk_rollup). Every known producer
+    of that table (rebuild_all.py, enrichment.py, worker.py's daemon cycle,
+    ingest-time upserts) keeps it fresh in the paths this module knows
+    about — but install_views() is called from many places (install
+    pipelines, `flex sync`, manual reinstalls, possibly future callers) and
+    is the one choke point every one of them shares before a view goes
+    live. Called unconditionally here so no caller can bypass it by
+    forgetting to also call rebuild_chunk_rollup.
+
+    No-op (cheap) for cells that were never claude_code-shaped: creates at
+    most one small empty table and returns.
+
+    Deliberately narrow scope — this guards against the OUTAGE case
+    (table missing, empty, or on the old pre-type/ext schema — full
+    rebuild_chunk_rollup()) plus a one-time PARTIAL-gap heal (individual
+    chunks missing a rollup row — heal_missing_rollup_rows()), not
+    ongoing staleness. One thing that looks tempting but is NOT done here:
+
+    Comparing rollup row count against edge-table row/chunk_id counts to
+    detect a PARTIAL rollup. Tried this — it doesn't work.
+    rebuild_chunk_rollup() populates through a join against _raw_chunks,
+    which correctly drops edge rows that can't join (orphaned
+    _edges_file_identity rows referencing a chunk_id no longer in
+    _raw_chunks; _edges_delegations rows with a NULL chunk_id). Real
+    production cells have exactly such rows — a raw edge-table count and
+    the rollup's count can legitimately and permanently differ by a
+    handful of harmless orphan rows. Comparing raw counts makes
+    install_views() see "stale" on every single call, forever, and pay a
+    full rebuild every time instead of the cheap no-op this is
+    supposed to be. heal_missing_rollup_rows() sidesteps this entirely by
+    checking the actual invariant (LEFT JOIN _raw_chunks -> rollup, WHERE
+    NULL) instead of comparing counts — orphans on the rollup side are
+    invisible to a LEFT JOIN driven from _raw_chunks, so they can never
+    trip it. It's gated behind a _meta flag so it only runs once per cell:
+    after the AFTER INSERT trigger on _raw_chunks (see chunk_rollup.py) is
+    in place, new gaps can't occur, so there's nothing to re-check.
+    Ongoing routine freshness of file_uuids/child_session_id/agent_type
+    (which the trigger does NOT populate — only ingest-time upserts and
+    the periodic rebuild do) is still owned by
+    worker.py::_run_enrichment_cycle (step 9.5), which rebuilds
+    unconditionally every ~30 min.
+
+    Schema note: since the type/ext computed-column fix, EVERY row of
+    _raw_chunks gets a rollup row (not just edge-bearing ones — type/ext
+    must be a real materialized value for every chunk for the index on
+    `type` to be usable). So the outage check below is keyed off
+    _raw_chunks directly rather than the edge tables — it also covers
+    codex-shaped cells, which share this same table/view via
+    insert_chunk_atom.
+    """
+    # Always ensure the table (CURRENT 6-column schema), its type index,
+    # and the default-row trigger exist — CREATE VIEW succeeds even if a
+    # referenced table doesn't, so without this a view installed ahead of
+    # _ensure_core_tables would only fail later, at first SELECT, with a
+    # confusing "no such table" instead of self-healing here. Shared with
+    # worker.py::_ensure_core_tables so there is exactly one definition of
+    # this schema (table + index + trigger) — see chunk_rollup.py.
+    from flex.modules.claude_code.manage.chunk_rollup import (
+        ensure_rollup_schema, heal_missing_rollup_rows,
+    )
+    # SHAPE GATE — must come BEFORE ensure_rollup_schema(). Every cell has
+    # _raw_chunks, so that is not a discriminator. Only session-shaped cells
+    # (claude_code/codex — the ones whose views PK-probe this table) may get
+    # the rollup schema. Without this gate, ensure_rollup_schema() creates the
+    # table AND its AFTER INSERT trigger on EVERY cell,
+    # the rebuild below then fails on the missing _edges_* tables and is
+    # swallowed by install_views()'s bare `except OperationalError: pass` — but
+    # the trigger survives, so every future ingest into a social cell silently
+    # leaks a junk row into a table no view or code path ever reads.
+    # (The docstring's old "creates at most one small empty table" stopped
+    # being true the moment the schema grew a trigger.)
+    is_session_shaped = db.execute(
+        "SELECT 1 FROM sqlite_master WHERE type='table' AND name='_types_message'"
+    ).fetchone() is not None
+    if not is_session_shaped:
+        return  # social/catalog/etc — no rollup view, no rollup schema
+
+    cols_before = {r[1] for r in db.execute(
+        "PRAGMA table_info(_enrich_chunk_rollup)").fetchall()}
+    needs_migration = bool(cols_before) and not {'type', 'ext'} <= cols_before
+    ensure_rollup_schema(db)  # creates table/migrates columns/index/trigger
+    db.commit()
+
+    has_raw_chunks = db.execute(
+        "SELECT name FROM sqlite_master WHERE type='table' AND name='_raw_chunks'"
+    ).fetchone() is not None
+    if not has_raw_chunks:
+        return  # not a claude_code/codex-shaped cell — nothing to roll up
+
+    has_rows = db.execute("SELECT 1 FROM _raw_chunks LIMIT 1").fetchone() is not None
+    if not has_rows:
+        return  # empty cell — rollup is correctly empty too
+
+    rollup_empty = db.execute(
+        "SELECT 1 FROM _enrich_chunk_rollup LIMIT 1"
+    ).fetchone() is None
+
+    if needs_migration or rollup_empty:
+        try:
+            from flex.modules.claude_code.manage.chunk_rollup import rebuild_chunk_rollup
+            rebuild_chunk_rollup(db)
+        except ImportError:
+            pass
+        return
+
+    # Outage cases are handled above. What's left is the PARTIAL-gap case:
+    # a handful of chunks with no rollup row at all — pre-trigger history,
+    # a bulk backfill that used raw INSERTs before this trigger existed,
+    # etc. Heal it with the exact invariant (LEFT JOIN ... WHERE
+    # cr.chunk_id IS NULL), never a count comparison — see
+    # heal_missing_rollup_rows' docstring for why a count-based version of
+    # this check is permanently wrong (orphaned rollup rows for deleted
+    # chunks make raw counts diverge forever). Gated on a _meta flag so
+    # install_views stays the ~0ms no-op it's supposed to be on every call
+    # after the first — the AFTER INSERT trigger (see chunk_rollup.py)
+    # means new gaps can't occur going forward, so there's nothing to
+    # re-check on subsequent calls.
+    db.execute("""CREATE TABLE IF NOT EXISTS _meta (
+        key TEXT PRIMARY KEY, value TEXT
+    )""")
+    already_healed = db.execute(
+        "SELECT 1 FROM _meta WHERE key = 'rollup_healed_v1'"
+    ).fetchone() is not None
+    if already_healed:
+        return
+
+    healed = heal_missing_rollup_rows(db)
+    db.execute(
+        "INSERT OR REPLACE INTO _meta (key, value) VALUES ('rollup_healed_v1', ?)",
+        (str(healed),)
+    )
+    db.commit()
+
+
 def install_views(db: sqlite3.Connection, view_dir: Path):
     """Read .sql files, execute CREATE VIEW, write metadata to _views."""
     db.execute("""CREATE TABLE IF NOT EXISTS _views (
@@ -500,6 +667,24 @@ def install_views(db: sqlite3.Connection, view_dir: Path):
         description TEXT,
         created_at INTEGER
     )""")
+
+    # Rebuild the rollup (if stale/empty/missing) BEFORE any view goes live,
+    # so there is no window where a freshly (re)installed chunks/messages
+    # view reads an empty rollup and silently returns NULL for the whole
+    # historical backlog.
+    try:
+        _ensure_chunk_rollup_fresh(db)
+    except sqlite3.OperationalError:
+        pass
+
+    # Same self-heal, for the social-module `_enrich_chunk_type` rollup
+    # (see flex.manage.chunk_type) — no-op on cells without a supported
+    # social-module type sidecar.
+    try:
+        from flex.manage.chunk_type import ensure_chunk_type_fresh
+        ensure_chunk_type_fresh(db)
+    except sqlite3.OperationalError:
+        pass
 
     installed = []
     for sql_file in sorted(view_dir.glob('*.sql')):

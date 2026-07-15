@@ -33,7 +33,7 @@ FLEX_ROOT = Path(__file__).resolve().parent.parent.parent.parent.parent
 
 from flex.modules.docpac.compile.docpac import parse_docpac
 from flex.modules.docpac.compile.classify import (
-    derive_temporal, load_sidecar, apply_sidecar_overrides,
+    derive_temporal, load_sidecar, apply_sidecar_overrides, record_file_date_health,
 )
 from flex.modules.markdown.compile.profile import docpac_profile
 from flex.modules.docpac.compile.context_config import load_context_config
@@ -41,13 +41,15 @@ from flex.compile.markdown import normalize_headers, extract_frontmatter, split_
 from flex.sdk import link
 from flex.core import open_cell, set_meta, run_sql, validate_cell
 from flex.views import regenerate_views
+from flex.compile.edges_schema import edges_source_ddl
 
 
 # ═════════════════════════════════════════════════
 # SCHEMA DDL
 # ═════════════════════════════════════════════════
 
-SCHEMA_DDL = """
+SCHEMA_DDL = f"""
+{edges_source_ddl('markdown')}
 -- RAW LAYER (immutable, COMPILE writes here)
 CREATE TABLE IF NOT EXISTS _raw_chunks (
     id TEXT PRIMARY KEY,
@@ -74,16 +76,6 @@ CREATE TABLE IF NOT EXISTS _raw_sources (
     embedding BLOB,
     content_hash TEXT
 );
-
--- EDGE LAYER
-CREATE TABLE IF NOT EXISTS _edges_source (
-    chunk_id TEXT NOT NULL,
-    source_id TEXT NOT NULL,
-    source_type TEXT DEFAULT 'markdown',
-    position INTEGER
-);
-CREATE INDEX IF NOT EXISTS idx_es_chunk ON _edges_source(chunk_id);
-CREATE INDEX IF NOT EXISTS idx_es_source ON _edges_source(source_id);
 
 -- CONTAINMENT TREE (heading hierarchy: section ⊃ subsection)
 CREATE TABLE IF NOT EXISTS _edges_tree (
@@ -141,6 +133,11 @@ CREATE TABLE IF NOT EXISTS _presets (
 CREATE TABLE IF NOT EXISTS _meta (
     key TEXT PRIMARY KEY,
     value TEXT
+);
+
+CREATE TABLE IF NOT EXISTS _health_defects (
+    kind TEXT NOT NULL, subject_id TEXT NOT NULL, observed_value TEXT, detail TEXT,
+    PRIMARY KEY (kind, subject_id)
 );
 
 CREATE VIRTUAL TABLE IF NOT EXISTS chunks_fts USING fts5(
@@ -449,6 +446,11 @@ def main():
         # (mutating entry so classify_chunk sees the merged temporal/doc_type)
         # and returns the _raw_sources typed columns.
         src = _docpac_prof.classify_source(entry, frontmatter)
+        # A filename-derived date is data, not merely display text. Reject
+        # malformed/future tokens at the write boundary and leave a durable,
+        # queryable receipt instead of allowing bogus chronology into views.
+        src['file_date'] = record_file_date_health(
+            db, source_id, src.get('file_date'))
 
         # Declarative split strategy (profile-as-data): resolve_chunker picks the split
         # from context_cfg['chunking'] + the .flexchunk.json cascade; no chunking block
@@ -577,6 +579,8 @@ def main():
         f"~{source_count} docs, ~{chunk_count} chunks."
     )
     set_meta(db, 'description', desc)
+    set_meta(db, 'profile', 'docpac')
+    set_meta(db, 'cell_type', 'docpac')
     set_meta(db, 'version', '2.0.0')
     set_meta(db, 'schema', 'chunk-atom')
 

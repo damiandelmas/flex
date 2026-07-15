@@ -141,6 +141,23 @@ def obsidian_profile() -> IngestProfile:
     )
 
 
+def profile_name_for_cell(cell: dict) -> str:
+    """Resolve the durable profile declaration, with registry type as fallback."""
+    declared = None
+    path = cell.get('path')
+    if path:
+        try:
+            import sqlite3
+            uri = f"file:{Path(path).resolve()}?mode=ro"
+            conn = sqlite3.connect(uri, uri=True, timeout=2)
+            row = conn.execute("SELECT value FROM _meta WHERE key='profile'").fetchone()
+            conn.close()
+            declared = row[0] if row and row[0] else None
+        except (OSError, sqlite3.Error):
+            pass
+    return declared or cell.get('cell_type') or 'markdown'
+
+
 # ════════════════════════════════════════════════════════════════════
 # docpac — the temporal/doc_type flavor (parity-gated)
 # ════════════════════════════════════════════════════════════════════

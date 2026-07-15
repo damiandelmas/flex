@@ -1,6 +1,7 @@
 """Incremental worker for markdown vaults. Stat-scan with content hash fast-skip."""
 
 import hashlib
+import os
 import sys
 import time
 from pathlib import Path
@@ -20,8 +21,8 @@ from flex.modules.markdown.compile.wikilinks import (
     extract_raw_wikilinks, resolve_all_wikilinks,
 )
 
-# Module-level size cache, persisted across daemon ticks
-_size_cache: dict[str, dict[str, int]] = {}  # {cell_name: {rel_path: size}}
+# Module-level stat-signature cache, persisted across daemon ticks
+_size_cache: dict[str, dict[str, str]] = {}  # {cell_name: {rel_path: size:mtime_ns}}
 _hash_cache: dict[str, dict[str, str]] = {}  # {cell_name: {rel_path: sha256}}
 _change_counts: dict[str, int] = {}           # {cell_name: changes since last graph}
 
@@ -218,8 +219,10 @@ def scan_markdown_cells(embed_fn=None) -> dict:
 
     # Find markdown/obsidian cells with lifecycle='watch'
     watched = discover_watched()
+    from flex.modules.markdown.compile.profile import profile_name_for_cell
     md_cells = [c for c in watched
-                if c.get('cell_type') in ('markdown', 'obsidian')
+                if c.get('cell_type') in ('markdown', 'obsidian', 'docpac')
+                and profile_name_for_cell(c) in ('markdown', 'obsidian')
                 and c.get('watch_path')]
 
     for cell in md_cells:
@@ -246,7 +249,7 @@ def scan_markdown_cells(embed_fn=None) -> dict:
         # First tick: populate cache only, don't treat everything as new
         if first_tick:
             for entry in entries:
-                sizes[entry.rel_path] = entry.size
+                sizes[entry.rel_path] = f"{entry.size}:{entry.path.stat().st_mtime_ns}"
             db.close()
             continue
 
@@ -257,18 +260,17 @@ def scan_markdown_cells(embed_fn=None) -> dict:
         # Detect changes
         for entry in entries:
             key = entry.rel_path
-            new_size = entry.size
+            signature = f"{entry.size}:{entry.path.stat().st_mtime_ns}"
 
             if key not in sizes:
-                files_added.append(entry)
-                sizes[key] = new_size
-            elif sizes[key] != new_size:
-                # Size changed — check content hash
+                files_added.append((entry, signature))
+            elif sizes[key] != signature:
+                # Stat changed — content hash avoids work for touch-only updates.
                 new_hash = _content_hash(entry.path)
                 if hashes.get(key) != new_hash:
-                    files_changed.append(entry)
-                    hashes[key] = new_hash
-                sizes[key] = new_size
+                    files_changed.append((entry, signature, new_hash))
+                else:
+                    sizes[key] = signature
 
         # Detect deletions
         for old_key in list(sizes.keys()):
@@ -281,13 +283,31 @@ def scan_markdown_cells(embed_fn=None) -> dict:
             db.close()
             continue
 
-        # Process changes
-        for entry in files_added + files_changed:
+        # Bound work per cell and persist the cursor so a large vault cannot
+        # repeatedly privilege its alphabetic prefix after daemon restarts.
+        from flex.watch import fair_batch
+        candidates = [
+            (entry.rel_path, ('added', entry, signature, None))
+            for entry, signature in files_added
+        ] + [
+            (entry.rel_path, ('changed', entry, signature, content_hash))
+            for entry, signature, content_hash in files_changed
+        ]
+        limit = max(1, int(os.environ.get('FLEX_DRAIN_FILES_PER_CELL', '200')))
+        selected = fair_batch(db, 'markdown', candidates, limit)
+        if selected:
+            db.commit()
+        selected_added = []
+        for _key, (kind, entry, signature, content_hash) in selected:
             if _index_file(db, entry):
                 stats['indexed'] += 1
                 _change_counts[cell_name] += 1
             else:
                 stats['skipped'] += 1
+            sizes[entry.rel_path] = signature
+            hashes[entry.rel_path] = content_hash or _content_hash(entry.path)
+            if kind == 'added':
+                selected_added.append(entry)
 
         # Cleanup deleted
         if files_removed:
@@ -295,7 +315,7 @@ def scan_markdown_cells(embed_fn=None) -> dict:
             _change_counts[cell_name] += removed
 
         # Re-resolve wikilinks if topology changed (dirty-set)
-        if files_added or files_removed:
+        if selected_added or files_removed:
             try:
                 # Re-read entries for resolution maps
                 entries_fresh = list(walk_vault(vault_root))

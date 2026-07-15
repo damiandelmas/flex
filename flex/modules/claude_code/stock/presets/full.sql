@@ -5,8 +5,10 @@
 WITH target AS (
     SELECT *
     FROM messages
-    WHERE id = :id OR id LIKE '%' || :id || '%'
-    ORDER BY CASE WHEN id = :id THEN 0 ELSE 1 END, length(id)
+    -- IDs returned by every retrieval surface are exact primary keys. Keeping
+    -- fuzzy-id recovery in this branch turned an exact lookup into a 900K-row
+    -- scan because SQLite had to satisfy the leading-wildcard OR.
+    WHERE id = :id
     LIMIT 1
 ),
 chunk_marker AS (

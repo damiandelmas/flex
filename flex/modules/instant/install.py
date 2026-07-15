@@ -89,7 +89,16 @@ CREATE TABLE IF NOT EXISTS _edges_import (
 CREATE INDEX IF NOT EXISTS _edges_import_module ON _edges_import(module);
 """
 
-_INSTANT_DDL = _FS_IDENTITY_DDL + _TYPES_DDL + _CALL_DDL
+_SOURCE_STATE_DDL = """
+CREATE TABLE IF NOT EXISTS _instant_source_state (
+    source_id    TEXT PRIMARY KEY,
+    content_hash TEXT NOT NULL,
+    size_bytes   INTEGER NOT NULL,
+    mtime_ns     INTEGER NOT NULL
+);
+"""
+
+_INSTANT_DDL = _FS_IDENTITY_DDL + _TYPES_DDL + _CALL_DDL + _SOURCE_STATE_DDL
 
 # Recursive query artifact (mirrors claude_code/stock/presets/delegation-tree.sql).
 # Dormant at depth-1 (no _edges_tree rows); the seat for multi-level containers.
@@ -155,8 +164,19 @@ def _slug(text: str) -> str:
     return slug or "fs"
 
 
-def _error(console, message: str) -> None:
+def _error(console, message: str, details: list[str] | None = None) -> None:
+    """Print the failure and EXIT NON-ZERO.
+
+    Exiting is the contract, not a nicety: the worker's watch runs regen as a
+    subprocess (`refresh.py`) and keys off its returncode. When this printed and
+    returned 0, a failed regen was indistinguishable from a successful one — the
+    watch then stamped the signature it had computed over an empty recipe, and the
+    cell was permanently marked fresh. Fail closed here so that can't recur.
+    """
     console.print(f"[red]instant:[/red] {message}")
+    for d in details or []:
+        console.print(f"    {d}")
+    raise SystemExit(1)
 
 
 def _load_selections(name: str) -> list[str]:
@@ -524,6 +544,90 @@ def _build_nodes(abs_path: str, text: str, mode: str) -> list[dict]:
     return _flat_nodes(abs_path, text)
 
 
+def _run_code_cell(args, console, *, name: str, desc: str,
+                   selections: list[str]) -> None:
+    """Build the one codegraph tier through the incremental per-file writer.
+
+    The CLI used to compile an eager ``instant --code`` schema while the daemon
+    maintained a different ``cell_type=code`` schema.  A codegraph now starts in
+    the same shape it will keep for its lifetime.
+    """
+    from datetime import datetime, timezone
+    from rich.panel import Panel
+    from rich.text import Text
+
+    from flex.core import set_meta
+    from flex.registry import FLEX_HOME, register_cell
+    from flex.sdk import create, register
+    from flex.modules.fs.compile.index_code import (
+        CODE_SCHEMA_DDL, _walk_code, index_file_code, install_code_presets,
+    )
+    from flex.modules.docpac.compile.init import _is_identity_excluded
+
+    files = sorted({str(p.resolve()) for root in selections
+                    for p in _walk_code(Path(root))})
+    if not files:
+        _error(console, "no indexable code in any selection — cell untouched")
+        return
+
+    cells_dir = FLEX_HOME / "cells" / "labs"
+    cells_dir.mkdir(parents=True, exist_ok=True)
+    db_path = cells_dir / f"{name}.db"
+    for stale in (db_path, db_path.with_suffix(".db-wal"),
+                  db_path.with_suffix(".db-shm")):
+        if stale.exists():
+            stale.unlink()
+
+    db = create(name, desc, cell_type="code", db_path=db_path,
+                schema=CODE_SCHEMA_DDL)
+    set_meta(db, "selections", json.dumps(selections))
+    set_meta(db, "chunking", json.dumps({"split_mode": "nest", "code": True}))
+    set_meta(db, "resolver", "code_graph@v1")
+    set_meta(db, "profile", "code")
+    db.commit()  # recipe survives an interrupted compile
+
+    identity = None
+    try:
+        from flex.modules.soma.lib.identity.file_identity.identity import get_instance
+        identity = get_instance()
+    except Exception:
+        pass
+
+    indexed = 0
+    for file_path in files:
+        file_id = file_path
+        if identity is not None and not _is_identity_excluded(file_path):
+            try:
+                file_id = identity.assign(file_path)
+            except Exception:
+                pass
+        if index_file_code(db, file_path, file_id=file_id):
+            indexed += 1
+
+    set_meta(db, "compiled_at", datetime.now(timezone.utc).isoformat())
+    register(db, name, desc, cell_type="code")
+    install_code_presets(db)  # wins over the general orient installed above
+    db.commit()
+
+    lifecycle = "static" if getattr(args, "no_watch", False) else "watch"
+    register_cell(
+        name, str(db_path), cell_type="code", description=desc,
+        corpus_path=selections[0], unlisted=True, lifecycle=lifecycle,
+        refresh_module=None, watch_path=selections[0], watch_pattern="**/*",
+    )
+    db.close()
+
+    panel = Text()
+    panel.append("Codegraph cell compiled.\n\n", style="cyan")
+    panel.append("Cell        ").append(f"{name}\n", style="green")
+    panel.append("Selections  ").append(f"{len(selections)}\n", style="green")
+    panel.append("Compiled    ").append(
+        f"{indexed} files through the incremental code writer\n", style="green")
+    panel.append("Mode        ").append(
+        "no embeddings · per-file refresh · explicit graph ambiguity\n", style="yellow")
+    console.print(Panel(panel, padding=(1, 2), highlight=False))
+
+
 def run(args, console) -> None:
     """Compile the union of selections into one unlisted, no-embed cell (v5)."""
     from datetime import datetime, timezone
@@ -572,16 +676,21 @@ def run(args, console) -> None:
 
     if not selections:
         _error(console, "no selections — use --path FOLDER (or --regen NAME)")
-        return
     missing = [s for s in selections if not Path(s).is_dir()]
     if missing:
-        _error(console, "selection folder(s) missing — recipe NOT modified, cell untouched:")
-        for s in missing:
-            console.print(f"    {s}")
-        return
+        _error(console, "selection folder(s) missing — recipe NOT modified, cell untouched:",
+               missing)
 
     desc = (getattr(args, "description", None)
             or f"{name} — instant projection of {len(selections)} selection(s)")
+
+    if code:
+        return _run_code_cell(
+            args, console, name=name,
+            desc=(getattr(args, "description", None)
+                  or f"{name} — incremental codegraph of {len(selections)} selection(s)"),
+            selections=selections,
+        )
 
     # ── union walk, dedup by absolute path (first selection to claim a file wins) ──
     by_file: dict[str, list] = {}
@@ -627,6 +736,21 @@ def run(args, console) -> None:
 
     db = create(name, desc, cell_type="instant", db_path=db_path, schema=_INSTANT_DDL)
 
+    # ── recipe stamp: BEFORE the compile, not after ──
+    # A regen wipes the old cell (`stale.unlink()`) and rebuilds. Stamping the recipe
+    # afterwards meant any interruption mid-compile left a cell that no longer knew
+    # what it was built FROM — an unrecoverable, unretryable state that then froze the
+    # watch permanently. The recipe is fully resolved by here; write and COMMIT it first
+    # so a killed build is merely incomplete, never amnesiac. Moving the writes without
+    # this commit would not cross the crash boundary: SQLite would roll them back.
+    # `compiled_at` stays at the end as the completion receipt (recipe without it = partial).
+    set_meta(db, "selections", json.dumps(selections))
+    _split_mode = "config" if config_mode else ("nest" if nest else "flat")
+    set_meta(db, "chunking", json.dumps({"split_mode": _split_mode, "code": bool(code)}))
+    set_meta(db, "resolver", "node_tree@v1")
+    set_meta(db, "profile", "instant")
+    db.commit()
+
     for abs_path, file_chunks in by_file.items():
         source(db, abs_path, Path(abs_path).name)
         if tree:
@@ -646,6 +770,20 @@ def run(args, console) -> None:
                 ch["container_id"] = abs_path
                 ch["content_hash"] = hashlib.sha256((ch.get("content") or "").encode("utf-8")).hexdigest()
             ingest(db, abs_path, file_chunks, types="_types_instant")
+
+        # Per-source refresh cursor. Unlike the aggregate watch signature, this
+        # identifies exactly which file changed, enabling incremental refresh.
+        try:
+            _p = Path(abs_path)
+            _st = _p.stat()
+            _hash = hashlib.sha256(_p.read_bytes()).hexdigest()
+            db.execute(
+                "INSERT OR REPLACE INTO _instant_source_state "
+                "(source_id,content_hash,size_bytes,mtime_ns) VALUES (?,?,?,?)",
+                (abs_path, _hash, _st.st_size, _st.st_mtime_ns),
+            )
+        except OSError:
+            pass
 
     # ── call graph (Python nest/config): resolve call sites vs the cell-wide symbol map ──
     if tree:  # only tree-mode nodes carry 'id'/'_calls'; flat chunks don't
@@ -759,12 +897,8 @@ def run(args, console) -> None:
             (_name, _desc, _params, _sql),
         )
 
-    # ── recipe stamp: the cell carries its own derivation ──
-    set_meta(db, "selections", json.dumps(selections))
-    _split_mode = "config" if config_mode else ("nest" if nest else "flat")
-    set_meta(db, "chunking", json.dumps({"split_mode": _split_mode, "code": bool(code)}))
-    set_meta(db, "resolver", "node_tree@v1")
-    set_meta(db, "profile", "instant")
+    # ── completion receipt: the recipe was stamped pre-compile (see above); this says
+    #    the compile actually FINISHED. recipe-without-compiled_at = a partial cell.
     set_meta(db, "compiled_at", datetime.now(timezone.utc).isoformat())
 
     # embed() and graph() are deliberately absent, permanently.

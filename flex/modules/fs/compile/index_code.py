@@ -93,8 +93,18 @@ CREATE TABLE IF NOT EXISTS _edges_fs_identity (
 );
 """
 
+_SOURCE_STATE_DDL = """
+CREATE TABLE IF NOT EXISTS _code_source_state (
+    source_id    TEXT PRIMARY KEY,
+    content_hash TEXT NOT NULL,
+    size_bytes   INTEGER NOT NULL,
+    mtime_ns     INTEGER NOT NULL
+);
+"""
+
 CODE_SCHEMA_DDL = (
     _TYPES_DDL + _CALL_DDL + _IMPORT_DDL + _SYMBOLS_DDL + _FS_IDENTITY_DDL
+    + _SOURCE_STATE_DDL
 )
 
 
@@ -103,8 +113,18 @@ CODE_SCHEMA_DDL = (
 # @callers symbol=X: who calls X. Already name-keyed in instant — no change:
 # _edges_call.callee_name = X → caller_id → its section_title.
 _CALLERS_SQL = (
-    "SELECT DISTINCT t.section_title AS caller, e.caller_id "
+    "WITH resolution AS ("
+    " SELECT name, COUNT(*) AS candidate_count FROM _symbols GROUP BY name"
+    ") "
+    "SELECT DISTINCT t.section_title AS caller, e.caller_id, "
+    "s.def_id AS candidate_def_id, ds.source_id AS candidate_file, "
+    "CASE WHEN COALESCE(r.candidate_count, 0)=0 THEN 'unresolved' "
+    "     WHEN r.candidate_count=1 THEN 'unique' ELSE 'ambiguous' END "
+    "AS resolution_state, COALESCE(r.candidate_count, 0) AS candidate_count "
     "FROM _edges_call e JOIN _types_instant t ON e.caller_id = t.chunk_id "
+    "LEFT JOIN resolution r ON r.name=e.callee_name "
+    "LEFT JOIN _symbols s ON s.name=e.callee_name "
+    "LEFT JOIN _edges_source ds ON ds.chunk_id=s.def_id "
     "WHERE e.callee_name = :symbol"
 )
 
@@ -112,17 +132,31 @@ _CALLERS_SQL = (
 # external/unresolved call still returns (callee_id NULL). Set-valued under
 # ambiguity (two files defining `run` → both def_ids) — owner-ratified.
 _CALLEES_SQL = (
-    "SELECT DISTINCT e.callee_name AS callee, s.def_id AS callee_id "
+    "WITH resolution AS ("
+    " SELECT name, COUNT(*) AS candidate_count FROM _symbols GROUP BY name"
+    ") "
+    "SELECT DISTINCT e.callee_name AS callee, s.def_id AS callee_id, "
+    "e.caller_id, cs.source_id AS caller_file, ds.source_id AS callee_file, "
+    "CASE WHEN COALESCE(r.candidate_count, 0)=0 THEN 'unresolved' "
+    "     WHEN r.candidate_count=1 THEN 'unique' ELSE 'ambiguous' END "
+    "AS resolution_state, COALESCE(r.candidate_count, 0) AS candidate_count "
     "FROM _edges_call e JOIN _types_instant t ON e.caller_id = t.chunk_id "
+    "JOIN _edges_source cs ON cs.chunk_id=e.caller_id "
+    "LEFT JOIN resolution r ON r.name=e.callee_name "
     "LEFT JOIN _symbols s ON s.name = e.callee_name "
-    "WHERE t.section_title = :symbol"
+    "LEFT JOIN _edges_source ds ON ds.chunk_id=s.def_id "
+    "WHERE t.section_title = :symbol "
+    "AND (:def_id='*' OR e.caller_id=:def_id) "
+    "AND (:file='*' OR cs.source_id=:file)"
 )
 
 # @impact symbol=X: transitive callers. Recursive CTE walks callee_name →
 # _symbols.def_id each hop (NOT a stored callee_id): from a symbol name, find its
 # def_ids, then any caller whose callee_name resolves to one of those defs, repeat.
 _IMPACT_SQL = (
-    "WITH RECURSIVE up(id) AS ("
+    "WITH RECURSIVE resolution(name, candidate_count) AS ("
+    "  SELECT name, COUNT(*) FROM _symbols GROUP BY name"
+    "), up(id) AS ("
     "  SELECT e.caller_id FROM _edges_call e WHERE e.callee_name = :symbol "
     "  UNION "
     "  SELECT e.caller_id FROM _edges_call e "
@@ -130,8 +164,18 @@ _IMPACT_SQL = (
     "  JOIN _types_instant t ON t.chunk_id = s.def_id "
     "  JOIN up ON up.id = s.def_id"
     ") "
-    "SELECT DISTINCT t.section_title AS affected "
-    "FROM up JOIN _types_instant t ON up.id = t.chunk_id"
+    "SELECT DISTINCT t.section_title AS affected, up.id AS affected_id, "
+    "es.source_id AS affected_file, "
+    "CASE WHEN COALESCE(ar.candidate_count,0)=0 THEN 'unresolved' "
+    "     WHEN ar.candidate_count=1 THEN 'unique' ELSE 'ambiguous' END "
+    "AS resolution_state, COALESCE(ar.candidate_count,0) AS candidate_count, "
+    "CASE WHEN COALESCE(rr.candidate_count,0)=0 THEN 'unresolved' "
+    "     WHEN rr.candidate_count=1 THEN 'unique' ELSE 'ambiguous' END "
+    "AS root_resolution_state, COALESCE(rr.candidate_count,0) AS root_candidate_count "
+    "FROM up JOIN _types_instant t ON up.id = t.chunk_id "
+    "JOIN _edges_source es ON es.chunk_id=up.id "
+    "LEFT JOIN resolution ar ON ar.name=t.section_title "
+    "LEFT JOIN resolution rr ON rr.name=:symbol"
 )
 
 _SUBTREE_PRESET_SQL = (
@@ -139,7 +183,12 @@ _SUBTREE_PRESET_SQL = (
     "SELECT id, depth FROM _edges_tree WHERE parent_id = :root "
     "UNION ALL "
     "SELECT e.id, e.depth FROM _edges_tree e JOIN sub ON e.parent_id = sub.id) "
-    "SELECT c.* FROM chunks c JOIN sub ON c.id = sub.id ORDER BY sub.depth, c.position"
+    "SELECT c.id, es.source_id, t.section_title, t.section_type, t.position, "
+    "t.depth, t.container_id, c.content "
+    "FROM sub JOIN _raw_chunks c ON c.id=sub.id "
+    "JOIN _types_instant t ON t.chunk_id=sub.id "
+    "JOIN _edges_source es ON es.chunk_id=sub.id "
+    "ORDER BY sub.depth, t.position"
 )
 
 _CODE_PRESETS = (
@@ -147,8 +196,9 @@ _CODE_PRESETS = (
      "root", _SUBTREE_PRESET_SQL),
     ("callers", "Who calls a symbol (call graph). @callers symbol=NAME",
      "symbol", _CALLERS_SQL),
-    ("callees", "What a symbol calls (late-bind via _symbols). @callees symbol=NAME",
-     "symbol", _CALLEES_SQL),
+    ("callees", "What a symbol definition calls; ambiguity is explicit. "
+     "Qualify with def_id or file. @callees symbol=NAME",
+     "symbol, def_id (default: *), file (default: *)", _CALLEES_SQL),
     ("impact", "Multi-hop callers — blast radius of a symbol. @impact symbol=NAME",
      "symbol", _IMPACT_SQL),
 )
@@ -278,6 +328,7 @@ def _delete_file_rows(conn: sqlite3.Connection, source_id: str, file_id: str,
     # until the next index. Reconcile-only avoids that (mirrors docpac's drop_source).
     if drop_identity:
         conn.execute("DELETE FROM _edges_fs_identity WHERE source_id = ?", (source_id,))
+    conn.execute("DELETE FROM _code_source_state WHERE source_id = ?", (source_id,))
 
 
 def _mint_file_identity(conn: sqlite3.Connection, source_id: str, file_path: str) -> bool:
@@ -370,6 +421,7 @@ def index_file_code(conn: sqlite3.Connection, file_path: str, *,
 
     try:
         text = p.read_text(encoding="utf-8", errors="ignore")
+        stat = p.stat()
     except Exception:
         return False
     if not text.strip():
@@ -380,6 +432,12 @@ def index_file_code(conn: sqlite3.Connection, file_path: str, *,
     # 1) content-hash skip (mirror docpac worker's per-file pattern).
     content_hash = hashlib.sha256(text.encode("utf-8")).hexdigest()
     if _stored_content_hash(conn, abs_path) == content_hash:
+        conn.execute(
+            "INSERT OR REPLACE INTO _code_source_state "
+            "(source_id,content_hash,size_bytes,mtime_ns) VALUES (?,?,?,?)",
+            (abs_path, content_hash, stat.st_size, stat.st_mtime_ns),
+        )
+        conn.commit()
         return False
 
     # 2) node tree for this file.
@@ -446,6 +504,12 @@ def index_file_code(conn: sqlite3.Connection, file_path: str, *,
         conn.executemany(
             "INSERT OR IGNORE INTO _edges_import (source_id, module, name) VALUES (?, ?, ?)",
             import_rows)
+
+    conn.execute(
+        "INSERT OR REPLACE INTO _code_source_state "
+        "(source_id,content_hash,size_bytes,mtime_ns) VALUES (?,?,?,?)",
+        (abs_path, content_hash, stat.st_size, stat.st_mtime_ns),
+    )
 
     conn.commit()
     return True
@@ -542,7 +606,7 @@ def scan_code_cells(size_cache: dict) -> dict:
     stats = {'indexed': 0, 'skipped': 0, 'deleted': 0}
     cells = [c for c in list_cells()
              if c.get('cell_type') == 'code' and c.get('corpus_path')
-             and c.get('lifecycle') == 'watch' and c.get('watch_path')
+             and c.get('lifecycle') == 'watch'
              and c.get('active', 1)]
     if not cells:
         return stats
@@ -558,6 +622,7 @@ def scan_code_cells(size_cache: dict) -> dict:
         if not _BASE_CELL_TABLES[0] in tables:   # not a created cell yet — skip
             conn.close()
             continue
+        _ensure_schema(conn)  # includes durable per-source state on upgraded cells
         # Self-heal the query surface (chunks view + @orient + nav presets) so
         # already-migrated code cells that shipped without it get fixed LIVE on the
         # next drain, not just fresh builds. Guarded → no-op once complete.
@@ -583,17 +648,37 @@ def scan_code_cells(size_cache: dict) -> dict:
 
         cell_indexed = 0
         on_disk_sids = set()
+        candidates = []
         for corpus in sel_dirs:
             for f in _walk_code(corpus, exclude):
                 abs_path = str(f.resolve())
                 on_disk_sids.add(abs_path)          # source_id = abs path (index_file_code's key)
                 key = str(f)
                 try:
-                    cur = f.stat().st_size
+                    stat = f.stat()
+                    signature = f"{stat.st_size}:{stat.st_mtime_ns}"
                 except OSError:
                     continue
-                if cur == size_cache.get(key, -1):
+                cache_key = f"code:{cell_name}:{key}"
+                if signature == size_cache.get(cache_key):
                     continue
+                if cache_key not in size_cache:
+                    stored = conn.execute(
+                        "SELECT size_bytes,mtime_ns FROM _code_source_state "
+                        "WHERE source_id=?", (abs_path,),
+                    ).fetchone()
+                    if stored and stored == (stat.st_size, stat.st_mtime_ns):
+                        size_cache[cache_key] = signature
+                        continue
+                candidates.append((abs_path, (f, corpus, signature, cache_key)))
+
+        from flex.watch import fair_batch
+        batch_limit = max(1, int(os.environ.get("FLEX_DRAIN_FILES_PER_CELL", "200")))
+        batch = fair_batch(conn, "code", candidates, batch_limit)
+        if batch:
+            conn.commit()  # cursor is a crash-safe fairness fact, not process memory
+        for _, (f, corpus, signature, cache_key) in batch:
+                abs_path = str(f.resolve())
                 try:
                     # Ephemeral corpora (/tmp,/var/tmp,/dev — soma exclude_paths) never mint,
                     # so fixture/test code cells don't pollute the shared ~/.soma authority.
@@ -603,7 +688,8 @@ def scan_code_cells(size_cache: dict) -> dict:
                         file_id = fid.assign(abs_path)
                     else:
                         file_id = abs_path
-                    if index_file_code(conn, key, file_id=file_id, corpus_root=str(corpus)):
+                    if index_file_code(conn, str(f), file_id=file_id,
+                                       corpus_root=str(corpus)):
                         stats['indexed'] += 1
                         cell_indexed += 1
                     else:
@@ -611,7 +697,7 @@ def scan_code_cells(size_cache: dict) -> dict:
                 except Exception as e:
                     print(f"[code] error on {f.name}: {e}", file=sys.stderr)
                     stats['skipped'] += 1
-                size_cache[key] = cur
+                size_cache[cache_key] = signature
 
         deleted = _reconcile_code_deletes(conn, on_disk_sids)
         stats['deleted'] += deleted

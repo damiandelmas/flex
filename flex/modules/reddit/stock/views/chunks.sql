@@ -8,7 +8,7 @@ SELECT
     r.content,
     r.timestamp,
     datetime(r.timestamp, 'unixepoch') AS created_at,
-    COALESCE(t.post_type, 'chunk') AS type,
+    ect.type AS type,
     s.source_id,
     s.position,
     src.title,
@@ -29,6 +29,7 @@ FROM _raw_chunks r
 LEFT JOIN _edges_source s ON r.id = s.chunk_id
 LEFT JOIN _raw_sources src ON s.source_id = src.source_id
 LEFT JOIN _types_reddit t ON r.id = t.chunk_id
+LEFT JOIN _enrich_chunk_type ect ON r.id = ect.chunk_id
 LEFT JOIN _enrich_source_graph g ON s.source_id = g.source_id
 WHERE (t.author IS NULL OR t.author NOT IN ('AutoModerator', '[deleted]'))
   AND (

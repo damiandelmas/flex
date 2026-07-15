@@ -8,7 +8,7 @@
 [![License: MIT](https://img.shields.io/badge/License-MIT-blue.svg)](LICENSE)
 [![Python 3.12+](https://img.shields.io/badge/python-3.12+-blue.svg)](https://www.python.org/)
 
-**Composable search and retrieval for AI agents**
+**SQLite knowledge and memory for AI agents**
 
 Retrieval was built for a human at a search box — hide the complexity, return ten
 links. Your agent is a different consumer: it can read structure, write queries,
@@ -38,6 +38,39 @@ Obsidian / Markdown:
 
 ```bash
 curl -sSL https://getflex.dev/install.sh | bash -s -- obsidian
+```
+
+New cells use the pinned Nomic v1.5 fp32 model automatically. The model runs
+locally; no API key or hosted embedding account is required.
+
+### upgrading existing cells to 0.52
+
+Cells created before 0.52 keep their original embedding model until you migrate
+them. This is deliberate: flex never relabels vectors from one model as another.
+Preview the work, then migrate with a verified copy and atomic swap:
+
+```bash
+flex reembed --dry-run
+flex reembed
+flex reembed --dry-run
+flex health --json
+```
+
+The live database remains untouched in its old vector space while the copy is
+built. Each converted database is backed up under `~/.flex/backups/reembed-nomic/` and
+only replaced after integrity, vector-width, and sampled reproducibility checks
+pass. Structural `--no-embed` cells and already-converted cells are skipped.
+For a large local migration, `FLEX_ONNX_THREADS=8 flex reembed` can use more CPU.
+
+If you want an agent to perform the upgrade, paste this:
+
+```text
+Upgrade this Flex installation to 0.52 safely. First run `flex reembed --dry-run`
+and report the cells and estimated work. Confirm the pinned fp32 model is installed
+with `flex init`. Then run `flex reembed`; do not edit cell databases directly and
+do not delete backups. Treat any ERROR or non-zero exit as blocking. When it
+finishes, rerun `flex reembed --dry-run` and `flex health --json`, and report which
+cells converted, skipped, or failed.
 ```
 
 ## coding-agent memory
@@ -117,7 +150,7 @@ Codex, and Obsidian do — compiled into a cell behind the one query surface.
 |---|---|
 | [`claude-code`](https://github.com/damiandelmas/flex/blob/main/flex/modules/claude_code/README.md) | Claude Code sessions: prompts, tool calls, file evidence |
 | [`codex`](https://github.com/damiandelmas/flex/blob/main/flex/modules/codex/README.md) | Codex CLI sessions, same surface |
-| [`filesystem`](https://github.com/damiandelmas/flex/tree/main/flex/modules/instant) | any folder or document tree — Instant (`--no-embed`, structural FTS+SQL+node tree; the default) or Vector (`--embed`, semantic embeddings; auto-detects an Obsidian vault). Aliases: `instant` = `filesystem --no-embed`, `obsidian`/`markdown` = `filesystem --embed` |
+| [`filesystem`](https://github.com/damiandelmas/flex/tree/main/flex/modules/instant) | any folder or document tree as structural FTS+SQL+node tree, without embeddings. `instant` remains a compatibility alias. Use the explicit `obsidian` or `markdown` module for a Markdown vault. |
 | [`codegraph`](https://github.com/damiandelmas/flex/tree/main/flex/modules/instant) | a code repository as a queryable graph: symbol tree, call graph, import graph (Python + JS/TS). Alias: `code` = `codegraph` |
 | [`tools`](https://github.com/damiandelmas/flex/blob/main/flex/modules/skills/README.md) | the agentic ecosystem catalog: skills, MCP servers, frameworks |
 

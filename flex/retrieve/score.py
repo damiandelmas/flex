@@ -271,17 +271,20 @@ def score_candidates(
     if modifiers:
         cfg = config or {}
 
-        # Temporal decay: scores *= 1 / (1 + days_ago / half_life)
+        # Temporal decay: exponential N-day half-life. `decay:0` is the
+        # documented explicit off switch; None means use the cell default.
         if modifiers.get('recent') and active_timestamps is not None:
             if np.any(active_timestamps > 0):
+                requested = modifiers.get('recent_days')
                 half_life = float(
-                    modifiers.get('recent_days')
-                    or cfg.get('vec:recent:half_life', 30)
+                    cfg.get('vec:recent:half_life', 30)
+                    if requested is None else requested
                 )
-                days_ago = np.maximum(
-                    (time.time() - active_timestamps) / 86400.0, 0.0
-                )
-                similarities *= 1.0 / (1.0 + days_ago / half_life)
+                if half_life > 0:
+                    days_ago = np.maximum(
+                        (time.time() - active_timestamps) / 86400.0, 0.0
+                    )
+                    similarities *= np.exp2(-days_ago / half_life)
 
         # Contrastive from modifier string — multiple suppress tokens compose additively
         for unlike_text in (modifiers.get('unlike') or []):
@@ -389,8 +392,32 @@ def _mmr_select(candidates: list, similarities: np.ndarray,
                 matrix: np.ndarray, k: int, lambda_: float = 0.7) -> list:
     """MMR: iteratively select for relevance minus redundancy.
 
-    Returns list of (index, mmr_score) tuples.
+    MMR is a selection criterion, not a scoring function: it decides which
+    candidates come back and in what order. The relevance-minus-redundancy
+    objective is the selection rule and is discarded — each selected candidate
+    keeps its true modulated relevance, so `score` means the same thing whether
+    or not `diverse` is set, and stays commensurable with keyword()'s [0,1]
+    ranks under hybrid fusion.
+
+    Returns list of (index, score) tuples, score = modulated relevance.
     """
+    if not candidates:
+        return []
+
+    # Deterministic embedding means duplicate content has the same normalized
+    # vector. Collapse those identities before MMR: relevance normalization can
+    # otherwise let hundreds of copied prompts consume the result set despite
+    # the redundancy penalty. Keep the highest-ranked representative (the input
+    # candidate order is relevance-descending). Near-but-distinct evidence stays.
+    unique_candidates = []
+    unique_vecs = []
+    for idx in candidates:
+        vec = matrix[idx]
+        if unique_vecs and np.max(np.asarray(unique_vecs) @ vec) >= 0.999999:
+            continue
+        unique_candidates.append(idx)
+        unique_vecs.append(vec)
+    candidates = unique_candidates
     if not candidates:
         return []
 
@@ -398,26 +425,31 @@ def _mmr_select(candidates: list, similarities: np.ndarray,
     cand_sims = cand_vecs @ cand_vecs.T
 
     n = len(candidates)
-    max_sim_to_selected = np.full(n, -np.inf)
     selected_mask = np.zeros(n, dtype=bool)
     relevance = similarities[candidates]
 
-    selected = [(candidates[0], lambda_ * float(relevance[0]))]
+    # Normalize relevance for the tradeoff ONLY. Raw cosines occupy a narrow
+    # band (often <0.1 wide) while redundancy spans [0,1]; mixed unscaled, the
+    # redundancy term dominates and MMR stops honoring relevance at all.
+    rel_min, rel_max = float(relevance.min()), float(relevance.max())
+    rel_norm = (relevance - rel_min) / (rel_max - rel_min + 1e-9)
+
+    selected = [(candidates[0], float(relevance[0]))]
     selected_mask[0] = True
-    max_sim_to_selected = np.maximum(max_sim_to_selected, cand_sims[0])
+    max_sim_to_selected = cand_sims[0].copy()
 
     for _ in range(k - 1):
         if selected_mask.all():
             break
 
-        mmr_scores = lambda_ * relevance - (1 - lambda_) * max_sim_to_selected
+        mmr_scores = lambda_ * rel_norm - (1 - lambda_) * max_sim_to_selected
         mmr_scores[selected_mask] = -np.inf
 
-        best = np.argmax(mmr_scores)
+        best = int(np.argmax(mmr_scores))
         if mmr_scores[best] == -np.inf:
             break
 
-        selected.append((candidates[best], float(mmr_scores[best])))
+        selected.append((candidates[best], float(relevance[best])))
         selected_mask[best] = True
         max_sim_to_selected = np.maximum(max_sim_to_selected, cand_sims[best])
 

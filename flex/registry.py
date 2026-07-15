@@ -21,6 +21,14 @@ FLEX_HOME = Path(os.environ.get("FLEX_HOME", Path.home() / ".flex"))
 CELLS_DIR = FLEX_HOME / "cells"
 REGISTRY_DB = FLEX_HOME / "registry.db"
 
+def retired_cell_message(name: str) -> str | None:
+    """Return optional deployment-specific retirement guidance."""
+    try:
+        from flex.modules.registry_ext import retired_cell_message as _retired
+    except ImportError:
+        return None
+    return _retired(name)
+
 # ── Hook registry ────────────────────────────────────────
 # Extensible hook system for optional modules and plugins.
 _hooks: dict[str, object] = {}
@@ -92,6 +100,12 @@ _MIGRATIONS = [
     "ALTER TABLE cells ADD COLUMN unlisted INTEGER DEFAULT 0",
     "ALTER TABLE cells ADD COLUMN source_url TEXT",
     "ALTER TABLE cells ADD COLUMN checksum TEXT",
+    # Provenance: which registry this cell was ACTUALLY installed from
+    # ('public' | 'private'), stamped from the path that resolved the
+    # manifest at pull time. source_url cannot carry this — the manifest
+    # composes a public URL even for private cells. NULL = legacy/unknown,
+    # which is never treated as a violation.
+    "ALTER TABLE cells ADD COLUMN origin TEXT",
     # Lifecycle management (SDK cells can register their refresh)
     "ALTER TABLE cells ADD COLUMN lifecycle TEXT DEFAULT 'static'",
     "ALTER TABLE cells ADD COLUMN refresh_interval INTEGER",
@@ -99,6 +113,14 @@ _MIGRATIONS = [
     "ALTER TABLE cells ADD COLUMN refresh_module TEXT",
     "ALTER TABLE cells ADD COLUMN last_refresh_at TEXT",
     "ALTER TABLE cells ADD COLUMN refresh_status TEXT",
+    "ALTER TABLE cells ADD COLUMN refresh_started_at TEXT",
+    "ALTER TABLE cells ADD COLUMN refresh_finished_at TEXT",
+    "ALTER TABLE cells ADD COLUMN refresh_error TEXT",
+    "ALTER TABLE cells ADD COLUMN source_signature TEXT",
+    "ALTER TABLE cells ADD COLUMN refresh_generation INTEGER DEFAULT 0",
+    "ALTER TABLE cells ADD COLUMN refresh_pending INTEGER DEFAULT 0",
+    "ALTER TABLE cells ADD COLUMN source_high_water TEXT",
+    "ALTER TABLE cells ADD COLUMN reconciliation_required INTEGER DEFAULT 0",
     "ALTER TABLE cells ADD COLUMN watch_path TEXT",
     "ALTER TABLE cells ADD COLUMN watch_pattern TEXT",
     # Active/inactive: active cells get VectorCache at startup, inactive are lazy-loaded on first query
@@ -252,6 +274,7 @@ def register_cell(
     active: bool | int | None = None,
     source_url: str | None = None,
     checksum: str | None = None,
+    origin: str | None = None,
     lifecycle: str | None = None,
     refresh_interval: int | None = None,
     refresh_script: str | None = None,
@@ -296,11 +319,11 @@ def register_cell(
 
     db.execute("""
         INSERT INTO cells (id, name, path, corpus_path, cell_type, description,
-                           unlisted, active, source_url, checksum,
+                           unlisted, active, source_url, checksum, origin,
                            lifecycle, refresh_interval, refresh_script, refresh_module,
                            watch_path, watch_pattern,
                            created_at, updated_at)
-        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
         ON CONFLICT(name) DO UPDATE SET
             id = COALESCE(cells.id, excluded.id),
             path = excluded.path,
@@ -311,6 +334,7 @@ def register_cell(
             active = COALESCE(excluded.active, cells.active),
             source_url = COALESCE(excluded.source_url, cells.source_url),
             checksum = COALESCE(excluded.checksum, cells.checksum),
+            origin = COALESCE(excluded.origin, cells.origin),
             lifecycle = COALESCE(excluded.lifecycle, cells.lifecycle),
             refresh_interval = CASE
                 WHEN excluded.lifecycle IS NOT NULL AND excluded.lifecycle != 'refresh'
@@ -318,14 +342,17 @@ def register_cell(
                 ELSE COALESCE(excluded.refresh_interval, cells.refresh_interval)
             END,
             refresh_script = COALESCE(excluded.refresh_script, cells.refresh_script),
-            refresh_module = COALESCE(excluded.refresh_module, cells.refresh_module),
+            refresh_module = CASE
+                WHEN excluded.lifecycle IS NOT NULL THEN excluded.refresh_module
+                ELSE COALESCE(excluded.refresh_module, cells.refresh_module)
+            END,
             watch_path = COALESCE(excluded.watch_path, cells.watch_path),
             watch_pattern = COALESCE(excluded.watch_pattern, cells.watch_pattern),
             updated_at = excluded.updated_at
     """, (cell_id, name, path_str, corpus_str, cell_type, description,
           None if unlisted is None else int(bool(unlisted)),
           None if active is None else int(bool(active)),
-          source_url, checksum,
+          source_url, checksum, origin,
           lifecycle, refresh_interval, refresh_script, refresh_module,
           watch_str, watch_pattern,
           now, now))
@@ -394,9 +421,14 @@ def get_cell_metadata(name: str) -> dict | None:
         db = _open_registry_readonly()
         row = db.execute(
             "SELECT id, name, path, corpus_path, cell_type, description, "
-            "source_url, checksum, "
+            "source_url, checksum, origin, "
             "lifecycle, refresh_interval, refresh_script, refresh_module, "
-            "last_refresh_at, refresh_status, watch_path, watch_pattern, "
+            "last_refresh_at, refresh_status, refresh_started_at, "
+            "refresh_finished_at, refresh_error, source_signature, "
+            "COALESCE(refresh_generation,0) AS refresh_generation, "
+            "COALESCE(refresh_pending,0) AS refresh_pending, source_high_water, "
+            "COALESCE(reconciliation_required,0) AS reconciliation_required, "
+            "watch_path, watch_pattern, "
             "created_at, updated_at, COALESCE(unlisted, 0) as unlisted, "
             "COALESCE(active, 1) as active "
             "FROM cells WHERE name = ?",
@@ -441,7 +473,12 @@ def list_cells() -> list[dict]:
             "SELECT id, name, path, corpus_path, cell_type, description, "
             "source_url, checksum, "
             "lifecycle, refresh_interval, refresh_script, refresh_module, "
-            "last_refresh_at, refresh_status, watch_path, watch_pattern, "
+            "last_refresh_at, refresh_status, refresh_started_at, "
+            "refresh_finished_at, refresh_error, source_signature, "
+            "COALESCE(refresh_generation,0) AS refresh_generation, "
+            "COALESCE(refresh_pending,0) AS refresh_pending, source_high_water, "
+            "COALESCE(reconciliation_required,0) AS reconciliation_required, "
+            "watch_path, watch_pattern, "
             "created_at, updated_at, COALESCE(unlisted, 0) as unlisted, "
             "COALESCE(active, 1) as active "
             "FROM cells ORDER BY name"
@@ -534,7 +571,11 @@ def classify_refresh_state(cell: dict, now: datetime | None = None) -> dict:
     except (TypeError, ValueError):
         interval_s = 0
 
-    last_dt = _parse_registry_ts(cell.get('last_refresh_at'))
+    last_dt = _parse_registry_ts(
+        cell.get('refresh_finished_at') or cell.get('last_refresh_at'))
+    started_dt = _parse_registry_ts(cell.get('refresh_started_at'))
+    if started_dt is None and status == 'running':
+        started_dt = last_dt  # pre-receipt registry compatibility
     age_s = None
     if last_dt:
         age_s = max(0, int((now - last_dt).total_seconds()))
@@ -544,7 +585,10 @@ def classify_refresh_state(cell: dict, now: datetime | None = None) -> dict:
     stale_after_s = max(interval_s * 2, 600) if interval_s else 600
     is_running = status == 'running'
     is_error = (status or '').startswith('error')
-    stale_running = bool(is_running and age_s is not None and age_s > stale_after_s)
+    running_age_s = (max(0, int((now - started_dt).total_seconds()))
+                     if started_dt else None)
+    stale_running = bool(
+        is_running and running_age_s is not None and running_age_s > stale_after_s)
 
     due = False
     if lifecycle == 'refresh':
@@ -581,6 +625,14 @@ def classify_refresh_state(cell: dict, now: datetime | None = None) -> dict:
     else:
         effective_status = status or 'idle'
 
+    if (cell.get('refresh_pending') or cell.get('reconciliation_required')
+            or is_running or is_error):
+        freshness = 'stale'
+    elif last_dt is not None and status == 'ok':
+        freshness = 'fresh'
+    else:
+        freshness = 'unknown'
+
     return {
         'effective_refresh_status': effective_status,
         'refresh_due': due,
@@ -589,7 +641,8 @@ def classify_refresh_state(cell: dict, now: datetime | None = None) -> dict:
         'refresh_never_run': never_run,
         'refresh_age_s': age_s,
         'refresh_stale_after_s': stale_after_s if is_running else None,
-        'refresh_running_for_s': age_s if is_running else None,
+        'refresh_running_for_s': running_age_s if is_running else None,
+        'freshness': freshness,
     }
 
 
@@ -655,16 +708,75 @@ def discover_watched() -> list[dict]:
     return results
 
 
-def update_refresh_status(name: str, status: str, timestamp: str | None = None):
-    """Update refresh status and timestamp for a cell."""
+def mark_refresh_started(name: str, *, pending: int | None = None,
+                         timestamp: str | None = None) -> None:
+    """Record work beginning without advancing the committed freshness receipt."""
     try:
         db = _open_registry()
         ts = timestamp or datetime.now(timezone.utc).isoformat()
         db.execute(
-            "UPDATE cells SET refresh_status = ?, last_refresh_at = ?, updated_at = ? WHERE name = ?",
-            (status, ts, ts, name)
+            "UPDATE cells SET refresh_status='running', refresh_started_at=?, "
+            "refresh_error=NULL, refresh_pending=COALESCE(?,refresh_pending), "
+            "updated_at=? WHERE name=?",
+            (ts, pending, ts, name),
         )
         db.commit()
         db.close()
     except Exception:
         pass
+
+
+def mark_refresh_committed(name: str, *, source_signature: str | None = None,
+                           source_high_water: str | None = None,
+                           pending: int = 0,
+                           timestamp: str | None = None) -> None:
+    """Advance freshness only after the owning cell transaction committed."""
+    try:
+        db = _open_registry()
+        ts = timestamp or datetime.now(timezone.utc).isoformat()
+        db.execute(
+            "UPDATE cells SET refresh_status='ok', last_refresh_at=?, "
+            "refresh_finished_at=?, refresh_error=NULL, "
+            "source_signature=COALESCE(?,source_signature), "
+            "source_high_water=COALESCE(?,source_high_water), "
+            "refresh_generation=COALESCE(refresh_generation,0)+1, "
+            "refresh_pending=?, reconciliation_required=0, updated_at=? "
+            "WHERE name=?",
+            (ts, ts, source_signature, source_high_water, pending, ts, name),
+        )
+        db.commit()
+        db.close()
+    except Exception:
+        pass
+
+
+def mark_refresh_failed(name: str, error: str, *, pending: int | None = None,
+                        reconciliation_required: bool = True,
+                        timestamp: str | None = None) -> None:
+    """Record failure while preserving the last successful completion receipt."""
+    try:
+        db = _open_registry()
+        ts = timestamp or datetime.now(timezone.utc).isoformat()
+        message = str(error)[:500]
+        db.execute(
+            "UPDATE cells SET refresh_status=?, refresh_error=?, "
+            "refresh_pending=COALESCE(?,refresh_pending), "
+            "reconciliation_required=?, updated_at=? WHERE name=?",
+            (f"error: {message}", message, pending,
+             int(bool(reconciliation_required)), ts, name),
+        )
+        db.commit()
+        db.close()
+    except Exception:
+        pass
+
+
+def update_refresh_status(name: str, status: str, timestamp: str | None = None):
+    """Compatibility adapter onto start/commit/failure lifecycle receipts."""
+    if status == 'running':
+        mark_refresh_started(name, timestamp=timestamp)
+    elif status == 'ok':
+        mark_refresh_committed(name, timestamp=timestamp)
+    elif status.startswith('error'):
+        mark_refresh_failed(name, status.partition(':')[2].strip() or status,
+                            timestamp=timestamp)

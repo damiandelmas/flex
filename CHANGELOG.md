@@ -4,6 +4,55 @@ Public changes to **flex** ([getflex.dev](https://getflex.dev)).
 
 ---
 
+## 0.52.0 — July 14, 2026
+
+This release makes a cell's declared contracts executable: one reproducible
+embedding space, committed freshness receipts, scale-safe evidence recovery,
+and query surfaces that expose ambiguity or unavailability instead of guessing.
+
+### Changes
+
+- **One portable embedding space** — newly embedded cells use the official
+  Nomic v1.5 fp32 ONNX model at native 768-dimensional storage and per-cell
+  Matryoshka serving at 256 dimensions. `flex init` downloads the ~522 MiB
+  artifact and tokenizer from a revision-pinned upstream URL, verifies both by
+  SHA-256, and installs them atomically. Existing pre-0.52 cells remain pinned
+  to their retained legacy model until `flex reembed` safely migrates them by
+  copy, verification, and atomic swap; Flex never silently interprets stored
+  vectors as a different space.
+- **Production-scale coding-agent recovery** — Claude Code and Codex gain an
+  indexed observation projection for `@full`, observed-file, path-history, and
+  bounded session-tail reads. Structural recovery no longer warms multi-GB
+  vector matrices. Exact duplicate vectors are collapsed before MMR selection.
+- **Freshness is a committed fact** — multi-root event watches and fair,
+  size+mtime reconciliation cover every declared selection. Registry health now
+  distinguishes dispatch, committed generations, source high-water marks, and
+  pending reconciliation instead of treating activity as completion.
+- **Honest code graphs** — same-named callees are labeled candidate sets rather
+  than fabricated certain edges; callers can qualify by definition or file.
+  Structural subtree reads use one-row node tables and avoid view fan-out.
+- **Profile-owned document surfaces** — markdown, Obsidian, and structured-doc
+  profiles own their views, presets, and refresh behavior. Malformed dates are
+  rejected into queryable health defects. Obsidian cells expose notes, tags,
+  Dataview fields, wikilinks, hubs, orphans, and ghost-note presets.
+- **Fail-loud Hub transfers** — a named-cell miss, incomplete object-store
+  credentials, provenance mismatch, or non-public bucket without an explicit
+  base URL now aborts instead of reporting a successful no-op or publishing a
+  manifest URL that cannot resolve. Registry `origin` records whether a cell is
+  public or private rather than inferring provenance from its URL.
+- **Retrieval scores keep their meaning** — MMR uses diversity only to select
+  candidates and publishes each result's true relevance. Exact duplicate
+  vectors collapse before selection, decay follows its documented exponential
+  half-life, and natural-language FTS input is sanitized consistently.
+- **Structural invariants heal forward** — edge tables enforce duplicate-safe
+  uniqueness, chunk rollups and presentation views are regenerated from shared
+  builders, and refresh paths upgrade compatible older schemas before writing.
+- **Interface closure** — active unlisted cells remain hidden from discovery but
+  are callable by exact MCP name; retired cell names refuse rebuild advice.
+  Filesystem orientation labels raw versus projected counts, reports full roots
+  and freshness, handles punctuation as FTS token boundaries, and uses uniform
+  JSON success envelopes.
+
 ## 0.51.0 — July 2026
 
 flex compiles any folder, repository, or document tree into a portable, queryable local **cell** — and now
@@ -83,8 +132,8 @@ regen and its CPU burn are retired; `last_refresh` now reports real index activi
 - **Retrieval honesty and freshness** — keyword search reports terms it couldn't match, semantic search
   exposes a result's distance above its pool's noise floor, undated docs get an effective date backfilled
   from git/filesystem, and cells declaring a refresh module get auto-refresh wired up.
-- **Standardized on the Nomic embedder** — the experimental multi-model reembed apparatus (the `flex reembed`
-  command and the model-registry path) is retired from the public surface.
+- **Retired the experimental multi-model reembed apparatus** — the `flex reembed` command and the
+  model-registry path are removed from the public surface; cells build against a single default embedder.
 
 *Consolidation note: the filesystem engines are unified at the compile/index layer; the user-facing install
 verbs (`filesystem` / `codegraph`) route to them but are not yet collapsed into a single routing surface —

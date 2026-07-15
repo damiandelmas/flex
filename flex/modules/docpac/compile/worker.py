@@ -196,6 +196,40 @@ def _in_skip_folder(path: Path) -> bool:
     return bool(set(path.parts) & SCAN_SKIP_FOLDERS)
 
 
+def _resolve_cell_embed_fn(conn: sqlite3.Connection, fallback=None):
+    """Resolve the doc-embedder for THIS cell from its `vec:model` _meta tag.
+
+    The watch-scan drain into index_file
+    used to be handed ONE shared MiniLM `encode_fn` for every watched cell,
+    regardless of that cell's own tag — so a nomic-v1.5-tagged cell's live
+    incremental chunks would get embedded with MiniLM-128 into the Nomic
+    column (silent cross-space corruption).
+
+    minilm/untagged cells are left COMPLETELY untouched — `fallback` (the
+    caller's shared encode_fn) is returned as-is, byte-identical to the
+    pre-existing behavior (this also keeps every call site free to pass a
+    test double for the untagged path, exactly as before). Only a
+    non-default tag triggers resolution,
+    mirroring flex.compile.embed._resolve_ingest_target (the batch embed_new
+    path, which is also tag-aware) so the two ingest paths never
+    diverge: nomic-v1.5 -> the dedicated Nomic embedder at its native 768d
+    (matches embed_new; the Matryoshka slice to serve_dim happens at
+    query/serve time, not here). Resolution of an explicit tag fails closed:
+    falling back would write another model's vectors into this cell's space.
+    """
+    try:
+        from flex.compile.embed import _cell_tag, _resolve_ingest_target
+        tag = _cell_tag(conn)
+    except Exception:
+        return fallback
+    if tag is None or tag == 'minilm':
+        return fallback
+    embed_doc, _dim, _tag = _resolve_ingest_target(conn)
+    if embed_doc is None:
+        raise RuntimeError(f"no document embedder available for vec:model={tag!r}")
+    return embed_doc
+
+
 def _embed_texts(texts: list[str], embed_fn) -> list[bytes | None]:
     """Embed texts using the shared ONNX embedder. Returns list of blobs."""
     if not texts:
@@ -258,7 +292,7 @@ def cell_is_no_embed(conn: sqlite3.Connection) -> bool:
     """PUBLIC: True if this cell self-declares embed-off (_meta.embed='false').
 
     The single-source parser for the canonical `_meta.embed` signal — the ONE flag
-    every embed-off consumer keys on (G4 index_file skip, runtime's VectorCache
+    every embed-off consumer keys on (index_file skip, runtime's VectorCache
     warm-skip, interface's @orient re-stamp). Embed-off = the row is present AND its
     value is falsey ({false,0,off,no}); absent/true = embed-on. Lives in _meta, so it
     survives regen. Import this rather than re-parsing so the semantics stay single-
@@ -290,6 +324,12 @@ def index_file(conn: sqlite3.Connection, file_path: str, embed_fn,
     Upsert semantics: delete old chunks for this source, re-insert.
     corpus_root comes from the cell's registry row; falls back to a
     registry lookup — never inferred from directory names.
+
+    `embed_fn` is the CALLER's shared encode_fn (historically MiniLM) — it is
+    now only a fallback. The actual embedder is resolved per-cell from THIS
+    cell's `vec:model` _meta tag via `_resolve_cell_embed_fn` (same 2-way
+    resolver embed_new's batch path uses), so a nomic-v1.5-tagged cell's
+    incremental chunks are never silently embedded with MiniLM.
 
     `place` (place-scoped cells only): the scope path under a corpus's place
     root. When set, the source_id is keyed on (place, path) and the `place`
@@ -361,16 +401,19 @@ def index_file(conn: sqlite3.Connection, file_path: str, embed_fn,
     if not sections:
         sections = [('', body.strip(), 0, 0)]
 
-    # Embed all section texts — unless this is an embed-off cell (G4). The cell's
+    # Embed all section texts — unless this is an embed-off cell. The cell's
     # own _meta.embed declaration wins over the caller, so a no-embed cell stays
     # no-embed. All-None embeddings → _raw_chunks.embedding NULL + the mean-pool
     # below is skipped by its `if valid:` guard → byte-identical to embed-on except
-    # the two embedding columns (Phase-0 manifest: control-flow-only).
+    # the two embedding columns.
     section_texts = [s[1] for s in sections]
     if no_embed or _cell_is_no_embed(conn):
         embeddings = [None] * len(section_texts)
     else:
-        embeddings = _embed_texts(section_texts, embed_fn)
+        # Per-cell resolution: never trust the caller's shared
+        # encode_fn blindly — resolve from THIS cell's vec:model tag first.
+        cell_embed_fn = _resolve_cell_embed_fn(conn, fallback=embed_fn)
+        embeddings = _embed_texts(section_texts, cell_embed_fn)
 
     # --- Upsert: delete old data for this source (shared with reconcile-delete) ---
     _delete_source_rows(conn, source_id)
@@ -380,7 +423,9 @@ def index_file(conn: sqlite3.Connection, file_path: str, embed_fn,
     # confidence, validity, maturity, summary) — INSERT OR REPLACE
     # would null them on every incremental touch.
     # fill-only date: filename > existing stored > git/mtime (no drift on edit).
-    fdate = resolve_file_date(src['file_date'], file_path, existing=existing_file_date)
+    raw_fdate = resolve_file_date(src['file_date'], file_path, existing=existing_file_date)
+    from flex.modules.docpac.compile.classify import record_file_date_health
+    fdate = record_file_date_health(conn, source_id, raw_fdate)
     if place is not None:
         conn.execute("""
             INSERT INTO _raw_sources
@@ -655,13 +700,13 @@ def _ensure_docpac_views(conn) -> bool:
 
 
 def scan_docpac_cells(embed_fn, size_cache: dict) -> dict:
-    """Scan registered docpac corpus dirs by file size, index changed .md files.
+    """Scan registered docpac corpora by stat signature, fairly bounded per tick.
 
     Mirror of claude_code scan_sessions() — Filebeat pattern.
 
     Args:
         embed_fn: ONNX encode callable (shared embedder).
-        size_cache: Mutable dict {abs_path: last_size}. Persisted in memory
+        size_cache: Mutable dict {cache_key: ``size:mtime_ns``}. Persisted in memory
                     across ticks. Empty dict triggers full initial scan.
 
     Returns:
@@ -671,12 +716,13 @@ def scan_docpac_cells(embed_fn, size_cache: dict) -> dict:
 
     stats = {'indexed': 0, 'skipped': 0}
 
+    from flex.modules.markdown.compile.profile import profile_name_for_cell
     cells = [
         c for c in list_cells()
         if c.get('cell_type') == 'docpac'
+        and profile_name_for_cell(c) == 'docpac'
         and c.get('corpus_path')
         and c.get('lifecycle') == 'watch'
-        and c.get('watch_path')
         and c.get('active', 1)
     ]
 
@@ -720,6 +766,7 @@ def scan_docpac_cells(embed_fn, size_cache: dict) -> dict:
 
         cell_indexed = 0
         on_disk_sids = set()
+        candidates = []
         _exclude = _cell_exclude_dirs(conn)   # per-cell subtree exclusions from _meta
         for md in _walk_md(corpus, exclude_dirs=_exclude):
             path_key = str(md)
@@ -727,13 +774,24 @@ def scan_docpac_cells(embed_fn, size_cache: dict) -> dict:
             # live file can never make the reconcile-delete drop it.
             on_disk_sids.add(make_source_id(path_key))
             try:
-                current_size = md.stat().st_size
+                stat = md.stat()
             except (FileNotFoundError, OSError):
                 continue
-
-            if current_size == size_cache.get(path_key, -1):
+            signature = f"{stat.st_size}:{stat.st_mtime_ns}"
+            cache_key = f"docpac:{cell_name}:{path_key}"
+            cached = size_cache.get(cache_key, size_cache.get(path_key))
+            # Accept the legacy integer cache for one release so a rolling daemon
+            # upgrade does not needlessly re-index every document.
+            if cached in (signature, stat.st_size):
                 continue
+            candidates.append((path_key, (md, signature, cache_key)))
 
+        from flex.watch import fair_batch
+        limit = max(1, int(os.environ.get('FLEX_DRAIN_FILES_PER_CELL', '200')))
+        batch = fair_batch(conn, 'docpac', candidates, limit)
+        if batch:
+            conn.commit()  # cursor is a durable fairness receipt, even on failure
+        for path_key, (md, signature, cache_key) in batch:
             try:
                 if index_file(conn, path_key, embed_fn, corpus_root=corpus):
                     stats['indexed'] += 1
@@ -743,7 +801,9 @@ def scan_docpac_cells(embed_fn, size_cache: dict) -> dict:
             except Exception as e:
                 print(f"[docpac] error on {md.name}: {e}", file=sys.stderr)
                 stats['skipped'] += 1
-            size_cache[path_key] = current_size
+            else:
+                # A failed write remains a candidate on the next tick.
+                size_cache[cache_key] = signature
 
         # Reconciliation-delete: drop rows for files that vanished since a prior
         # pass (the walk only sees existing files, so deletes need this diff).

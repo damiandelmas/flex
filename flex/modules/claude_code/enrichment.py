@@ -41,6 +41,7 @@ def run_enrichment(
         from flex.modules.claude_code.manage.rebuild_all import (
             rebuild_warmup_types, reembed_sources, rebuild_source_graph,
             rebuild_community_labels, rebuild_file_graph, rebuild_delegation_graph,
+            rebuild_chunk_rollup,
         )
         from flex.modules.claude_code.manage.enrich_summary import run as run_fingerprints
         from flex.modules.claude_code.manage.enrich_soma_repos import run as _register_soma_repos
@@ -57,6 +58,7 @@ def run_enrichment(
     ]
     if not skip_delegation:
         steps.append(("delegation graph", lambda: rebuild_delegation_graph(conn)))
+    steps.append(("chunk rollup",   lambda: rebuild_chunk_rollup(conn)))
     steps.extend([
         ("fingerprints",     lambda: run_fingerprints(conn)),
         ("repo registry",    lambda: _register_soma_repos(conn)),

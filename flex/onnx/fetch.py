@@ -1,5 +1,5 @@
 """
-Download ONNX embedding model from GitHub release assets.
+Download the public fp32 ONNX embedding model from its authoritative release.
 
 Called by `flex init`. Model stored at ~/.flex/models/ to persist across
 pip upgrades. Uses urllib only — no extra dependencies.
@@ -13,29 +13,33 @@ from pathlib import Path
 FLEX_HOME = Path(os.environ.get("FLEX_HOME", Path.home() / ".flex"))
 MODEL_DIR = FLEX_HOME / "models"
 
-# Bundled model lives alongside this file in flex/onnx/
-BUNDLED_DIR = Path(__file__).parent
-
-# Model weights hosted on GitHub Releases (87MB — exceeds Cloudflare Pages 25MB limit).
-# Version-pinned: model weights are independent of flex version. Only changes if the
-# embedding model changes (which requires re-embedding all cells).
-BASE_URL = "https://github.com/damiandelmas/flex/releases/download/v0.1.1"
-
+# Nomic's optimized ONNX export, pinned to an exact upstream revision.
+# The SHA pins are the embedding-space contract: changing either
+# artifact requires an explicit model migration, never a transparent download.
+MODEL_REVISION = "ac6fcd72429d86ff25c17895e47a9bfcfc50c1b2"
+BASE_URL = (
+    "https://huggingface.co/nomic-ai/nomic-embed-text-v1.5/resolve/"
+    f"{MODEL_REVISION}"
+)
+MODEL_SUBDIR = "nomic-v1.5-fp32"
 FILES = [
-    ("model.onnx", "30ff8ad63546f9efd85019f394445f566ea595c119b08aa6663058af9e18fa87"),
-    ("model.onnx.data", "853ca16b709b09328d2d596c29e747163566139af3836fee64a358317e1c4268"),
+    ("model.onnx", "onnx/model.onnx",
+     "147d5aa88c2101237358e17796cf3a227cead1ec304ec34b465bb08e9d952965"),
+    ("tokenizer.json", "tokenizer.json",
+     "d241a60d5e8f04cc1b2b3e9ef7a4921b27bf526d9f6050ab90f9267a1f9e5c66"),
 ]
 
 
 def model_dir() -> Path:
     """Return model directory, creating if needed."""
-    MODEL_DIR.mkdir(parents=True, exist_ok=True)
-    return MODEL_DIR
+    dest = MODEL_DIR / MODEL_SUBDIR
+    dest.mkdir(parents=True, exist_ok=True)
+    return dest
 
 
 def _files_valid(directory: Path) -> bool:
     """Check all model files exist AND have correct checksums."""
-    for name, expected_hash in FILES:
+    for name, _remote_path, expected_hash in FILES:
         p = directory / name
         if not p.exists():
             return False
@@ -45,19 +49,8 @@ def _files_valid(directory: Path) -> bool:
 
 
 def model_ready() -> bool:
-    """Check if all model files exist with valid checksums (user dir or bundled)."""
-    return _files_valid(MODEL_DIR) or _files_valid(BUNDLED_DIR)
-
-
-def _copy_bundled() -> bool:
-    """Copy bundled model files to ~/.flex/models/. Returns True only if checksums valid."""
-    if not _files_valid(BUNDLED_DIR):
-        return False
-    import shutil
-    dest = model_dir()
-    for name, _ in FILES:
-        shutil.copy2(BUNDLED_DIR / name, dest / name)
-    return True
+    """Check whether the pinned fp32 model and tokenizer are installed."""
+    return _files_valid(MODEL_DIR / MODEL_SUBDIR)
 
 
 def _sha256(path: Path) -> str:
@@ -80,7 +73,7 @@ def _progress_hook(block_num, block_size, total_size):
 
 def download_model(force: bool = False) -> Path:
     """
-    Install model files: copy from bundled package first, fall back to GitHub download.
+    Install the pinned fp32 model and tokenizer.
 
     Args:
         force: Re-copy/download even if files exist.
@@ -93,12 +86,7 @@ def download_model(force: bool = False) -> Path:
     """
     dest = model_dir()
 
-    # Fast path: copy from bundled package (no network, works in Docker/offline)
-    if not force and not all((dest / name).exists() for name, _ in FILES):
-        if _copy_bundled():
-            return dest
-
-    for name, expected_hash in FILES:
+    for name, remote_path, expected_hash in FILES:
         target = dest / name
         if target.exists() and not force:
             if _sha256(target) == expected_hash:
@@ -106,27 +94,30 @@ def download_model(force: bool = False) -> Path:
             # Corrupt or truncated — re-download
             target.unlink(missing_ok=True)
 
-        url = f"{BASE_URL}/{name}"
+        url = f"{BASE_URL}/{remote_path}?download=true"
+        partial = target.with_suffix(target.suffix + ".part")
         print(f"  {name}")
         try:
-            urllib.request.urlretrieve(url, target, reporthook=_progress_hook)
+            partial.unlink(missing_ok=True)
+            urllib.request.urlretrieve(url, partial, reporthook=_progress_hook)
             print()  # newline after progress
         except Exception as e:
-            target.unlink(missing_ok=True)
+            partial.unlink(missing_ok=True)
             raise RuntimeError(
                 f"Failed to download {name} from {url}: {e}\n"
                 f"You can download manually and place in {dest}/"
             ) from e
 
         # Verify checksum
-        actual = _sha256(target)
+        actual = _sha256(partial)
         if actual != expected_hash:
-            target.unlink(missing_ok=True)
+            partial.unlink(missing_ok=True)
             raise RuntimeError(
                 f"Checksum mismatch for {name}.\n"
                 f"  expected: {expected_hash}\n"
                 f"  got:      {actual}\n"
                 f"Re-run 'flex init' to retry."
             )
+        partial.replace(target)
 
     return dest

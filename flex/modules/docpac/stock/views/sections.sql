@@ -15,6 +15,7 @@ SELECT
     s.source_id AS doc_id,
     s.source_id AS source_id,
     s.position,
+    COALESCE(tree.depth, 0) AS depth,
     src.title AS doc_title,
     src.title AS title,
     src.source_path,
@@ -49,4 +50,5 @@ FROM _raw_chunks r
 LEFT JOIN _edges_source s ON r.id = s.chunk_id
 LEFT JOIN _raw_sources src ON s.source_id = src.source_id
 LEFT JOIN _types_docpac tp ON r.id = tp.chunk_id
+LEFT JOIN _edges_tree tree ON tree.id = r.id
 LEFT JOIN _enrich_source_graph g ON s.source_id = g.source_id;

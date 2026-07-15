@@ -15,27 +15,17 @@ SELECT
     r.content,
     r.timestamp,
     datetime(r.timestamp, 'unixepoch', 'localtime') AS created_at,
-    CASE
-        WHEN fb.chunk_id IS NOT NULL THEN 'file'
-        WHEN tp.type IS NOT NULL THEN tp.type
-        ELSE 'chunk'
-    END AS type,
+    cr.type,
     s.source_id AS session_id,
     s.position,
     src.project,
     t.tool_name,
     COALESCE(fb.target_file, t.target_file) AS file,
     fb.title AS section,
-    CASE
-        WHEN COALESCE(fb.target_file, t.target_file) LIKE '%.%'
-        THEN LOWER(SUBSTR(COALESCE(fb.target_file, t.target_file),
-            LENGTH(RTRIM(COALESCE(fb.target_file, t.target_file),
-            REPLACE(REPLACE(COALESCE(fb.target_file, t.target_file), '/', ''), '.', ''))) + 1))
-        ELSE ''
-    END AS ext,
-    d.child_session_id,
-    d.agent_type,
-    fi.file_uuids,
+    cr.ext,
+    cr.child_session_id,
+    cr.agent_type,
+    cr.file_uuids,
     tp.branch_id
 FROM _raw_chunks r
 LEFT JOIN _edges_source s ON r.id = s.chunk_id
@@ -43,5 +33,4 @@ LEFT JOIN _raw_sources src ON s.source_id = src.source_id
 LEFT JOIN _edges_tool_ops t ON r.id = t.chunk_id
 LEFT JOIN _types_message tp ON r.id = tp.chunk_id
 LEFT JOIN _types_file_body fb ON r.id = fb.chunk_id
-LEFT JOIN (SELECT chunk_id, child_session_id, agent_type FROM _edges_delegations GROUP BY chunk_id) d ON r.id = d.chunk_id
-LEFT JOIN (SELECT chunk_id, json_group_array(file_uuid) AS file_uuids FROM _edges_file_identity GROUP BY chunk_id) fi ON r.id = fi.chunk_id;
+LEFT JOIN _enrich_chunk_rollup cr ON r.id = cr.chunk_id;

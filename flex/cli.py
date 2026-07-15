@@ -754,18 +754,17 @@ def _run_enrichment_quiet(conn, progress_cb=None) -> tuple[int, list[str]]:
 
 
 # ── Surface routing ───────────────────────────────────────────────────────
-# Present `filesystem` and `codegraph` as the user-facing install verbs over
-# the two existing engines. This is a routing LAYER only — the engines stay two
-# separate modules under the hood (instant + markdown/obsidian); nothing merges.
+# Present `filesystem` and `codegraph` as user-facing install verbs over the
+# structural instant engine. Markdown/Obsidian remains an explicit, separate
+# module until the unified filesystem compiler lands.
 #
-#   filesystem  (default / --no-embed) -> instant  engine  (structural: FTS+SQL+node tree)
-#   filesystem  --embed                -> obsidian engine  (semantic embeddings)
-#   codegraph                          -> instant  engine, --code (call/import graph)
+#   filesystem -> instant engine (structural: FTS+SQL+node tree)
+#   codegraph   -> instant engine, --code (call/import graph)
 #
 # Permanent aliases (old commands keep working):
-#   instant            -> filesystem --no-embed  (instant engine)
-#   obsidian / markdown-> filesystem --embed     (markdown engine, auto-detects a vault)
-#   code               -> codegraph              (instant --code)
+#   instant             -> filesystem (instant engine)
+#   obsidian / markdown -> markdown engine
+#   code                -> codegraph (instant --code)
 def _resolve_module_surface(module: str, args) -> tuple[str, dict]:
     """Map a user-facing verb/alias to (engine_cli_name, forced_flags).
 
@@ -776,8 +775,14 @@ def _resolve_module_surface(module: str, args) -> tuple[str, dict]:
     embed = bool(getattr(args, "embed", False))
     if module in ("filesystem", "instant", "obsidian", "markdown"):
         if module == "filesystem":
-            # default is Instant (structural); --embed routes to the Vector engine
-            return ("obsidian" if embed else "instant"), {}
+            if embed:
+                raise SystemExit(
+                    "`flex init --module filesystem --embed` is not supported: "
+                    "the 0.52 filesystem cell is structural (FTS + SQL, no embeddings). "
+                    "For a Markdown or Obsidian vault, use the explicit "
+                    "`--module obsidian --vault PATH` surface."
+                )
+            return "instant", {}
         if module == "instant":
             return "instant", {}
         return "obsidian", {}  # obsidian / markdown -> the markdown engine (vector)
@@ -962,6 +967,120 @@ def cmd_hub_view(args):
         print(f"  {name:<20s} {status}")
 
 
+_R2_CRED_VARS = ("FLEX_R2_ENDPOINT", "FLEX_R2_ACCESS_KEY", "FLEX_R2_SECRET_KEY")
+
+
+def _guard_r2_credentials():
+    """GUARD 3 — private intent with broken credentials must ABORT, not silently
+    degrade to the public registry.
+
+    FLEX_R2_BUCKET expresses the intent "use the access-controlled registry." If
+    the credentials to reach it are absent, falling back to the public registry
+    answers a different question than the one that was asked.
+
+    When every variable is absent there is no registry-intent signal to inspect;
+    the env-independent named-cell and provenance guards below cover that case.
+    """
+    if not os.environ.get("FLEX_R2_BUCKET"):
+        return
+    absent = [v for v in _R2_CRED_VARS if not os.environ.get(v)]
+    if not absent:
+        return
+    print(
+        "error: FLEX_R2_BUCKET is set (access-controlled registry) but these are not: "
+        + ", ".join(absent),
+        file=sys.stderr,
+    )
+    print(
+        "  refusing to fall back to the public registry — that would answer a "
+        "different question than the one you asked.",
+        file=sys.stderr,
+    )
+    sys.exit(2)
+
+
+def _registry_label(authed: bool) -> str:
+    return "PRIVATE (authenticated)" if authed else "PUBLIC (anonymous)"
+
+
+def _fail_on_missing(missing, remote, authed):
+    """GUARD 1 (PRIMARY, env-independent) — a NAMED cell absent from the fetched
+    manifest is a loud, named, non-zero failure. Never a silent `continue`.
+
+    The invariant: asked for N, wrote 0, exited 0 — never. A pull that changed
+    nothing must never look like a pull that worked, regardless of which registry
+    was resolved or why.
+    """
+    if not missing:
+        return
+    print(
+        f"error: {len(missing)} named cell(s) not in the manifest: "
+        + ", ".join(missing),
+        file=sys.stderr,
+    )
+    print(
+        f"  resolved registry: {_registry_label(authed)} — "
+        f"{len(remote)} cell(s) available",
+        file=sys.stderr,
+    )
+    if not authed:
+        print(
+            "  hint: cells in an access-controlled registry need "
+            + " / ".join(_R2_CRED_VARS)
+            + ".",
+            file=sys.stderr,
+        )
+        print(
+            "        a systemd EnvironmentFile is NOT loaded by an ssh shell — "
+            "source it explicitly.",
+            file=sys.stderr,
+        )
+    sys.exit(1)
+
+
+def _guard_provenance(cells, local_by_name, authed):
+    """GUARD 2 (PROVENANCE) — never silently cross registries.
+
+    A cell installed from the access-controlled registry (origin='private') must
+    not be resolved against the public one. Guard 1 catches the common case (the
+    private name simply isn't in the public manifest) — but a NAME COLLISION
+    defeats it: if a public cell shares a name with a private one, a creds-less
+    pull would fetch the public impostor and register it OVER the private cell,
+    with an identical source_url, leaving the substitution undetectable.
+
+    Provenance is stamped from the path that ACTUALLY resolved the manifest at
+    install time — not inferred from source_url, which cannot carry the signal
+    (the manifest composes a public URL even for private cells).
+
+    origin=NULL is UNKNOWN (a legacy row), not a violation — do not enforce. A
+    migration must never brick an existing install.
+    """
+    if authed:
+        return
+    crossed = [
+        n for n in cells
+        if (local_by_name.get(n) or {}).get("origin") == "private"
+    ]
+    if not crossed:
+        return
+    print(
+        f"error: {len(crossed)} cell(s) were installed from an access-controlled "
+        "registry, but this context resolved the public one: " + ", ".join(crossed),
+        file=sys.stderr,
+    )
+    print(
+        "  refusing to overwrite them from the public registry — a same-named "
+        "public cell is not the same cell.",
+        file=sys.stderr,
+    )
+    print(
+        "  hint: set " + " / ".join(_R2_CRED_VARS) + " to reach the registry these "
+        "cells came from.",
+        file=sys.stderr,
+    )
+    sys.exit(1)
+
+
 def cmd_hub_pull(args):
     """Install a specific cell, or (with --all) refresh all stale installed cells.
 
@@ -969,16 +1088,33 @@ def cmd_hub_pull(args):
     --all: refresh installed cells that are stale vs the remote manifest,
     optionally filtered to the named cell(s) — this is the folded
     `cmd_update` behavior, cell-filter fix included.
+
+    Fails LOUD: a named cell that cannot be resolved is an error with a non-zero
+    exit, never a silent skip. See _fail_on_missing / _guard_provenance /
+    _guard_r2_credentials.
     """
-    from flex.hub.manifest import fetch_manifest, diff_manifest, download_cell
+    from flex.hub.manifest import (
+        fetch_manifest,
+        diff_manifest,
+        download_cell,
+        _r2_auth_configured,
+    )
     from flex.registry import list_cells, register_cell, CELLS_DIR
+
+    _guard_r2_credentials()                       # GUARD 3 — before any network
 
     remote = fetch_manifest()
     cells = list(getattr(args, "cells", None) or [])
+    authed = _r2_auth_configured()
+    origin = "private" if authed else "public"
+
+    local_by_name = {c["name"]: c for c in list_cells()}
+
+    if cells:
+        _guard_provenance(cells, local_by_name, authed)   # GUARD 2
 
     if getattr(args, "all", False):
-        local = list_cells()
-        installed = [c for c in local if c.get("source_url")]
+        installed = [c for c in local_by_name.values() if c.get("source_url")]
         if cells:
             installed = [c for c in installed if c.get("name") in cells]
         diffs = diff_manifest(remote, installed)
@@ -987,8 +1123,11 @@ def cmd_hub_pull(args):
                 entry = remote.get(name)
                 if entry:
                     dest = download_cell(entry, CELLS_DIR)
-                    register_cell(name=name, path=str(dest), source_url=entry.url, checksum=entry.checksum)
+                    register_cell(name=name, path=str(dest), source_url=entry.url,
+                                  checksum=entry.checksum, origin=origin)
                     print(f"  {name}: updated")
+        # GUARD 1 — a named cell we were asked to refresh but could not resolve.
+        _fail_on_missing([n for n in cells if n not in remote], remote, authed)
         return
 
     if not cells:
@@ -998,11 +1137,15 @@ def cmd_hub_pull(args):
     for name in cells:
         entry = remote.get(name)
         if not entry:
-            continue
+            continue                              # collected below — never silent
         dest = download_cell(entry, CELLS_DIR)
         register_cell(name=name, path=str(dest), cell_type=entry.cell_type,
-                      source_url=entry.url, checksum=entry.checksum)
+                      source_url=entry.url, checksum=entry.checksum, origin=origin)
         print(f"  {name}: installed")
+
+    # GUARD 1 (PRIMARY). Cells that DID resolve are installed above — we don't roll
+    # back good work — but the run still exits non-zero and names what was missed.
+    _fail_on_missing([n for n in cells if n not in remote], remote, authed)
 
 
 def cmd_hub_push(args):
@@ -1181,53 +1324,48 @@ def cmd_relay(args):
 # raw search implementation
 # ============================================================
 
-def _open_cell_for_search(cell_name: str):
-    """Open a cell with vec_ops UDF registered. Returns (db, cleanup) or exits."""
+def _open_cell_for_search(cell_name: str, query: str | None = None):
+    """Open a cell, warming vectors only when the query actually needs them.
+
+    Routes through the same resolution as the MCP path (flex.engine.build_vec_state
+    / register_vec_udf) so a tagged cell (e.g. `vec:model=nomic-v1.5`) serves
+    identically here as it does over MCP or flex.retrieve.execute — no more
+    stale-default-embedder divergence for the CLI path."""
     from flex.registry import resolve_cell
     from flex.core import open_cell_readonly
 
     path = resolve_cell(cell_name)
     if path is None:
+        from flex.registry import retired_cell_message
+        retired = retired_cell_message(cell_name)
+        if retired:
+            print(retired, file=sys.stderr)
+            sys.exit(1)
         print(f"Cell '{cell_name}' not found.", file=sys.stderr)
         print("Run 'flex init' first, then use Claude Code to build your index.", file=sys.stderr)
         sys.exit(1)
 
     db = open_cell_readonly(path)
 
-    # Try to register vec_ops (needs ONNX + embeddings)
+    needs_vectors = 'vec_ops(' in (query or '')
+    if query and query.lstrip().startswith('@'):
+        preset_name = query.lstrip()[1:].split(None, 1)[0]
+        row = db.execute("SELECT sql FROM _presets WHERE name=?", (preset_name,)).fetchone()
+        needs_vectors = bool(row and 'vec_ops(' in (row[0] or ''))
+
+    # Structural SQL/recovery must not pay to load a multi-gigabyte vector
+    # matrix. Semantic queries still use the exact shared engine resolver.
     try:
-        from flex.retrieve.vec_ops import VectorCache, register_vec_ops
-        from flex.onnx import get_model
-        from flex.onnx.embed import STORE_DIM
+        if not needs_vectors:
+            return db
+        from flex import engine as _engine
+        from pathlib import Path as _Path
 
-        try:
-            embedder = get_model()
-        except Exception:
-            embedder = None
-        caches = {}
-        for table, id_col in [("_raw_chunks", "id"), ("_raw_sources", "source_id")]:
-            try:
-                cache = VectorCache()
-                cache.load_from_db(db, table, "embedding", id_col)
-                if cache.size > 0:
-                    cache.load_columns(db, table, id_col)
-                    caches[table] = cache
-            except Exception:
-                pass
-
-        if caches and embedder:
-            # Read vec config from _meta
-            config = {}
-            try:
-                rows = db.execute(
-                    "SELECT key, value FROM _meta WHERE key LIKE 'vec:%'"
-                ).fetchall()
-                config = {r[0]: r[1] for r in rows}
-            except Exception:
-                pass
-            embed_query = lambda text: embedder.encode(text, prefix='search_query: ', matryoshka_dim=STORE_DIM)
-            embed_doc   = lambda text: embedder.encode(text, prefix='search_document: ', matryoshka_dim=STORE_DIM)
-            register_vec_ops(db, caches, embed_query, config, embed_doc_fn=embed_doc)
+        db_path = _Path(path)
+        mtime = db_path.stat().st_mtime if db_path.exists() else 0
+        state = _engine.build_vec_state(cell_name, db, mtime)
+        if state:
+            _engine.register_vec_udf(db, state)
     except ImportError:
         pass  # vec_ops won't work but plain SQL is fine
 
@@ -1278,7 +1416,7 @@ def cmd_search(args):
     # Lazy import — avoids pulling in mcp deps at CLI startup
     from flex.mcp_server import execute_query
 
-    db = _open_cell_for_search(args.cell)
+    db = _open_cell_for_search(args.cell, args.query)
     try:
         query = args.query
         if query.startswith('!'):
@@ -1783,6 +1921,29 @@ def cmd_soma_backfill_identity(args):
         sys.exit(code)
 
 
+def cmd_edges(args):
+    """Dispatch edge-table maintenance subcommands."""
+    action = getattr(args, "edges_action", None)
+    if action == "dedupe":
+        return cmd_edges_dedupe(args)
+    print("  Expected one of: dedupe")
+
+
+def cmd_edges_dedupe(args):
+    """Dedupe _edges_source / _edges_delegations on existing cells.
+
+    Fixes cells whose INSERT OR IGNORE never had a uniqueness constraint to
+    ignore against, so every re-ingest appended duplicate edge rows. See
+    flex/manage/dedupe_edges.py.
+    """
+    from flex.manage.dedupe_edges import report, run
+
+    results = run([args.cell] if args.cell else None, dry_run=args.dry_run, vacuum=args.vacuum)
+    code = report(results, dry_run=args.dry_run)
+    if code:
+        sys.exit(code)
+
+
 def cmd_status(args):
     """Show cell health, lifecycle, and refresh status."""
     from flex.health import refresh_problems, watch_problem, watch_problems
@@ -1974,6 +2135,67 @@ def cmd_warm(args):
         print("Restart to apply: systemctl --user restart flex-mcp")
 
 
+def cmd_reembed(args):
+    """Convert cell(s) onto the standard (Nomic) embedding model.
+
+    The sanctioned per-cell model-upgrade path: each
+    cell's `_raw_chunks`/`_raw_sources` embedding column is OVERWRITTEN with
+    Nomic-768 vectors via copy-then-atomic-swap — never in-place on the live
+    database. The
+    live cell keeps serving MiniLM correctly for its full duration; it only
+    flips, atomically, once the copy is fully re-embedded and verified.
+    Backs up each cell db before touching it. Skips cells already
+    `vec:model=nomic-v1.5-fp32` unless `--force`.
+    """
+    from flex.compile.reembed import reembed_cell
+    from flex import registry
+
+    names = list(getattr(args, 'cells', []) or [])
+    had_error = False
+    if names:
+        targets = []
+        for n in names:
+            path = registry.resolve_cell(n)
+            if path is None:
+                print(f"{n}: ERROR — unknown cell")
+                had_error = True
+                continue
+            targets.append((n, path))
+    else:
+        targets = [(c['name'], Path(c['path'])) for c in registry.list_cells()]
+
+    if not targets:
+        print("No cells to reembed.")
+        if had_error:
+            raise SystemExit(1)
+        return
+
+    dry_run = bool(getattr(args, 'dry_run', False))
+    force = bool(getattr(args, 'force', False))
+    for name, path in targets:
+        if not dry_run:
+            print(f"{name}: migrating to nomic-v1.5-fp32 (live cell stays intact until verified swap)")
+        # Pass the registry name, not only its path, so the migration can
+        # freeze ingest and restore the cell's exact prior active state.
+        result = reembed_cell(name, dry_run=dry_run, force=force)
+        status = result.get('status')
+        if status == 'converted':
+            print(f"{name}: converted ({result['chunks']} chunks)  "
+                  f"backup={result['backup']}")
+        elif status == 'skipped':
+            print(f"{name}: skipped ({result['reason']})")
+        elif status == 'dry-run':
+            note = f"  — {result['note']}" if result.get('note') else ""
+            print(f"{name}: {result['pending']} pending / {result['chunks']} total chunks, "
+                  f"~{result['eta_seconds']}s ETA{note}")
+        else:
+            had_error = True
+            print(f"{name}: ERROR — {result.get('reason')}"
+                  + (f"  backup={result['backup']}" if result.get('backup') else ""))
+    if had_error:
+        raise SystemExit(1)
+
+
 def cmd_health(args):
     """Show compact operational health."""
     from flex.health import (
@@ -2050,7 +2272,7 @@ def _gnu_flex_proxy():
     # Our commands — definitely not GNU flex
     our_commands = {
         "init", "search", "sync", "remove", "status", "health",
-        "module", "relay", "hub", "index",
+        "module", "relay", "hub", "index", "warm", "reembed", "edges", "soma",
         "-h", "--help",
     }
     if argv[0] in our_commands:
@@ -2173,13 +2395,13 @@ def main():
         _module_help_lines.append(f"{_name}: {_sum}" if _sum else _name)
     _module_help = (
         "Module to install. Surface verbs: "
-        "filesystem <path> [--embed|--no-embed] (structural Instant, default; "
-        "or semantic Vector with --embed), codegraph <path> (a repo's call/import "
-        "graph). Engines/aliases: " + (", ".join(sorted(_install_modules)) or "(none)")
+        "filesystem <path> (structural FTS+SQL+node tree; no embeddings), "
+        "codegraph <path> (a repo's call/import graph). Markdown/Obsidian vaults "
+        "use the explicit obsidian or markdown module. Engines/aliases: "
+        + (", ".join(sorted(_install_modules)) or "(none)")
     )
     _surface_help_lines = [
-        "filesystem: index a folder — Instant (structural FTS+SQL+node tree, default / --no-embed) "
-        "or Vector (semantic embeddings, --embed)",
+        "filesystem: index a folder as structural FTS+SQL+node tree (no embeddings)",
         "codegraph: compile a repository into a call/import graph (instant --code)",
     ]
     init_p = sub.add_parser(
@@ -2191,13 +2413,14 @@ def main():
         formatter_class=argparse.RawDescriptionHelpFormatter,
     )
     init_p.add_argument("--module", default=None, help=_module_help)
-    # Surface flags for the `filesystem` verb — select the engine the folder routes to.
+    # Compatibility flags for the `filesystem` verb. --embed is rejected rather
+    # than silently changing the source semantics to Markdown-only indexing.
     init_p.add_argument("--embed", action="store_true",
-                        help="filesystem: build a Vector cell (semantic embeddings) — "
-                             "routes to the markdown/obsidian engine")
+                        help="filesystem: unsupported in 0.52; use the explicit "
+                             "obsidian or markdown module for a vault")
     init_p.add_argument("--no-embed", action="store_true",
-                        help="filesystem: build an Instant cell (structural FTS+SQL+node "
-                             "tree) — the default; routes to the instant engine")
+                        help="filesystem: structural FTS+SQL+node tree (the default; "
+                             "accepted for compatibility)")
     for _entry in _install_modules.values():
         _reg = getattr(_entry['module'], 'register_args', None)
         if callable(_reg):
@@ -2243,6 +2466,19 @@ def main():
                                   help="Only this cell (default: all registered cells)")
     soma_backfill_p.add_argument("--dry-run", action="store_true",
                                   help="Report per-cell coverage only, write nothing")
+
+    edges_p = sub.add_parser("edges", help="Edge-table maintenance utilities")
+    edges_sub = edges_p.add_subparsers(dest="edges_action")
+    edges_dedupe_p = edges_sub.add_parser(
+        "dedupe",
+        help="Dedupe _edges_source / _edges_delegations on existing cells (fixes stale duplicate rows)",
+    )
+    edges_dedupe_p.add_argument("--cell", default=None,
+                                 help="Only this cell (default: all registered cells)")
+    edges_dedupe_p.add_argument("--dry-run", action="store_true",
+                                 help="Report counts only, write nothing")
+    edges_dedupe_p.add_argument("--vacuum", action="store_true",
+                                 help="VACUUM cells that were actually deduped")
 
     # flex hub — view/pull/push cells + status (two-level dispatch,
     # mirroring the `soma`/`module` groups above)
@@ -2320,6 +2556,16 @@ def main():
     warm_p.add_argument("--only", action="store_true", help="Warm ONLY the named cells; mark all others lazy")
     warm_p.add_argument("--restart", action="store_true", help="Restart flex-mcp to apply now")
 
+    # flex reembed — convert cell(s) onto the standard (Nomic) embedding model
+    reembed_p = sub.add_parser(
+        "reembed",
+        help="Convert cell(s) onto the standard embedding model (copy-then-atomic-swap)")
+    reembed_p.add_argument("cells", nargs="*", help="Cell names to reembed (none = all registered cells)")
+    reembed_p.add_argument("--dry-run", action="store_true",
+                           help="Report pending/total chunk counts + ETA without writing anything")
+    reembed_p.add_argument("--force", action="store_true",
+                           help="Reembed even if already vec:model=nomic-v1.5-fp32")
+
     _register_extra = get_hook("register_extra_commands")
     if _register_extra:
         _register_extra(sub)
@@ -2336,6 +2582,8 @@ def main():
             cmd_module(args)
         elif args.command == "soma":
             cmd_soma(args)
+        elif args.command == "edges":
+            cmd_edges(args)
         elif args.command == "hub":
             cmd_hub(args)
         elif args.command == "remove":
@@ -2346,6 +2594,8 @@ def main():
             cmd_health(args)
         elif args.command == "warm":
             cmd_warm(args)
+        elif args.command == "reembed":
+            cmd_reembed(args)
         elif args.command == "relay":
             cmd_relay(args)
         elif hasattr(args, 'func'):

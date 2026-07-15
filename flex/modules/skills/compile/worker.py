@@ -33,13 +33,15 @@ from pathlib import Path
 from datetime import datetime, timezone
 
 from flex.core import open_cell, set_meta, validate_cell, log_op
+from flex.compile.edges_schema import edges_source_ddl
 
 
 # ═════════════════════════════════════════════════════
 # SCHEMA DDL
 # ═════════════════════════════════════════════════════
 
-SCHEMA_DDL = """
+SCHEMA_DDL = f"""
+{edges_source_ddl('github')}
 -- RAW LAYER
 CREATE TABLE IF NOT EXISTS _raw_chunks (
     id TEXT PRIMARY KEY,
@@ -64,16 +66,6 @@ CREATE TABLE IF NOT EXISTS _raw_content (
     content_hash TEXT PRIMARY KEY,
     content TEXT
 );
-
--- EDGE LAYER
-CREATE TABLE IF NOT EXISTS _edges_source (
-    chunk_id TEXT NOT NULL,
-    source_id TEXT NOT NULL,
-    source_type TEXT DEFAULT 'github',
-    position INTEGER
-);
-CREATE INDEX IF NOT EXISTS idx_es_chunk ON _edges_source(chunk_id);
-CREATE INDEX IF NOT EXISTS idx_es_source ON _edges_source(source_id);
 
 CREATE TABLE IF NOT EXISTS _edges_raw_content (
     source_id TEXT NOT NULL,

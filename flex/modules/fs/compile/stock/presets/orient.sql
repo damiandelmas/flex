@@ -40,7 +40,7 @@ UNION ALL SELECT '_edges_fs_identity', 'SOMA file_uuid per file — the hinge to
 -- @query: nav_presets
 -- The navigation verbs (graph traversal, daemon-free). Prefer these over raw graph SQL.
 SELECT '@callers symbol=NAME' AS preset, 'who calls NAME' AS does
-UNION ALL SELECT '@callees symbol=NAME', 'what NAME calls'
+UNION ALL SELECT '@callees symbol=NAME [def_id=ID|file=PATH]', 'what NAME calls; qualify a same-named caller definition when needed'
 UNION ALL SELECT '@impact  symbol=NAME', 'transitive callers — blast radius of changing NAME'
 UNION ALL SELECT '@subtree root=ID_or_FILEPATH', 'recursive descendants — a file''s tree, or a class''s methods';
 
@@ -50,14 +50,14 @@ SELECT 'graph' AS surface, 'navigation — @callers/@callees/@impact/@subtree, o
 UNION ALL SELECT 'symbol', 'exact definition — keyword(''NAME'') or WHERE section_title = ''NAME'' on chunks'
 UNION ALL SELECT 'keyword()', 'FTS5 over content — a literal, error string, or identifier. Scope with the 2nd arg.'
 UNION ALL SELECT 'structural', 'GROUP BY / COUNT(DISTINCT) over chunks / _edges_* — free; get the shape before reading bodies'
-UNION ALL SELECT 'vec_ops', 'INERT — a code cell has no embeddings. There is no semantic/fuzzy search; use keyword() + the graph.';
+UNION ALL SELECT 'vec_ops', 'UNAVAILABLE and rejected — a code cell has no embeddings. There is no semantic/fuzzy search; use keyword() + the graph.';
 
 -- @query: coverage
 -- Be honest about what the graph does and does not cover (qualify claims against this).
 SELECT 'languages' AS aspect, 'call + import edges and the class > method tree: Python (ast) and JS/TS (tree-sitter). Other languages chunk flat; markdown nests by heading — no call graph.' AS detail
 UNION ALL SELECT 'call resolution', 'Python: bare foo() only. JS/TS: bare foo() plus this.m()/super.m() (resolved to the enclosing class). Other member calls (obj.m()) are NOT edges — name-only resolution cannot disambiguate them.'
-UNION ALL SELECT 'external / collisions', 'stdlib/external calls and same-named defs are unresolved — the call keeps callee_name, with no resolved target.'
-UNION ALL SELECT 'fan-out', 'the chunks view can fan out — use DISTINCT when listing; the @callers/@callees/@impact presets join _types_instant (1:1) and are clean.';
+UNION ALL SELECT 'external / collisions', 'stdlib/external calls are unresolved. Same-named definitions are returned as conservative candidate sets with resolution_state and candidate_count; candidates are not certain edges.'
+UNION ALL SELECT 'fan-out', 'chunks may fan out through optional enrichments. @subtree reads one-row structural tables; graph presets label any candidate expansion.';
 
 -- @query: presets
 SELECT name, description, params FROM _presets ORDER BY name;

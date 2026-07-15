@@ -670,9 +670,13 @@ def _build_tool_schema() -> dict:
             },
             "cell": {
                 "type": "string",
-                "description": "Knowledge cell to query.",
+                "description": (
+                    "Knowledge cell to query by exact name. Discoverable cells: "
+                    + (", ".join(cell_list) if cell_list else "claude_code")
+                    + ". Active unlisted cells are accepted by exact name even though hidden from discovery."
+                ),
                 "default": "claude_code",
-                "enum": cell_list if cell_list else ["claude_code"],
+                "examples": cell_list if cell_list else ["claude_code"],
             },
             "params": {
                 "type": "object",
@@ -906,6 +910,10 @@ def _execute_cell_query(cell: str, query: str) -> str:
     """Synchronous cell query — runs in executor to avoid blocking event loop."""
     with get_cell(cell) as db:
         if db is None:
+            from flex.registry import retired_cell_message
+            retired = retired_cell_message(cell)
+            if retired:
+                return json.dumps({"error": retired, "retired": True})
             available = sorted(_known_cells)
             on_disk = set(discover_cells()) - set(available)
             msg = {"error": f"Unknown cell: {cell}", "available": available}

@@ -29,10 +29,10 @@ SELECT 'embedded_sections', COUNT(*) FROM _raw_chunks WHERE embedding IS NOT NUL
 
 -- @query: embed_mode
 -- The cell's own declaration (_meta.embed). Embed-off cells carry no vectors:
--- the semantic surface is INERT and @orient advertises only the structural one.
+-- semantic scoring is unavailable and @orient advertises the structural surface.
 SELECT CASE
     WHEN lower(COALESCE((SELECT value FROM _meta WHERE key='embed'),'true')) IN ('false','0','off','no')
-    THEN 'embed-off — structural surface (keyword() FTS + node tree + declared edges + identity); vec_ops/similar/centroid/near_type are INERT'
+    THEN 'embed-off — structural surface (keyword() FTS + node tree + declared edges + identity); semantic scoring is unavailable'
     ELSE 'embed-on — semantic + structural surface (vec_ops + keyword() + views)'
 END AS embed_mode;
 
@@ -55,8 +55,8 @@ ORDER BY
 
 -- @query: query_surface
 -- The semantic row is gated on the cell's embed mode (_meta.embed). An embed-off
--- cell carries no vectors, so vec_ops/similar/centroid/near_type are INERT: the row
--- is replaced by an explicit INERT notice pointing at the structural surface. The
+-- cell carries no vectors, so vec_ops/similar/centroid/near_type are unavailable: the row
+-- is replaced by an explicit notice pointing at the structural surface. The
 -- predicate set ('false','0','off','no') matches cell_is_no_embed() verbatim.
 SELECT 'scoring' AS kind,
        'vec' || '_ops(''similar:topic diverse pool:100'', ''SELECT id FROM sections'')' AS name,
@@ -65,7 +65,7 @@ SELECT 'scoring' AS kind,
 WHERE lower(COALESCE((SELECT value FROM _meta WHERE key='embed'),'true')) NOT IN ('false','0','off','no')
 UNION ALL
 SELECT 'scoring',
-       'INERT — no embeddings in this cell',
+       'UNAVAILABLE — no embeddings in this cell',
        '(unavailable)',
        'Embed-off cell: vec_ops/similar/centroid/near_type do not apply. Use keyword() + structural SQL + the node tree (_edges_tree) instead.'
 WHERE lower(COALESCE((SELECT value FROM _meta WHERE key='embed'),'true')) IN ('false','0','off','no')
@@ -90,6 +90,13 @@ UNION ALL
 SELECT 'table', 'chunks_fts',
        'rowid, content',
        'Raw FTS5 table. Prefer keyword(); bridge manually only for advanced filters.';
+
+-- @query: health_defects
+-- Rejected metadata is visible rather than silently entering chronology.
+SELECT kind, COUNT(*) AS affected
+FROM _health_defects
+GROUP BY kind
+ORDER BY affected DESC, kind;
 
 -- @query: doc_types
 -- doc_type is the compound 'category.subtype'; plan-support refs (slot/spec/shape)
@@ -171,7 +178,7 @@ SELECT 'semantic_section',
 WHERE lower(COALESCE((SELECT value FROM _meta WHERE key='embed'),'true')) NOT IN ('false','0','off','no')
 UNION ALL
 SELECT 'tree_subtree',
-       'SELECT t.depth, s.section_title, substr(s.content,1,800) AS content FROM _edges_tree t JOIN sections s ON s.id = t.id WHERE t.id LIKE ''SOURCE_ID%'' ORDER BY t.depth, s.position'
+       'WITH RECURSIVE subtree(id, depth) AS (SELECT id, 0 FROM sections WHERE id = ''ROOT_SECTION_ID'' UNION ALL SELECT e.id, subtree.depth + 1 FROM _edges_tree e JOIN subtree ON e.parent_id = subtree.id) SELECT subtree.depth, s.section_title, substr(s.content,1,800) AS content FROM subtree JOIN sections s ON s.id = subtree.id ORDER BY subtree.depth, s.position'
 UNION ALL
 SELECT 'exact_term',
        'SELECT k.rank, k.snippet, s.source_id, s.title, s.source_path, s.section_title, substr(s.content,1,1000) AS content FROM key' || 'word(''TERM'', ''SELECT id FROM sections'') k JOIN sections s ON s.id = k.id ORDER BY k.rank DESC LIMIT 10'

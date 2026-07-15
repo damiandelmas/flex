@@ -18,7 +18,21 @@ import asyncio
 import os
 import signal
 import sys
+import threading
 import time
+
+
+def _start_daemon_thread(target, *args, name: str):
+    """Run process-local background work without delaying process exit.
+
+    ``asyncio.to_thread`` uses non-daemon executor threads. A long vector-cache
+    warmup can therefore keep Python alive after Uvicorn has shut down, until
+    systemd kills the otherwise-finished service. Warmup state is expendable
+    process-local cache state, so a daemon thread is the correct lifecycle.
+    """
+    thread = threading.Thread(target=target, args=args, name=name, daemon=True)
+    thread.start()
+    return thread
 
 
 # ============================================================
@@ -93,18 +107,20 @@ async def _run_stdio(active_names: list[str] | None = None, no_embed: bool = Fal
 
     server = get_server()
     bg_task = None
-    warm_task = None
+    warm_thread = None
     try:
         async with stdio_server() as (read_stream, write_stream):
             if active_names and not no_embed:
-                warm_task = asyncio.create_task(asyncio.to_thread(warm_cells, active_names))
+                warm_thread = _start_daemon_thread(
+                    warm_cells, active_names, name="flex-vector-warmup"
+                )
             if os.environ.get("FLEX_MCP_ENABLE_STDIO_INDEXER") == "1":
                 bg_task = asyncio.create_task(_background_indexer())
             await server.run(
                 read_stream, write_stream, server.create_initialization_options()
             )
     finally:
-        for task in (bg_task, warm_task):
+        for task in (bg_task,):
             if task:
                 task.cancel()
                 try:
@@ -186,9 +202,11 @@ def run_http_server(port: int = 7134, active_names: list[str] | None = None, no_
     @asynccontextmanager
     async def lifespan(app):
         task = None
-        warm_task = None
+        warm_thread = None
         if active_names and not no_embed:
-            warm_task = asyncio.create_task(asyncio.to_thread(warm_cells, active_names))
+            warm_thread = _start_daemon_thread(
+                warm_cells, active_names, name="flex-vector-warmup"
+            )
         try:
             from flex.ext import start_background
             task = asyncio.create_task(start_background())
@@ -196,7 +214,7 @@ def run_http_server(port: int = 7134, active_names: list[str] | None = None, no_
             pass
         async with session_manager.run():
             yield
-        for t in (task, warm_task):
+        for t in (task,):
             if t:
                 t.cancel()
 

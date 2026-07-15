@@ -473,6 +473,24 @@ def rebuild_file_graph(db):
     sys.stdout.flush()
 
 
+def rebuild_chunk_rollup(db):
+    """Rebuild the chunk-level file_uuids/delegation rollup used by curated views."""
+    from flex.modules.claude_code.manage.chunk_rollup import (
+        rebuild_chunk_rollup as _rebuild_chunk_rollup,
+    )
+
+    print("=" * 60)
+    print("Step 2.5: Chunk Rollup (file_uuids + delegation, 1:1)")
+    print("=" * 60)
+    sys.stdout.flush()
+
+    t0 = time.time()
+    row_count = _rebuild_chunk_rollup(db)
+    t1 = time.time()
+    print(f'Done in {t1-t0:.1f}s — {row_count} rows\n')
+    sys.stdout.flush()
+
+
 def rebuild_delegation_graph(db):
     """Rebuild delegation graph."""
     from flex.modules.claude_code.manage.delegation_graph import (
@@ -571,6 +589,7 @@ def main():
     rebuild_source_graph(db)
     rebuild_file_graph(db)
     rebuild_delegation_graph(db)
+    rebuild_chunk_rollup(db)
     rebuild_fingerprints(db)
     rebuild_repo_project(db)
     rebuild_community_labels(db)

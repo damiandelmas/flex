@@ -15,17 +15,19 @@ SELECT COALESCE((SELECT value FROM _meta WHERE key='description'), 'instant file
 
 -- @query: embed_mode
 -- The one honesty conditional. An instant fs cell is no-embed by default (no _meta.embed key),
--- so vec_ops/similar are INERT — use keyword() + structural SQL. Flips only if built --embed.
+-- so vec_ops/similar are unavailable — use keyword() + structural SQL. Flips only if built --embed.
 SELECT CASE
   WHEN lower(COALESCE((SELECT value FROM _meta WHERE key='embed'),'false')) IN ('false','0','off','no')
-  THEN 'embed-off — structural cell: keyword() FTS + path scoping + file identity (and node tree / call graph when built --nest/--code). vec_ops/similar are INERT.'
+  THEN 'embed-off — structural cell: keyword() FTS + path scoping + file identity (and node tree / call graph when built --nest/--code). vec_ops/similar are unavailable.'
   ELSE 'embed-on — this fs cell also carries embeddings: vec_ops/similar are available.'
 END AS embed_mode;
 
 -- @query: shape
-SELECT 'files' AS what, COUNT(*) AS n FROM sources
-UNION ALL SELECT 'chunks', COUNT(*) FROM chunks
-UNION ALL SELECT 'embedded', COALESCE((SELECT COUNT(*) FROM _raw_chunks WHERE embedding IS NOT NULL),0);
+SELECT 'source_rows' AS what, COUNT(*) AS n FROM _raw_sources
+UNION ALL SELECT 'raw_chunk_rows', COUNT(*) FROM _raw_chunks
+UNION ALL SELECT 'projected_chunk_rows', COUNT(*) FROM chunks
+UNION ALL SELECT 'distinct_projected_chunk_ids', COUNT(DISTINCT id) FROM chunks
+UNION ALL SELECT 'embedded_raw_chunks', COALESCE((SELECT COUNT(*) FROM _raw_chunks WHERE embedding IS NOT NULL),0);
 
 -- @query: columns
 -- DISCOVERED from the live views — never hardcoded. This is the agentic PRAGMA: the exact
@@ -48,7 +50,9 @@ SELECT name, description, params FROM _presets ORDER BY name;
 -- @query: path_roots
 -- A few coarse source_id prefixes so an agent sees the corpus's real path structure to scope against
 -- (grounds the skill's generic `source_id LIKE` scoping to THIS cell).
-SELECT DISTINCT substr(source_id, 1, 48) AS root FROM sources ORDER BY root LIMIT 12;
+SELECT value AS root
+FROM json_each(COALESCE((SELECT value FROM _meta WHERE key='selections'), '[]'))
+ORDER BY root;
 
 -- @query: method
 -- Pointer, not pedagogy: the query METHOD lives in the skill; this orient is the live contract.

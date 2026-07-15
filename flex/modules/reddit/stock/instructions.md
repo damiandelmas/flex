@@ -1,6 +1,6 @@
 # Reddit Cell Instructions
 
-Subreddit-scoped public archive via Arctic Shift. No Reddit authentication.
+A subreddit-scoped public archive via Arctic Shift. No Reddit authentication.
 A cell covers only the subreddits named at install or refresh time.
 
 ```bash

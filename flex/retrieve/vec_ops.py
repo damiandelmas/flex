@@ -223,6 +223,13 @@ class VectorCache:
         self._id_to_idx: Dict[str, int] = {}
         self.loaded_at: Optional[float] = None
         self.dims: int = 0
+        # Stored (pre-slice) column width, e.g. 768 for a native-Nomic column
+        # served at serve_dim=128. Equals self.dims when there is no Matryoshka
+        # slice (e.g. MiniLM@128). append_from_db matches new rows on THIS width
+        # (the actual blob length in the column) then slices to self.dims —
+        # matching on self.dims would silently match zero rows whenever
+        # serve_dim < stored width, permanently defeating incremental append.
+        self._stored_dim: int = 0
         # Column arrays for landscape modulation (N,), aligned with self.ids
         self.timestamps: Optional[np.ndarray] = None    # (N,) float64, epoch seconds
         # Incremental-append cursor state (see append_from_db)
@@ -230,8 +237,12 @@ class VectorCache:
         self.embedded_count: int = 0     # rows in the matrix (post dim-filter)
 
     def load_from_db(self, db, table: str, embedding_col: str = 'embedding',
-                     id_col: str = 'id') -> 'VectorCache':
-        """Load vectors from SQLite BLOB column into numpy matrix."""
+                     id_col: str = 'id', serve_dim: int | None = None) -> 'VectorCache':
+        """Load vectors from SQLite BLOB column into numpy matrix.
+
+        serve_dim: optional Matryoshka slice applied AFTER the dominant-dim
+        guard and BEFORE normalization. No-op when serve_dim >= the loaded
+        matrix width (e.g. MiniLM@128 stays 128)."""
         start = time.time()
 
         rows = db.execute(
@@ -268,12 +279,19 @@ class VectorCache:
 
         # Stack into matrix
         self.matrix = np.vstack(vectors)  # (n, dims)
+        self._stored_dim = self.matrix.shape[1]   # pre-slice column width
+
+        if serve_dim and serve_dim < self.matrix.shape[1]:        # Matryoshka slice
+            self.matrix = np.ascontiguousarray(self.matrix[:, :serve_dim])
+
         self.dims = self.matrix.shape[1]
 
-        # Normalize for cosine similarity (in-place)
+        # Normalize for cosine similarity (in-place slice is a fresh contiguous
+        # array from the copy above; the unsliced path keeps the original
+        # vstack buffer, so /= is still safe there too)
         norms = np.linalg.norm(self.matrix, axis=1, keepdims=True)
         norms[norms == 0] = 1
-        self.matrix /= norms
+        self.matrix = self.matrix / norms
 
         # Build index
         self._id_to_idx = {id_: i for i, id_ in enumerate(self.ids)}
@@ -325,43 +343,6 @@ class VectorCache:
             print(f"VectorCache: memmap persist failed ({e}); staying in RAM",
                   file=sys.stderr)
 
-    def load_from_embeddings(self, db, model: str, serve_dim: int = None,
-                             kind: str = 'chunk') -> 'VectorCache':
-        """Load the matrix from the multi-model `_embeddings` table (active model),
-        Matryoshka-sliced to serve_dim. Opt-in serving path. Marks self._model so the
-        refresh path full-rebuilds (the incremental append assumes _raw_chunks rowids).
-        Scoring is unchanged — the matrix is the same normalized float32 (n, dim)."""
-        start = time.time()
-        rows = db.execute(
-            "SELECT id, vector FROM _embeddings WHERE model = ? AND kind = ?",
-            (model, kind)).fetchall()
-        if not rows:
-            return self
-        self.ids = [r[0] for r in rows]
-        vectors = [np.frombuffer(r[1], dtype=np.float32) for r in rows]
-        dims = [v.shape[0] for v in vectors]
-        dominant = max(set(dims), key=dims.count)
-        if any(d != dominant for d in dims):
-            kept = [(i, v) for i, v, d in zip(self.ids, vectors, dims) if d == dominant]
-            self.ids = [k[0] for k in kept]
-            vectors = [k[1] for k in kept]
-        self.matrix = np.vstack(vectors)
-        if serve_dim and serve_dim < self.matrix.shape[1]:        # Matryoshka slice
-            self.matrix = np.ascontiguousarray(self.matrix[:, :serve_dim])
-        self.dims = self.matrix.shape[1]
-        norms = np.linalg.norm(self.matrix, axis=1, keepdims=True)
-        norms[norms == 0] = 1
-        self.matrix = self.matrix / norms                         # renormalize (slice or stored)
-        self._id_to_idx = {id_: i for i, id_ in enumerate(self.ids)}
-        self.embedded_count = len(self.ids)
-        self.max_rowid = 0          # no rowid alignment -> append falls back to rebuild
-        self._model = model
-        self.loaded_at = time.time()
-        self._load_msg = (f"VectorCache[{model}@{self.dims}]: {len(self.ids)} vectors "
-                          f"({(self.loaded_at - start) * 1000:.1f}ms)")
-        self._memmap_matrix(db, f"emb_{model}_{self.dims}")
-        return self
-
     def append_from_db(self, db, table: str, embedding_col: str = 'embedding',
                        id_col: str = 'id') -> 'VectorCache | None | int':
         """Incremental refresh: build a SUCCESSOR cache with rows appended.
@@ -383,7 +364,14 @@ class VectorCache:
         if self.matrix is None or not self.ids or self.dims == 0:
             return None
 
-        byte_len = self.dims * 4  # float32 blobs; length() on BLOB = bytes
+        # Match new rows on the STORED (pre-slice) column width, not the served
+        # width — a nomic column stores native 768d while self.dims is the
+        # Matryoshka serve_dim (e.g. 128). Matching on self.dims would match
+        # zero rows whenever serve_dim < stored width, forcing a full rebuild
+        # on every refresh. Falls back to self.dims if _stored_dim is somehow
+        # unset (defensive; load_from_db always sets it).
+        stored_dim = self._stored_dim or self.dims
+        byte_len = stored_dim * 4  # float32 blobs; length() on BLOB = bytes
         try:
             total = db.execute(
                 f"SELECT COUNT(*) FROM [{table}] "
@@ -415,15 +403,18 @@ class VectorCache:
             if rowid is not None and rowid > new_max:
                 new_max = rowid
             v = np.frombuffer(blob, dtype=np.float32)
-            if v.shape[0] != self.dims:
+            if v.shape[0] != stored_dim:
                 continue  # mixed-model artifact, same rule as load_from_db
             if id_ in self._id_to_idx:
                 continue  # already present (e.g. re-scanned row)
+            if stored_dim > self.dims:                # Matryoshka slice, mirrors
+                v = v[:self.dims]                      # load_from_db (renorm below)
             new_ids.append(id_)
             vecs.append(v)
 
         succ = VectorCache()
         succ.dims = self.dims
+        succ._stored_dim = self._stored_dim
         succ.loaded_at = self.loaded_at  # full-load age survives appends (rebuild floor)
         succ.max_rowid = new_max
         succ.embedded_count = self.embedded_count + len(new_ids)
@@ -580,6 +571,54 @@ class VectorCache:
         return f"VectorCache({self.size} vectors, {self.dims}d, {self.memory_mb:.1f}MB)"
 
 
+def _mask_sql_data(sql: str) -> str:
+    """Blank SQL strings, quoted identifiers, and comments without moving bytes.
+
+    Materializers only need to recognize calls in executable SQL.  Keeping the
+    result the same length lets matches found in the mask slice the original SQL
+    directly, avoiding a parser dependency and the false positives caused by
+    documentation literals in presets.
+    """
+    masked = list(sql)
+    i = 0
+    while i < len(sql):
+        c = sql[i]
+        if c == '-' and i + 1 < len(sql) and sql[i + 1] == '-':
+            end = sql.find('\n', i + 2)
+            end = len(sql) if end < 0 else end
+            masked[i:end] = ' ' * (end - i)
+            i = end
+            continue
+        if c == '/' and i + 1 < len(sql) and sql[i + 1] == '*':
+            end = sql.find('*/', i + 2)
+            end = len(sql) if end < 0 else end + 2
+            masked[i:end] = ' ' * (end - i)
+            i = end
+            continue
+        if c in ("'", '"', '`'):
+            quote = c
+            start = i
+            i += 1
+            while i < len(sql):
+                if sql[i] == quote:
+                    if i + 1 < len(sql) and sql[i + 1] == quote:
+                        i += 2
+                        continue
+                    i += 1
+                    break
+                i += 1
+            masked[start:i] = ' ' * (i - start)
+            continue
+        if c == '[':
+            start = i
+            end = sql.find(']', i + 1)
+            i = len(sql) if end < 0 else end + 1
+            masked[start:i] = ' ' * (i - start)
+            continue
+        i += 1
+    return ''.join(masked)
+
+
 def materialize_vec_ops(db, sql: str) -> str:
     """Transparently materialize vec_ops() as a temp table.
 
@@ -591,50 +630,41 @@ def materialize_vec_ops(db, sql: str) -> str:
     Skips if wrapped in json_each() (backward compat).
     Only triggers when vec_ops appears as a table source (after FROM/JOIN).
     """
-    lower = sql.lower()
+    code = _mask_sql_data(sql)
+    lower = code.lower()
 
     # json_each(vec_ops(...)) — explicit pattern, don't touch
     if 'json_each' in lower:
         return sql
 
     # Find vec_ops(...) call — balanced paren matching for quoted strings
-    start = re.search(r'vec_ops\s*\(', sql)
+    start = re.search(r'\bvec_ops\s*\(', code, re.IGNORECASE)
     if not start:
         return sql
 
     # Only materialize when used as a table source
-    before = sql[:start.start()].rstrip().upper()
+    before = code[:start.start()].rstrip().upper()
     if not (before.endswith('FROM') or before.endswith('JOIN') or before.endswith(',')):
         return json.dumps({"error":
             "vec_ops must be used as a table source (after FROM or JOIN), "
             "not as a scalar expression. "
             "Correct: SELECT v.id, v.score FROM vec_ops('similar:query text') v"})
 
-    # Find the matching close paren (handles quoted strings with escaped '' quotes)
+    # Parentheses inside data/comments are blank in ``code``, so balance only
+    # executable punctuation while slicing the corresponding original text.
     paren_start = start.end() - 1
     depth = 0
-    in_quote = False
     end_pos = None
     i = paren_start
-    while i < len(sql):
-        c = sql[i]
-        if in_quote:
-            if c == "'":
-                if i + 1 < len(sql) and sql[i + 1] == "'":
-                    i += 2  # skip escaped quote '', stay in string
-                    continue
-                else:
-                    in_quote = False
-        else:
-            if c == "'":
-                in_quote = True
-            elif c == '(':
-                depth += 1
-            elif c == ')':
-                depth -= 1
-                if depth == 0:
-                    end_pos = i + 1
-                    break
+    while i < len(code):
+        c = code[i]
+        if c == '(':
+            depth += 1
+        elif c == ')':
+            depth -= 1
+            if depth == 0:
+                end_pos = i + 1
+                break
         i += 1
     if end_pos is None:
         return sql

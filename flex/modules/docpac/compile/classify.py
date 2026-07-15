@@ -10,6 +10,9 @@ _flex_types.json sidecar (here) > FOLDER_MAP path inference (docpac.py). This
 file owns the sidecar tier and the compound-prefix temporal derivation.
 """
 import json
+import re
+import sqlite3
+from datetime import date, datetime, timedelta
 from pathlib import Path
 
 
@@ -25,6 +28,73 @@ TEMPORAL_MAP = {
     'external': 'exogenous',
     'design':   'future',   # legacy flat doc_type (pre category×subtype)
 }
+
+_FILE_DATE_HEALTH_DDL = """
+CREATE TABLE IF NOT EXISTS _health_defects (
+    kind TEXT NOT NULL,
+    subject_id TEXT NOT NULL,
+    observed_value TEXT,
+    detail TEXT,
+    PRIMARY KEY (kind, subject_id)
+)
+"""
+
+
+def validate_file_date(value) -> str | None:
+    """Return an accepted raw calendar token, or NULL for malformed/future data."""
+    if value is None or str(value).strip() == '':
+        return None
+    raw = str(value).strip()
+    parsed = None
+    try:
+        if re.fullmatch(r'\d{6}', raw):
+            parsed = date(2000 + int(raw[:2]), int(raw[2:4]), int(raw[4:6]))
+        elif re.fullmatch(r'\d{6}-\d{4}', raw):
+            parsed = datetime(2000 + int(raw[:2]), int(raw[2:4]), int(raw[4:6]),
+                              int(raw[7:9]), int(raw[9:11])).date()
+        elif re.fullmatch(r'20\d{6}', raw):
+            parsed = datetime.strptime(raw, '%Y%m%d').date()
+        elif re.match(r'^20\d{2}-\d{2}-\d{2}', raw):
+            parsed = date.fromisoformat(raw[:10])
+    except ValueError:
+        return None
+    if parsed is None or parsed > date.today() + timedelta(days=1):
+        return None
+    return raw
+
+
+def record_file_date_health(conn: sqlite3.Connection, source_id: str, raw_value) -> str | None:
+    """Normalize the public value and keep a queryable defect for rejection."""
+    conn.execute(_FILE_DATE_HEALTH_DDL)
+    normalized = validate_file_date(raw_value)
+    if raw_value not in (None, '') and normalized is None:
+        conn.execute(
+            "INSERT OR REPLACE INTO _health_defects VALUES (?,?,?,?)",
+            ('invalid_file_date', source_id, str(raw_value),
+             'rejected: not a valid non-future supported calendar token'),
+        )
+    else:
+        conn.execute(
+            "DELETE FROM _health_defects WHERE kind='invalid_file_date' AND subject_id=?",
+            (source_id,),
+        )
+    return normalized
+
+
+def heal_invalid_file_dates(conn: sqlite3.Connection) -> int:
+    """Repair existing cells in place without touching valid calendar tokens."""
+    conn.execute(_FILE_DATE_HEALTH_DDL)
+    rows = conn.execute(
+        "SELECT source_id,file_date FROM _raw_sources WHERE file_date IS NOT NULL AND file_date<>''"
+    ).fetchall()
+    bad = 0
+    for source_id, raw in rows:
+        if validate_file_date(raw) is None:
+            record_file_date_health(conn, source_id, raw)
+            conn.execute("UPDATE _raw_sources SET file_date=NULL WHERE source_id=?", (source_id,))
+            bad += 1
+    conn.commit()
+    return bad
 
 
 def derive_temporal(doc_type, fallback):

@@ -51,13 +51,29 @@ class PresetLoader:
             return self._cache[name]
 
         row = self.db.execute(
-            "SELECT sql FROM _presets WHERE name = ?", (name,)
+            "SELECT description, params, sql FROM _presets WHERE name = ?", (name,)
         ).fetchone()
         if row is None:
             raise KeyError(f"Preset not found: {name}")
 
-        text = row[0]
+        text = row[2]
         preset = self._parse(text, name)
+        # Programmatically installed presets store their contract in table
+        # columns rather than SQL annotations. Those columns are equally
+        # authoritative and must drive validation/default interpolation.
+        if not preset.get('description'):
+            preset['description'] = row[0] or ''
+        if not preset.get('params') and row[1]:
+            preset['params'] = row[1]
+            for part in row[1].split(','):
+                match = re.match(r'(\w+)\s*\(default:\s*(.+?)\)', part.strip())
+                if not match:
+                    continue
+                key, value = match.groups()
+                try:
+                    preset['defaults'][key] = int(value)
+                except ValueError:
+                    preset['defaults'][key] = value.strip()
         self._cache[name] = preset
         return preset
 

@@ -24,12 +24,15 @@ from flex.views import install_views
 from flex.onnx.embed import get_model, encode
 from flex.modules.claude_code.compile.soft_detect import detect_file_ops
 from flex.modules.claude_code.compile.scope import excluded_tool as _excluded_tool
+from flex.compile.edges_schema import ensure_edges_source, ensure_edges_delegations
 _secondary_cell_drainer = None
 _corpus_drainer = None
+_corpus_path_drainer = None
 _corpus_graph_refresher = None
 try:
     from flex.modules.engines import drain_local_cells as _secondary_cell_drainer
     from flex.modules.engines import drain_corpus as _corpus_drainer
+    from flex.modules.engines import drain_corpus_paths as _corpus_path_drainer
     from flex.modules.engines import refresh_corpus_graphs as _corpus_graph_refresher
 except ImportError:
     pass
@@ -76,6 +79,7 @@ try:
     from flex.modules.claude_code.manage.rebuild_all import (
         rebuild_source_graph, rebuild_warmup_types, reembed_sources,
         rebuild_community_labels, rebuild_file_graph, rebuild_delegation_graph,
+        rebuild_chunk_rollup,
     )
 except ImportError:
     rebuild_source_graph = None
@@ -84,6 +88,7 @@ except ImportError:
     rebuild_community_labels = None
     rebuild_file_graph = None
     rebuild_delegation_graph = None
+    rebuild_chunk_rollup = None
 
 CLAUDE_PROJECTS = Path.home() / ".claude/projects"
 
@@ -178,6 +183,24 @@ def get_embedder():
 
 def serialize_f32(vector) -> bytes:
     return struct.pack(f'{len(vector)}f', *vector)
+
+
+def _encode_for_cell(conn: sqlite3.Connection, texts):
+    """Embed documents in the vector space declared by this cell's tag.
+
+    Coding-agent ingestion predates the shared tag-aware pipeline and used the
+    bundled MiniLM singleton directly. Once a cell is converted to Nomic that
+    silently creates a mixed-width cell on every subsequent watch tick. Keep
+    the legacy fast path for untagged/MiniLM cells, but resolve every explicit
+    Nomic tag through the same fail-closed ingest resolver as ``embed_new``.
+    """
+    from flex.compile.embed import _cell_tag, _resolve_ingest_target
+
+    tag = _cell_tag(conn)
+    if tag in (None, 'minilm'):
+        return encode(texts)
+    embed_doc = _resolve_ingest_target(conn)[0]
+    return embed_doc(texts, batch_size=64)
 
 
 # JSONL path cache — one rglob populates, subsequent lookups are O(1).
@@ -324,15 +347,6 @@ def _ensure_core_tables(conn: sqlite3.Connection):
             fork_count INTEGER DEFAULT 0
         );
 
-        CREATE TABLE IF NOT EXISTS _edges_source (
-            chunk_id TEXT NOT NULL,
-            source_id TEXT NOT NULL,
-            source_type TEXT DEFAULT 'claude-code',
-            position INTEGER
-        );
-        CREATE INDEX IF NOT EXISTS idx_es_chunk ON _edges_source(chunk_id);
-        CREATE INDEX IF NOT EXISTS idx_es_source ON _edges_source(source_id);
-
         CREATE TABLE IF NOT EXISTS _edges_tool_ops (
             chunk_id TEXT PRIMARY KEY,
             tool_name TEXT,
@@ -358,16 +372,24 @@ def _ensure_core_tables(conn: sqlite3.Connection):
         -- not via the chunks view (which CASE-computes type and can't use it).
         CREATE INDEX IF NOT EXISTS idx_types_message_type ON _types_message(type);
 
-        CREATE TABLE IF NOT EXISTS _edges_delegations (
-            id INTEGER PRIMARY KEY,
-            chunk_id TEXT,
+        -- 1:1 rollup of _edges_file_identity (1:many) + _edges_delegations,
+        -- keyed by chunk_id. The chunks/messages views PK-probe this instead
+        -- of inlining aggregate GROUP BY subqueries (which SQLite MATERIALIZEs
+        -- in full before applying any predicate — see chunk_rollup.py).
+        -- Kept fresh at ingest by _upsert_chunk_rollup(); rebuilt from scratch
+        -- each enrichment cycle by rebuild_chunk_rollup(). 6-column shape
+        -- created directly (not the legacy 4-column one) so a brand-new
+        -- cell never needs the ALTER-TABLE migration in
+        -- views.py::_ensure_chunk_rollup_fresh — that migration path exists
+        -- only for cells that predate the type/ext columns.
+        CREATE TABLE IF NOT EXISTS _enrich_chunk_rollup (
+            chunk_id TEXT PRIMARY KEY,
+            file_uuids TEXT,
             child_session_id TEXT,
             agent_type TEXT,
-            created_at INTEGER,
-            parent_source_id TEXT
+            type TEXT,
+            ext TEXT
         );
-        CREATE UNIQUE INDEX IF NOT EXISTS idx_deleg_chunk_child
-            ON _edges_delegations(chunk_id, child_session_id);
 
         CREATE TABLE IF NOT EXISTS _edges_soft_ops (
             id INTEGER PRIMARY KEY,
@@ -412,6 +434,8 @@ def _ensure_core_tables(conn: sqlite3.Connection):
             content_rowid='rowid'
         );
     """)
+    ensure_edges_source(conn, 'claude-code')
+    ensure_edges_delegations(conn)
     # FTS triggers — can't use IF NOT EXISTS, so check first
     has_trigger = conn.execute(
         "SELECT 1 FROM sqlite_master WHERE type='trigger' AND name='raw_chunks_ai'"
@@ -429,6 +453,15 @@ def _ensure_core_tables(conn: sqlite3.Connection):
                 INSERT INTO chunks_fts(rowid, content) VALUES (new.rowid, new.content);
             END;
         """)
+
+    # Bring _enrich_chunk_rollup to the current schema (6 columns, type
+    # index, default-row trigger) unconditionally here — the one choke
+    # point every ingest path runs through before touching _raw_chunks.
+    from flex.modules.claude_code.manage.chunk_rollup import ensure_rollup_schema
+    ensure_rollup_schema(conn)
+    from flex.modules.claude_code.manage.observations import ensure_observation_schema
+    ensure_observation_schema(conn)
+    conn.commit()
 
 
 def _ensure_content_tables(conn: sqlite3.Connection):
@@ -554,6 +587,11 @@ def _ingest_file_body(conn: sqlite3.Connection, parent_chunk_id: str,
         conn.execute(
             "INSERT OR IGNORE INTO _types_file_body VALUES (?,?,?,?)",
             (fb_id, target_file, chunk['title'], chunk['position']))
+        # These :fb: sub-chunks bypass insert_chunk_atom (they're inserted
+        # directly above), so nothing else upserts their rollup row —
+        # without this, the view's LEFT JOIN would silently return NULL
+        # for their type instead of 'file' until the next enrichment cycle.
+        _upsert_chunk_rollup(conn, fb_id)
         inserted += 1
 
     # Update index
@@ -593,8 +631,111 @@ def _normalize_tool_result(content) -> str | None:
     return None
 
 
-def insert_chunk_atom(conn: sqlite3.Connection, chunk: dict):
-    """Insert a chunk into all chunk-atom tables."""
+def _is_missing_table_error(exc: sqlite3.OperationalError, table: str) -> bool:
+    """True only for 'no such table: <table>' — never locks, IO errors, etc."""
+    return str(exc).strip() == f"no such table: {table}"
+
+
+def _upsert_chunk_rollup(conn: sqlite3.Connection, chunk_id: str):
+    """Keep _enrich_chunk_rollup fresh for one chunk at ingest time.
+
+    Re-derives the rollup row from _edges_file_identity / _edges_delegations
+    for this chunk_id — called right after either edge table is written for
+    the chunk, so a chunk ingested now has correct file_uuids/child_session_id
+    immediately, not after the next 30-minute enrichment cycle. Also
+    (re)computes type/ext — every chunk gets a row now, since type/ext must
+    be a real materialized value (indexable) for every chunk, not just
+    edge-bearing ones.
+
+    Missing-table errors (transitional cell states — SOMA disabled, or a
+    cell that predates this rollup table) are expected and silently
+    skipped. Anything else (lock timeout, IO error, corruption) is logged,
+    not swallowed — a chunk silently missing its identity with zero trace
+    is exactly the failure mode this function exists to prevent elsewhere.
+    """
+    file_uuids = None
+    try:
+        fi_count = conn.execute(
+            "SELECT COUNT(*) FROM _edges_file_identity WHERE chunk_id = ?", (chunk_id,)
+        ).fetchone()[0]
+        if fi_count:
+            file_uuids = conn.execute(
+                "SELECT json_group_array(file_uuid) FROM _edges_file_identity WHERE chunk_id = ?",
+                (chunk_id,)
+            ).fetchone()[0]
+    except sqlite3.OperationalError as e:
+        if not _is_missing_table_error(e, '_edges_file_identity'):
+            print(f"[worker] Chunk rollup file_uuids read error for {chunk_id}: {e}", file=sys.stderr)
+        file_uuids = None
+
+    try:
+        deleg = conn.execute(
+            "SELECT child_session_id, agent_type FROM _edges_delegations WHERE chunk_id = ? LIMIT 1",
+            (chunk_id,)
+        ).fetchone()
+        child_session_id, agent_type = (deleg[0], deleg[1]) if deleg else (None, None)
+    except sqlite3.OperationalError as e:
+        if not _is_missing_table_error(e, '_edges_delegations'):
+            print(f"[worker] Chunk rollup delegation read error for {chunk_id}: {e}", file=sys.stderr)
+        child_session_id, agent_type = None, None
+
+    # type/ext must be computed for EVERY chunk (the index over `type` is
+    # only useful if 'chunk' is a real materialized value, not something
+    # left NULL until the next enrichment cycle) — so, unlike file_uuids/
+    # child_session_id/agent_type above, there is no early return here.
+    # Same CASE logic as chunk_rollup.rebuild_chunk_rollup / the old
+    # inline view expressions, single-row form.
+    chunk_type, ext = 'chunk', None
+    try:
+        row = conn.execute("""
+            SELECT
+                CASE
+                    WHEN fb.chunk_id IS NOT NULL THEN 'file'
+                    WHEN tp.type IS NOT NULL THEN tp.type
+                    ELSE 'chunk'
+                END AS type,
+                CASE
+                    WHEN COALESCE(fb.target_file, t.target_file) LIKE '%.%'
+                    THEN LOWER(SUBSTR(COALESCE(fb.target_file, t.target_file),
+                        LENGTH(RTRIM(COALESCE(fb.target_file, t.target_file),
+                        REPLACE(REPLACE(COALESCE(fb.target_file, t.target_file), '/', ''), '.', ''))) + 1))
+                    ELSE ''
+                END AS ext
+            FROM (SELECT ? AS id) r
+            LEFT JOIN _edges_tool_ops t ON r.id = t.chunk_id
+            LEFT JOIN _types_message tp ON r.id = tp.chunk_id
+            LEFT JOIN _types_file_body fb ON r.id = fb.chunk_id
+        """, (chunk_id,)).fetchone()
+        if row:
+            chunk_type, ext = row[0], row[1]
+    except sqlite3.OperationalError as e:
+        if not _is_missing_table_error(e, '_types_message') and \
+           not _is_missing_table_error(e, '_types_file_body') and \
+           not _is_missing_table_error(e, '_edges_tool_ops'):
+            print(f"[worker] Chunk rollup type/ext read error for {chunk_id}: {e}", file=sys.stderr)
+        chunk_type, ext = 'chunk', None
+
+    try:
+        conn.execute("""
+            INSERT INTO _enrich_chunk_rollup
+                (chunk_id, file_uuids, child_session_id, agent_type, type, ext)
+            VALUES (?, ?, ?, ?, ?, ?)
+            ON CONFLICT(chunk_id) DO UPDATE SET
+                file_uuids = excluded.file_uuids,
+                child_session_id = excluded.child_session_id,
+                agent_type = excluded.agent_type,
+                type = excluded.type,
+                ext = excluded.ext
+        """, (chunk_id, file_uuids, child_session_id, agent_type, chunk_type, ext))
+    except sqlite3.OperationalError as e:
+        if not _is_missing_table_error(e, '_enrich_chunk_rollup'):
+            print(f"[worker] Chunk rollup write error for {chunk_id}: {e}", file=sys.stderr)
+        # else: cell predates this table and _ensure_core_tables hasn't run
+        # yet — next enrichment cycle's rebuild_chunk_rollup() picks it up.
+
+
+def insert_chunk_atom(conn: sqlite3.Connection, chunk: dict) -> bool:
+    """Insert a chunk into all chunk-atom tables; return whether it was new."""
     cur = conn.cursor()
     chunk_id = chunk['id']
 
@@ -603,6 +744,7 @@ def insert_chunk_atom(conn: sqlite3.Connection, chunk: dict):
         INSERT OR IGNORE INTO _raw_chunks (id, content, embedding, timestamp)
         VALUES (?, ?, ?, ?)
     """, (chunk_id, chunk['content'], chunk.get('embedding'), chunk['timestamp']))
+    inserted_new = cur.rowcount > 0
 
     # _edges_source
     cur.execute("""
@@ -654,6 +796,11 @@ def insert_chunk_atom(conn: sqlite3.Connection, chunk: dict):
                 (chunk_id, file_path, file_uuid, inferred_op, confidence)
                 VALUES (?, ?, NULL, ?, ?)
             """, (chunk_id, op.file_path, op.inferred_op, op.confidence))
+
+    # Keep the chunks/messages view rollup fresh — must run after the SOMA
+    # and delegation edge writes above.
+    _upsert_chunk_rollup(conn, chunk_id)
+    return inserted_new
 
 
 
@@ -1114,22 +1261,21 @@ def sync_session_messages(session_id: str, conn: sqlite3.Connection,
             # Phase 1 of decoupled backfill: insert without embeddings
             for chunk in new_chunks:
                 try:
-                    insert_chunk_atom(conn, chunk)
-                    update_source_stats(conn, chunk['doc_id'], chunk)
-                    inserted += 1
+                    if insert_chunk_atom(conn, chunk):
+                        update_source_stats(conn, chunk['doc_id'], chunk)
+                        inserted += 1
                 except Exception as e:
                     print(f"[worker] Chunk insert error: {e}", file=sys.stderr)
         else:
-            embedder = get_embedder()
             texts = [c['content'] for c in new_chunks]
-            embeddings = encode(texts)
+            embeddings = _encode_for_cell(conn, texts)
 
             for chunk, emb in zip(new_chunks, embeddings):
                 try:
                     chunk['embedding'] = serialize_f32(emb)
-                    insert_chunk_atom(conn, chunk)
-                    update_source_stats(conn, chunk['doc_id'], chunk)
-                    inserted += 1
+                    if insert_chunk_atom(conn, chunk):
+                        update_source_stats(conn, chunk['doc_id'], chunk)
+                        inserted += 1
                 except Exception as e:
                     print(f"[worker] Chunk insert error: {e}", file=sys.stderr)
 
@@ -1169,6 +1315,16 @@ def sync_session_messages(session_id: str, conn: sqlite3.Connection,
         except Exception as e:
             print(f"[worker] Delegation insert error: {e}", file=sys.stderr)
 
+    # --- Keep chunk rollup fresh for chunks whose SOMA/delegation edges were
+    # just written above (these chunk_ids are resolved late, via tool_use_id
+    # matching, so insert_chunk_atom ran before these edges existed). ---
+    _rollup_chunk_ids = {c for c, _ in soma_items} | {c for c, *_ in delegation_items}
+    for chunk_id in _rollup_chunk_ids:
+        try:
+            _upsert_chunk_rollup(conn, chunk_id)
+        except Exception as e:
+            print(f"[worker] Chunk rollup upsert error: {e}", file=sys.stderr)
+
     # --- Write soft_ops edges ---
     for chunk_id, op in soft_ops_items:
         try:
@@ -1193,6 +1349,15 @@ def sync_session_messages(session_id: str, conn: sqlite3.Connection,
             _ingest_file_body(conn, parent_id, tfile, fb_content, session_id, ts)
         except Exception as e:
             print(f"[worker] File body ingest error: {e}", file=sys.stderr)
+
+    # Projection maintenance happens after tool/content/SOMA writes so the row
+    # is a committed observation, not an early guess from the message chunk.
+    from flex.modules.claude_code.manage.observations import upsert_observation
+    for chunk_id in {c['id'] for c in new_chunks}:
+        try:
+            upsert_observation(conn, chunk_id)
+        except Exception as e:
+            print(f"[worker] Observation upsert error for {chunk_id}: {e}", file=sys.stderr)
 
     # Clean up empty source stubs — if we parsed the JSONL but produced zero
     # chunks (e.g. file-history-snapshot only), remove the source row so it
@@ -1469,7 +1634,7 @@ def _batch_embed_chunks(conn, batch_size: int = 500, quiet: bool = False,
                   no time limit. The daemon's per-tick sweep passes a real
                   budget so a large backlog cannot monopolize the process.
     """
-    _enc = embedder.encode if embedder is not None else encode
+    _enc = embedder.encode if embedder is not None else None
     # Use embedder's preferred batch size if it exposes one (e.g. NomicEmbedder=64)
     if embedder is not None and hasattr(embedder, '_batch_size'):
         batch_size = embedder._batch_size
@@ -1511,7 +1676,7 @@ def _batch_embed_chunks(conn, batch_size: int = 500, quiet: bool = False,
             break
 
         texts = [r[1] for r in rows]
-        embeddings = _enc(texts)
+        embeddings = _enc(texts) if _enc is not None else _encode_for_cell(conn, texts)
 
         conn.executemany(
             "UPDATE _raw_chunks SET embedding = ? WHERE id = ?",
@@ -1835,6 +2000,7 @@ def _heal_delegations(conn: sqlite3.Connection) -> int:
                     VALUES (?, ?, ?, ?, ?)
                 """, (chunk_id, spawned, at, ts_int, sid))
                 inserted += 1
+                _upsert_chunk_rollup(conn, chunk_id)
             except Exception:
                 pass
 
@@ -1933,6 +2099,17 @@ def _run_enrichment_cycle(conn, graph_threshold=50):
             print(f"[enrich] Embedded {n} orphaned chunks", file=sys.stderr)
     except Exception as e:
         print(f"[enrich] Embed sweep error: {e}", file=sys.stderr)
+
+    # 9.5. Chunk rollup — MUST run before view auto-sync below. The curated
+    # chunks/messages views PK-probe _enrich_chunk_rollup instead of an
+    # inline aggregate; if a new view installs while the rollup is stale or
+    # empty, file_uuids/child_session_id/agent_type silently go NULL for
+    # every row until the next cycle repopulates it.
+    if rebuild_chunk_rollup:
+        try:
+            rebuild_chunk_rollup(conn)
+        except Exception as e:
+            print(f"[enrich] Chunk rollup error: {e}", file=sys.stderr)
 
     # 10. View auto-sync — install views if .sql files changed since last install
     try:
@@ -2083,6 +2260,14 @@ def daemon_loop(interval=2, invalidation_queue=None, watcher=None,
                             f"[worker] event-synced={stats['synced']} chunks={stats['chunks']}",
                             file=sys.stderr,
                         )
+                corpus_events = [inv for inv in ready if inv.cell_name != 'claude_code']
+                if corpus_events and _corpus_path_drainer:
+                    _t0 = time.time()
+                    event_stats = _corpus_path_drainer(corpus_events, encode_fn=encode)
+                    _phase_durations['corpus_targeted_sync_s'] = time.time() - _t0
+                    if event_stats['indexed']:
+                        print(f"[worker] corpus event-indexed={event_stats['indexed']}",
+                              file=sys.stderr)
             except Exception as e:
                 print(f"[worker] Event drain error: {e}", file=sys.stderr)
 

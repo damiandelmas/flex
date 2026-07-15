@@ -17,11 +17,45 @@ import subprocess
 import sys
 
 
+def _cell_tag(db) -> str | None:
+    """Read the cell's `vec:model` tag from `_meta` (None = untagged/default)."""
+    try:
+        row = db.execute("SELECT value FROM _meta WHERE key='vec:model'").fetchone()
+        return row[0] if row else None
+    except Exception:
+        return None
+
+
+def _resolve_ingest_target(db):
+    """Resolve (embed_doc_fn, dim) to embed NEW chunks with, from the cell's
+    `vec:model` tag — routes through the same inline resolver engine.py/
+    execute.py/cli.py use, so ingest never diverges from serving.
+
+    minilm / absent -> bundled default embedder @ STORE_DIM (128) — unchanged,
+    byte-identical to the legacy path.
+    nomic-v1.5 / nomic-v1.5-fp32 -> the dedicated Nomic embedder (int8 or
+    fp32, per tag) at its NATIVE 768 (no Matryoshka slice). serve_dim slicing
+    happens at query/serve time, not at ingest time.
+    Unknown explicit tags and missing tagged models fail closed in
+    `_query_embedder_for`; falling back would silently mix vector spaces.
+    """
+    from flex.engine import _query_embedder_for
+    from flex.onnx.embed import STORE_DIM
+
+    tag = _cell_tag(db)
+    dim = 768 if tag in ('nomic-v1.5', 'nomic-v1.5-fp32') else STORE_DIM
+    _, embed_doc = _query_embedder_for(tag, serve_dim=dim)
+    return embed_doc, dim, tag
+
+
 def embed_new(db, batch_size=128, commit_every=500, enrich_fn=None):
     """Embed all chunks missing embeddings, then mean-pool sources.
 
     Priority: Rust flex-embed (subprocess) → Python ONNX (in-process).
-    Both produce identical STORE_DIM-d Nomic vectors (see flex.onnx.embed.STORE_DIM).
+    The Rust binary is tag-blind (fixed `flex-embed` binary, no per-cell model
+    selection) — it is only used for untagged/minilm cells; a nomic-tagged
+    cell is always routed to the Python path so it never gets MiniLM vectors
+    via Rust.
 
     Args:
         enrich_fn: Optional callable(str) -> str that transforms content
@@ -30,17 +64,6 @@ def embed_new(db, batch_size=128, commit_every=500, enrich_fn=None):
             When provided, forces the Python path (Rust binary embeds raw).
 
     Returns the number of chunks embedded.
-
-    Model-aware dual-write: if this cell has been converted (`flex reembed`)
-    onto a richer model — it has an `_embeddings` table AND an active,
-    registered `vec:model` — newly embedded chunks (and any source mean-pools
-    that depend on them) are ALSO embedded into `_embeddings` for that model,
-    on top of the legacy `_raw_chunks.embedding` write above. This keeps a
-    converted, still-growing cell fully indexed on its active model instead of
-    silently falling behind. Purely additive; `_raw_chunks.embedding` /
-    `_raw_sources.embedding` are never touched by this path. Cells without an
-    active model (the overwhelming majority) pay one cheap metadata check and
-    are otherwise byte-for-byte unchanged.
     """
     # Check if there's work to do
     null_count = db.execute(
@@ -49,26 +72,52 @@ def embed_new(db, batch_size=128, commit_every=500, enrich_fn=None):
 
     if null_count == 0:
         _recover_orphaned_sources(db, commit_every)
-        _sync_active_model_embeddings(db, batch_size, commit_every)
         return 0
 
-    # enrich_fn requires Python path (Rust binary can't call Python)
-    if enrich_fn is None:
+    tag = _cell_tag(db)
+    if tag is None:
+        # A genuinely new vector column enters the public fp32 space. Existing
+        # untagged cells are pre-0.52 MiniLM cells, so the presence of even one
+        # stored vector is authoritative and keeps them on the legacy path.
+        existing_vectors = db.execute(
+            "SELECT EXISTS(SELECT 1 FROM _raw_chunks WHERE embedding IS NOT NULL) "
+            "OR EXISTS(SELECT 1 FROM _raw_sources WHERE embedding IS NOT NULL)"
+        ).fetchone()[0]
+        if not existing_vectors:
+            from flex.retrieve.embeddings import set_active_model
+            set_active_model(db, 'nomic-v1.5-fp32', 256)
+            db.execute(
+                "INSERT INTO _meta(key,value) VALUES('embedding_model',?) "
+                "ON CONFLICT(key) DO UPDATE SET value=excluded.value",
+                ('nomic-embed-text-v1.5-fp32',),
+            )
+            db.execute(
+                "INSERT INTO _meta(key,value) VALUES('embedding_dim','768') "
+                "ON CONFLICT(key) DO UPDATE SET value=excluded.value"
+            )
+            db.commit()
+            tag = 'nomic-v1.5-fp32'
+    tag_blind_ok = tag is None or tag == 'minilm'
+
+    # enrich_fn requires Python path (Rust binary can't call Python); a
+    # nomic-tagged cell also forces Python (Rust has no per-cell model
+    # selection and would silently write MiniLM vectors).
+    if enrich_fn is None and tag_blind_ok:
         # Release WAL locks so Rust subprocess can write
         db.commit()
         rust_count = _try_rust_embed(db)
         if rust_count is not None:
-            _sync_active_model_embeddings(db, batch_size, commit_every)
             return rust_count
 
-    # Fallback: Python ONNX (or forced by enrich_fn)
-    embedded = _python_embed(db, batch_size, commit_every, enrich_fn=enrich_fn)
-    _sync_active_model_embeddings(db, batch_size, commit_every)
-    return embedded
+    # Fallback: Python ONNX (or forced by enrich_fn / non-default tag)
+    return _python_embed(db, batch_size, commit_every, enrich_fn=enrich_fn)
 
 
 def _try_rust_embed(db):
-    """Try flex-embed Rust binary via subprocess. Returns count or None."""
+    """Try flex-embed Rust binary via subprocess. Returns count or None.
+
+    Caller MUST have already confirmed the cell's tag is tag-blind-safe
+    (None/'minilm') — this function has no per-cell model awareness."""
     db_path = _get_db_path(db)
     if not db_path:
         return None
@@ -108,9 +157,11 @@ def _try_rust_embed(db):
 
 
 def _python_embed(db, batch_size=64, commit_every=500, enrich_fn=None):
-    """Python ONNX fallback — streams in batches to bound memory."""
-    from flex.onnx.embed import ONNXEmbedder, STORE_DIM
+    """Python ONNX fallback — streams in batches to bound memory.
 
+    Embedder + dim are resolved from the cell's `vec:model` tag (see
+    _resolve_ingest_target) — a nomic-tagged cell embeds new chunks with the
+    Nomic embedder at native 768d, not the bundled MiniLM default."""
     total = db.execute(
         "SELECT COUNT(*) FROM _raw_chunks WHERE embedding IS NULL"
     ).fetchone()[0]
@@ -119,7 +170,7 @@ def _python_embed(db, batch_size=64, commit_every=500, enrich_fn=None):
         _recover_orphaned_sources(db, commit_every)
         return 0
 
-    embedder = ONNXEmbedder()
+    embed_doc, dim, _tag = _resolve_ingest_target(db)
     embedded = 0
 
     while True:
@@ -139,7 +190,7 @@ def _python_embed(db, batch_size=64, commit_every=500, enrich_fn=None):
         if enrich_fn is not None:
             texts = [enrich_fn(t) for t in texts]
 
-        embeddings = embedder.encode(texts, batch_size=batch_size, matryoshka_dim=STORE_DIM)
+        embeddings = embed_doc(texts, batch_size=batch_size)
 
         for i, chunk_id in enumerate(chunk_ids):
             blob = embeddings[i].astype(np.float32).tobytes()
@@ -219,7 +270,12 @@ def _recover_orphaned_sources(db, commit_every=500):
 def _mean_pool_sources(db, sources, commit_every=500):
     """Compute mean-pooled embeddings for sources from their chunks.
 
-    Commits in batches to keep WAL size bounded.
+    Commits in batches to keep WAL size bounded. Guards against a source
+    whose chunks mix dims (e.g. old MiniLM-128 chunks + newly tag-aware
+    Nomic-768 chunks landing in the same _raw_chunks.embedding column) — keeps
+    only the dominant dim among that
+    source's chunks, mirroring VectorCache.load_from_db's guard, so np.mean
+    never sees ragged vectors.
     """
     for idx, (source_id,) in enumerate(sources):
         chunk_rows = db.execute("""
@@ -232,6 +288,14 @@ def _mean_pool_sources(db, sources, commit_every=500):
             continue
 
         vecs = [np.frombuffer(r[0], dtype=np.float32) for r in chunk_rows]
+        dims = [v.shape[0] for v in vecs]
+        if len(set(dims)) > 1:
+            dominant = max(set(dims), key=dims.count)
+            vecs = [v for v, d in zip(vecs, dims) if d == dominant]
+            print(f"_mean_pool_sources: source {source_id} has mixed-dim chunks "
+                  f"(kept {dominant}d, dropped {len(dims) - len(vecs)})",
+                  file=sys.stderr)
+
         mean_vec = np.mean(vecs, axis=0).astype(np.float32)
         norm = np.linalg.norm(mean_vec)
         if norm > 0:
@@ -244,67 +308,3 @@ def _mean_pool_sources(db, sources, commit_every=500):
             db.commit()
 
     db.commit()
-
-
-def _sync_active_model_embeddings(db, batch_size=128, commit_every=500):
-    """Dual-write NEW chunks (and their derived source mean-pools) into the
-    additive `_embeddings` table when this cell has an active, registered
-    model (i.e. it was converted by `flex reembed`). No-op — one cheap
-    metadata check — for the overwhelming majority of cells that have never
-    been converted (no `_embeddings` table, or no `vec:model` set).
-
-    NEVER writes `_raw_chunks.embedding` / `_raw_sources.embedding`; this only
-    ever inserts rows into `_embeddings`, so legacy readers and the byte-exact
-    128d MiniLM column are untouched.
-    """
-    try:
-        from flex.retrieve import embeddings as _embstore
-        from flex.retrieve import model_registry as _mr
-    except ImportError:
-        return
-
-    try:
-        has_table = db.execute(
-            "SELECT 1 FROM sqlite_master WHERE type='table' AND name='_embeddings'"
-        ).fetchone()
-    except Exception:
-        return
-    if not has_table:
-        return
-
-    model = _embstore.active_model(db)
-    if not model or not _mr.is_registered(model):
-        return
-
-    # The full (stored) dim for this model: read from what's already stored so
-    # we never guess a width; only reachable if the cell somehow has an active
-    # model with zero stored vectors (shouldn't happen post-`flex reembed`).
-    store_dim = None
-    for m, kind, _n, dim in _embstore.list_models(db):
-        if m == model and kind == 'chunk':
-            store_dim = dim
-            break
-    if store_dim is None:
-        store_dim = _mr._native_dim(model)
-
-    embed_doc = _mr.doc_embedder(model, store_dim)
-    target_bytes = store_dim * 4
-
-    while True:
-        rows = db.execute(
-            "SELECT c.id, c.content FROM _raw_chunks c "
-            "LEFT JOIN _embeddings e ON e.id = c.id AND e.kind='chunk' AND e.model=? "
-            "WHERE c.content IS NOT NULL "
-            "AND (e.id IS NULL OR length(e.vector) != ?) "
-            "LIMIT ?",
-            (model, target_bytes, commit_every),
-        ).fetchall()
-        if not rows:
-            break
-
-        ids = [r[0] for r in rows]
-        texts = [r[1] or "" for r in rows]
-        vecs = np.asarray(embed_doc(texts), dtype=np.float32)
-        _embstore.store_embeddings(db, zip(ids, vecs), model=model, kind='chunk')
-
-    _embstore.mean_pool_sources(db, model, commit_every=commit_every)

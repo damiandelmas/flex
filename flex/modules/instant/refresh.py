@@ -12,12 +12,16 @@ pruning the same noise dirs the walk excludes so big repos stay cheap to poll.
 from __future__ import annotations
 
 import json
+import os
 import sqlite3
 import subprocess
 import sys
 from pathlib import Path
 
 _SIGNATURE_KEY = "instant_sources_signature"
+
+# Keep the watchdog configurable and comfortably above ordinary regeneration time.
+_REGEN_TIMEOUT_S = int(os.environ.get("FLEX_INSTANT_REGEN_TIMEOUT_S", "3600"))
 
 try:  # share the compiler's exact enumeration so the watch tracks what's indexed
     from flex.modules.instant.install import _iter_indexed_paths
@@ -112,6 +116,14 @@ def refresh(cell_path: str, graph: bool = False, dry_run: bool = False) -> dict:
     conn.row_factory = sqlite3.Row
     try:
         selections = _selections(conn)
+        if not selections:
+            # An empty recipe is a BROKEN cell, not an empty world. _signature([]) is
+            # "0:0:0"; stamping that once made it equal the stored value forever after,
+            # so `changed` was permanently False and the cell reported ok while never
+            # regenerating again. Refuse to compute or stamp a signature we can't trust.
+            return {"changed": False,
+                    "error": f"no recipe: {Path(cell_path).name} has no _meta.selections "
+                             f"— rebuild with `flex init --module instant --path <dir>`"}
         sig = _signature(selections, _code_flag(conn))
         last = _last_signature(conn)
         changed = sig != last
@@ -128,16 +140,31 @@ def refresh(cell_path: str, graph: bool = False, dry_run: bool = False) -> dict:
         return {"changed": True, "error": "cell name not resolvable from registry"}
 
     # regen = wipe-and-recompile from the stored recipe (restores nest/code mode)
-    proc = subprocess.run(
-        [sys.executable, "-m", "flex", "init", "--module", "instant", "--regen", name],
-        capture_output=True, text=True, timeout=900,
-    )
+    try:
+        proc = subprocess.run(
+            [sys.executable, "-m", "flex", "init", "--module", "instant", "--regen", name],
+            capture_output=True, text=True, timeout=_REGEN_TIMEOUT_S,
+        )
+    except subprocess.TimeoutExpired:
+        # The child was killed mid-build. Do NOT stamp a partially compiled cell;
+        # surface the failure so the watch retries.
+        return {"changed": True,
+                "error": f"regen timed out after {_REGEN_TIMEOUT_S}s — cell partially "
+                         f"rebuilt, not stamped (raise FLEX_INSTANT_REGEN_TIMEOUT_S)"}
     if proc.returncode != 0:
         return {"changed": True, "error": f"regen failed: {proc.stderr[-300:]}"}
 
-    # stamp the new signature into the freshly recompiled cell
+    # Stamp only a cell that came back whole. A signature is a claim that the cell matches
+    # its sources; never make that claim about a build we can't confirm completed.
     rw = sqlite3.connect(str(cell_path), timeout=30.0)
     try:
+        done = rw.execute(
+            "SELECT COUNT(*) FROM _meta WHERE key IN ('selections','compiled_at')"
+        ).fetchone()[0]
+        if done < 2:
+            return {"changed": True,
+                    "error": f"regen produced an incomplete cell (missing recipe or "
+                             f"compiled_at) — not stamping"}
         rw.execute("INSERT OR REPLACE INTO _meta (key, value) VALUES (?, ?)",
                    (_SIGNATURE_KEY, sig))
         rw.commit()

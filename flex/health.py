@@ -196,6 +196,12 @@ def watch_problem(cell: dict, worker: dict | None = None, state: dict | None = N
             "watch_path": cell.get("watch_path"),
             "refresh_status": cell.get("refresh_status"),
             "last_refresh_at": cell.get("last_refresh_at"),
+            "refresh_started_at": cell.get("refresh_started_at"),
+            "refresh_finished_at": cell.get("refresh_finished_at"),
+            "refresh_error": cell.get("refresh_error"),
+            "refresh_generation": cell.get("refresh_generation", 0),
+            "refresh_pending": cell.get("refresh_pending", 0),
+            "freshness": state.get("freshness", "unknown"),
             "active": bool(cell.get("active", 1)),
             "unlisted": bool(cell.get("unlisted", 0)),
         }
@@ -381,11 +387,18 @@ def watch_summary(
     worker_state = worker_state or worker or local_worker_state()
     problems = watch_problems(watch_cells, include_unlisted=True, worker=worker_state)
     counts = Counter(problem["problem"] for problem in problems)
+    freshness = Counter(
+        classify_refresh_state(cell).get("freshness", "unknown")
+        for cell in watch_cells
+    )
+    status = ("degraded" if problems or freshness.get("stale", 0)
+              else "unknown" if freshness.get("unknown", 0) else "ok")
     return {
-        "status": "degraded" if problems else "ok",
+        "status": status,
         "watch_cells": len(watch_cells),
         "problems": len(problems),
         "counts": dict(counts),
+        "freshness": dict(freshness),
         "stale_running": counts.get("watch-stale-running", 0),
         "worker_dead": counts.get("worker-dead", 0),
         "affected_by_worker": [

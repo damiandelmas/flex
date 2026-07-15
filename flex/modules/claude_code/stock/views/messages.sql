@@ -27,16 +27,26 @@ SELECT
     t.success,
     t.cwd,
     tp.type,
-    d.child_session_id,
-    d.agent_type,
-    fi.file_uuids,
-    fb.file_body,
+    cr.child_session_id,
+    cr.agent_type,
+    cr.file_uuids,
+    (
+        SELECT rc.content
+        FROM _edges_raw_content erc
+        JOIN _raw_content rc ON rc.hash = erc.content_hash
+        WHERE erc.chunk_id = r.id
+        ORDER BY erc.content_hash
+        LIMIT 1
+    ) AS file_body,
     tp.branch_id
 FROM _raw_chunks r
 LEFT JOIN _edges_source s ON r.id = s.chunk_id
 LEFT JOIN _raw_sources src ON s.source_id = src.source_id
 LEFT JOIN _edges_tool_ops t ON r.id = t.chunk_id
 LEFT JOIN _types_message tp ON r.id = tp.chunk_id
-LEFT JOIN (SELECT chunk_id, child_session_id, agent_type FROM _edges_delegations GROUP BY chunk_id) d ON r.id = d.chunk_id
-LEFT JOIN (SELECT chunk_id, json_group_array(file_uuid) AS file_uuids FROM _edges_file_identity GROUP BY chunk_id) fi ON r.id = fi.chunk_id
-LEFT JOIN (SELECT erc.chunk_id, rc.content AS file_body FROM _edges_raw_content erc JOIN _raw_content rc ON erc.content_hash = rc.hash GROUP BY erc.chunk_id) fb ON r.id = fb.chunk_id;
+LEFT JOIN _enrich_chunk_rollup cr ON r.id = cr.chunk_id
+WHERE NOT EXISTS (
+    SELECT 1 FROM _meta m, json_each(m.value) j
+    WHERE m.key = 'exclude_paths'
+      AND t.target_file LIKE '%' || j.value || '%'
+);

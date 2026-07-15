@@ -22,119 +22,41 @@ import sys
 import threading
 from pathlib import Path
 
-from flex.retrieve.vec_ops import VectorCache, register_vec_ops, materialize_vec_ops
+from flex.retrieve.vec_ops import materialize_vec_ops
 from flex.retrieve.keyword import materialize_keyword
+from flex import engine as _engine
 
 # Module-level cache — survives across calls within a process.
-# {cell_name: {'caches': {table: VectorCache}, 'config': dict, 'mtime': float}}
+# {cell_name: {'caches': {table: VectorCache}, 'config': dict, 'mtime': float,
+#              'model': str|None, 'serve_dim': int|None}}
 _cache_state: dict = {}
 _cache_lock = threading.Lock()
 
-# Force a full reload this often even when appends succeed — bounds ghost
-# rows from delete+insert sequences the count-drift detector cannot see.
-_FULL_REBUILD_INTERVAL_S = 3600
-
-
-def _try_append(state: dict, db) -> bool:
-    """Incremental refresh of a cached state via VectorCache.append_from_db.
-
-    Returns True if all tables appended cleanly (successors swapped in),
-    False if any table needs a full rebuild. Applies successors only when
-    every table succeeds, so the state never mixes fresh and stale tables.
-    """
-    import time as _time
-
-    caches = (state or {}).get('caches') or {}
-    if not caches:
-        return False
-
-    updates = {}
-    for table, id_col in [('_raw_chunks', 'id'), ('_raw_sources', 'source_id')]:
-        cache = caches.get(table)
-        if cache is None:
-            continue
-        if cache.loaded_at and (_time.time() - cache.loaded_at) > _FULL_REBUILD_INTERVAL_S:
-            return False
-        try:
-            result = cache.append_from_db(db, table, 'embedding', id_col)
-        except Exception:
-            return False
-        if result is None:
-            return False
-        if result != 0:
-            updates[table] = result
-
-    for table, succ in updates.items():
-        caches[table] = succ  # single dict-key assignment — atomic swap
-    return True
-
-_embedder = None
-_embedder_lock = threading.Lock()
-
-
-def _get_embedder():
-    """Lazy-load ONNX embedder singleton."""
-    global _embedder
-    if _embedder is not None:
-        return _embedder
-    with _embedder_lock:
-        if _embedder is not None:
-            return _embedder
-        try:
-            from flex.onnx import get_model
-            _embedder = get_model()
-            return _embedder
-        except ImportError:
-            return None
-
-
-def _read_vec_config(db) -> dict:
-    """Read vec:* keys from _meta."""
-    config = {}
-    try:
-        rows = db.execute(
-            "SELECT key, value FROM _meta WHERE key LIKE 'vec:%'"
-        ).fetchall()
-        for row in rows:
-            config[row[0]] = row[1]
-    except Exception:
-        pass
-    return config
+# Unified with engine.py: same resolver (_query_embedder_for), same cache-state
+# shape (build_vec_state), same incremental-append policy (refresh_vec_state) —
+# so this path serves a tagged cell identically to the MCP path.
 
 
 def _build_cache(db, name: str, db_path: Path) -> dict | None:
-    """Build VectorCache state for a cell."""
-    caches = {}
-    for table, id_col in [('_raw_chunks', 'id'), ('_raw_sources', 'source_id')]:
-        try:
-            cache = VectorCache()
-            cache.load_from_db(db, table, 'embedding', id_col)
-            if cache.size > 0:
-                cache.load_columns(db, table, id_col)
-                caches[table] = cache
-        except Exception:
-            pass
-
-    if not caches:
-        return None
-
+    """Build VectorCache state for a cell — delegates to engine.build_vec_state
+    so this path and the MCP path resolve the same way for a tagged cell."""
     mtime = db_path.stat().st_mtime if db_path.exists() else 0
-    return {
-        'caches': caches,
-        'config': _read_vec_config(db),
-        'mtime': mtime,
-    }
+    return _engine.build_vec_state(name, db, mtime)
 
 
 def _register_udf(db: sqlite3.Connection, state: dict):
-    """Register vec_ops UDF on a connection using cached VectorCache."""
-    embedder = _get_embedder()
-    if embedder:
-        from flex.onnx.embed import STORE_DIM
-        embed_query = lambda text: embedder.encode(text, prefix='search_query: ', matryoshka_dim=STORE_DIM)
-        embed_doc = lambda text: embedder.encode(text, prefix='search_document: ', matryoshka_dim=STORE_DIM)
-        register_vec_ops(db, state['caches'], embed_query, state['config'],
-                         embed_doc_fn=embed_doc)
+    """Register vec_ops UDF on a connection using cached VectorCache —
+    delegates to engine.register_vec_udf (the shared tag-aware resolver)."""
+    _engine.register_vec_udf(db, state)
+
+
+def _try_append(state: dict, db) -> bool:
+    """Incremental refresh of a cached state — thin bool-returning wrapper
+    around engine.refresh_vec_state (the shared append/rebuild policy), kept
+    for API compatibility with existing callers/tests. Returns True if all
+    tables appended cleanly (successors swapped in), False if a full rebuild
+    is needed."""
+    return _engine.refresh_vec_state(state, db) == 'appended'
 
 
 def open_cell_for_query(name: str, force_refresh: bool = False) -> sqlite3.Connection:

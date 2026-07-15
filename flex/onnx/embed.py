@@ -1,8 +1,8 @@
 """
-ONNX-based embedding model — Nomic embed-text-v1.5 (768-dim, Matryoshka).
+ONNX-based embedding model — Nomic embed-text-v1.5 fp32 (768-dim, Matryoshka).
 
 Drop-in replacement for sentence-transformers. Uses ONNX runtime.
-No PyTorch dependency. ~137MB int8 model.
+No PyTorch dependency. ~547MB fp32 model.
 
 Task prefixes (mandatory for Nomic):
   search_document:  — index time (default)
@@ -39,23 +39,22 @@ _tokenizer = None
 
 ONNX_DIR = Path(__file__).parent
 
-# Single source of truth for the effective embedding dimension used across
-# the embed/store/serve path (Matryoshka truncation target). Change this ONE
-# constant to propagate a new dimension everywhere it's read from — do not
-# hardcode 128 (or any other value) elsewhere.
+# Legacy fallback dimension for callers that do not provide a per-cell
+# Matryoshka target. New fp32 cells explicitly store 768 and serve 256 through
+# their vec:* metadata; pre-0.52 MiniLM cells remain 128.
 STORE_DIM = 128
 
 
 def _resolve_model_path() -> Path:
-    """User dir first, then bundled — matches model_ready() priority in fetch.py.
+    """Resolve the pinned public fp32 model installed by ``flex init``.
 
     Verifies SHA256 checksum at load time to detect tampering.
     """
     import os
     flex_home = Path(os.environ.get("FLEX_HOME", Path.home() / ".flex"))
 
-    # Known-good checksums (same as fetch.py)
-    _EXPECTED_HASH = "30ff8ad63546f9efd85019f394445f566ea595c119b08aa6663058af9e18fa87"
+    # Known-good checksum (same as fetch.py).
+    _EXPECTED_HASH = "147d5aa88c2101237358e17796cf3a227cead1ec304ec34b465bb08e9d952965"
 
     def _verify(p: Path) -> bool:
         if not p.exists():
@@ -70,7 +69,7 @@ def _resolve_model_path() -> Path:
                 h.update(chunk)
         return h.hexdigest() == _EXPECTED_HASH
 
-    user = flex_home / "models" / "model.onnx"
+    user = flex_home / "models" / "nomic-v1.5-fp32" / "model.onnx"
     if user.exists():
         if not _verify(user):
             raise RuntimeError(
@@ -79,15 +78,23 @@ def _resolve_model_path() -> Path:
                 "  Delete it and run 'flex init' to re-download."
             )
         return user
-    bundled = ONNX_DIR / "model.onnx"
-    if bundled.exists():
-        return bundled  # bundled model is shipped in the package, trusted
     raise RuntimeError(
         "Embedding model not found.\n"
         f"  Checked: {user}\n"
-        f"  Checked: {bundled}\n"
         "  Run 'flex init' to download it."
     )
+
+
+def _resolve_tokenizer_path() -> Path:
+    """Resolve the tokenizer paired with the pinned fp32 artifact."""
+    flex_home = Path(os.environ.get("FLEX_HOME", Path.home() / ".flex"))
+    path = flex_home / "models" / "nomic-v1.5-fp32" / "tokenizer.json"
+    if not path.exists():
+        raise RuntimeError(
+            f"Embedding tokenizer not found: {path}\n"
+            "  Run 'flex init' to download it."
+        )
+    return path
 
 
 # Attention memory budget: batch × 12_heads × seq² × 4_bytes ≤ ATTN_BUDGET_BYTES
@@ -128,7 +135,7 @@ def _get_tokenizer():
     global _tokenizer
     if _tokenizer is None:
         from tokenizers import Tokenizer
-        _tokenizer = Tokenizer.from_file(str(ONNX_DIR / "tokenizer.json"))
+        _tokenizer = Tokenizer.from_file(str(_resolve_tokenizer_path()))
     return _tokenizer
 
 
@@ -148,9 +155,12 @@ class ONNXEmbedder:
         if self._session is None:
             ort = _get_onnxruntime()
             opts = ort.SessionOptions()
-            # ORT_ENABLE_ALL: fuses QKV attention, layer norm, GELU, embedding
-            # layers into single kernels. 2-5x speedup on transformers.
-            opts.graph_optimization_level = ort.GraphOptimizationLevel.ORT_ENABLE_ALL
+            # ORT_ENABLE_EXTENDED (not ALL): ALL's SimplifiedLayerNormFusion pass
+            # crashes on the Nomic fp16 ONNX export (references a cast node an
+            # earlier fusion already removed). EXTENDED keeps the safe fusions
+            # (QKV attention, GELU, most layer-norm) and loads BOTH the int8 and
+            # fp16 models cleanly. Negligible perf delta on this model.
+            opts.graph_optimization_level = ort.GraphOptimizationLevel.ORT_ENABLE_EXTENDED
             # Thread pool size is configurable via FLEX_ONNX_THREADS.
             # Default 4 keeps the always-on worker a quiet background citizen
             # (0 = all cores spawns 50+ threads that spin-wait ~20% CPU idle).

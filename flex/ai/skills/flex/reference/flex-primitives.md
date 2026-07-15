@@ -12,6 +12,11 @@ Every semantic query has three phases:
 
 Scores are ordinal within one query. Do not compare score magnitude across different token strings.
 
+Graph centrality is relative to the graph that produced it. Rank or percentile
+within one cell is meaningful; a value or threshold copied between cells is not.
+Candidate-local PageRank (`_local_centrality`) is narrower still: compare it only
+within that one query result.
+
 ## vec_ops
 
 ```sql

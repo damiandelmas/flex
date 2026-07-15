@@ -51,8 +51,9 @@ point `flex init --module codegraph --path` at any repo.
   name**; `(module)` = file preamble) · `source_id` (file path) · `depth`
   (1=top-level, 2=method, …) · `container_id` (parent node id, or file path) ·
   `content` · `position`.
-- **`_edges_call`** `(caller_id, callee_id, callee_name)` — the call graph
-  (`callee_id` NULL = external/stdlib).
+- **`_edges_call`** `(caller_id, callee_name)` — syntactic calls, late-bound at
+  query time through **`_symbols(name, def_id, file_id, kind)`**. Candidate
+  definitions are evidence, not certain edges.
 - **`_edges_import`** `(source_id, module, name)` — the import graph.
 - **`_edges_tree`** `(id, parent_id, depth)` — containment.
 
@@ -61,7 +62,7 @@ point `flex init --module codegraph --path` at any repo.
 ```text
 @orient                         schema, presets, shape
 @callers  symbol=NAME           who calls NAME
-@callees  symbol=NAME           what NAME calls
+@callees  symbol=NAME [def_id=ID|file=PATH]  what one definition calls
 @impact   symbol=NAME           transitive callers — blast radius of changing NAME
 @subtree  root=ID_or_FILEPATH   recursive descendants (a file's tree, or a class's methods)
 ```
@@ -110,9 +111,10 @@ GROUP BY module ORDER BY importers DESC LIMIT 15;
 
 **Hot internal symbols** (most-called):
 ```sql
-SELECT callee_name, count(DISTINCT caller_id) AS callers
-FROM _edges_call WHERE callee_id IS NOT NULL
-GROUP BY callee_name ORDER BY callers DESC LIMIT 15;
+SELECT e.callee_name, count(DISTINCT e.caller_id) AS callers,
+       count(DISTINCT s.def_id) AS candidate_count
+FROM _edges_call e LEFT JOIN _symbols s ON s.name=e.callee_name
+GROUP BY e.callee_name ORDER BY callers DESC LIMIT 15;
 ```
 
 **Blast radius before a change** — `@impact symbol=X`, then read each affected def with `WHERE section_title IN (...)`.
@@ -122,7 +124,9 @@ GROUP BY callee_name ORDER BY callers DESC LIMIT 15;
 SELECT DISTINCT t.section_title, es.source_id
 FROM _types_instant t JOIN _edges_source es ON t.chunk_id = es.chunk_id
 WHERE t.depth = 1 AND t.section_title NOT LIKE '(%'
-  AND t.chunk_id NOT IN (SELECT callee_id FROM _edges_call WHERE callee_id IS NOT NULL)
+  AND NOT EXISTS (
+    SELECT 1 FROM _edges_call e WHERE e.callee_name=t.section_title
+  )
 LIMIT 20;
 ```
 
@@ -133,13 +137,19 @@ LIMIT 20;
 - **Structural first.** `GROUP BY`/`COUNT(DISTINCT …)` over the edges is free — get the shape before reading bodies.
 - **Graph for navigation, FTS for strings.** Presets/`_edges_*` to walk relationships; `keyword()` for an exact identifier, literal, or error.
 - **Resolve then read.** Cheap query to a `section_title`/`chunk_id`, then pull the body or `@subtree`.
-- **No semantic search.** No `vec_ops` on a codegraph cell. A fuzzy "where do we handle auth-ish things" needs a Vector cell — see `flex:filesystem --embed`.
+- **No semantic search.** No `vec_ops` on a codegraph cell. In 0.52 the
+  filesystem surface is structural too; do not redirect fuzzy repository queries
+  to a nonexistent `filesystem --embed` mode.
 
 ## Limits (qualify claims against these)
 
 - **Graph: Python (`ast`) + JS/TS (`tree-sitter`)** — `.py` and `.ts/.tsx/.js/.jsx` get call + import edges and the `class ⊃ method` tree; other languages chunk flat, markdown nests by heading.
 - **Call resolution** — Python: bare `foo()` only. JS/TS: bare `foo()` **plus** `this.m()`/`super.m()` (resolved to the enclosing class — where the OO graph lives). In both, other member calls (`obj.m()`) are not edges — name-only resolution can't disambiguate them.
-- **Name collisions / external** — same-named defs or stdlib calls leave `callee_id` NULL (kept by `callee_name`).
-- **`chunks`-view fan-out** — `DISTINCT` when listing; the `@callers`/`@callees`/`@impact` presets join `_types_instant` (1:1) and are clean.
+- **Name collisions / external** — stdlib/external calls are `unresolved`.
+  Same-named internal definitions form an `ambiguous` conservative candidate
+  set. Navigation reports `resolution_state` and `candidate_count`; qualify the
+  caller with `def_id` or `file` when reading its outgoing calls.
+- **Projection fan-out** — use `DISTINCT` when listing from `chunks`.
+  `@subtree` reads the one-row structural tables directly.
 
 Lead with `@orient`. Prefer presets and shape queries before reading bodies. Say what the graph does and does not cover rather than overclaiming.

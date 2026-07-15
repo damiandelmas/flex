@@ -6,6 +6,7 @@ coding-agent substrate: `chunks`, `messages`, `sessions`, `files`, and
 cells. Goose-specific session metadata lives in `sources` (extended view) and
 is queryable directly via the `provider_name`, `goose_mode`, `model_config_json`,
 `total_tokens`, `session_type`, and `working_dir` columns.
+The native metadata backing that view is preserved in `_types_goose_session`.
 
 The cell is self-describing. Start here:
 

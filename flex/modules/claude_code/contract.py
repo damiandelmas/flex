@@ -156,4 +156,25 @@ def validate_coding_agent_cell(
                 ),
             ))
 
+    # A vector tag is a promise that semantic retrieval covers the cell. Fresh
+    # NULL rows are otherwise invisible to vec_ops while exact FTS still finds
+    # them—the precise split-brain failure that hid known Codex evidence.
+    if "_raw_chunks" in existing:
+        try:
+            tagged = conn.execute(
+                "SELECT value FROM _meta WHERE key='vec:model'"
+            ).fetchone()
+            missing = conn.execute(
+                "SELECT COUNT(*) FROM _raw_chunks WHERE embedding IS NULL"
+            ).fetchone()[0]
+            if tagged and tagged[0] and missing:
+                report.violations.append(ContractViolation(
+                    severity="warn",
+                    table="_raw_chunks.embedding",
+                    message=(f"{missing} tagged chunks have no vector and are invisible "
+                             "to semantic retrieval"),
+                ))
+        except sqlite3.OperationalError:
+            pass
+
     return report

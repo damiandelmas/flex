@@ -95,7 +95,7 @@ def materialize_keyword(db, sql: str) -> str:
     # then OR the remaining words. Natural language queries like
     # "What degree did I graduate with?" become "What OR degree OR did OR ..."
     # which is more forgiving than FTS5's default AND semantics.
-    sanitized = _sanitize_fts5(term)
+    sanitized = sanitize_fts5(term)
 
     # Parse remaining args: detect pre-filter (starts with SELECT) vs modifiers
     pre_filter_sql = None
@@ -282,7 +282,7 @@ def _probe_keyword_tokens(db, term: str, sanitized: str, scope_table):
     return matched, dropped
 
 
-def _sanitize_fts5(term: str) -> str:
+def sanitize_fts5(term: str) -> str:
     """Sanitize a search term for FTS5 MATCH syntax.
 
     Strips punctuation that breaks FTS5 (?, !, @, etc.), drops single-char
@@ -292,14 +292,18 @@ def _sanitize_fts5(term: str) -> str:
 
     AND semantics are correct for most queries ("net revenue 2022" should
     require all terms). The fallback path uses OR when AND returns 0 results.
+
+    Public interface modules call this directly when they lower whole
+    expressions to SQL and cannot nest inside the keyword() materializer.
     """
     # Pass through if it already contains FTS5 operators
     if re.search(r'\b(AND|OR|NOT|NEAR)\b', term) or '*' in term:
         return term
 
-    # Strip non-alphanumeric (except spaces and dots for decimals),
-    # split, drop single-char words
-    words = re.sub(r'[^\w\s.]', '', term).split()
+    # Apostrophes join a word (what's -> whats); other punctuation is a token
+    # boundary (vec:model -> vec model), not deletion (vecmodel).
+    normalized = re.sub(r"['\u2019]", '', term)
+    words = re.sub(r'[^\w\s.]', ' ', normalized).split()
     words = [w.strip('.') for w in words]
     words = [w for w in words if len(w) > 1]
     if not words:
@@ -307,6 +311,10 @@ def _sanitize_fts5(term: str) -> str:
 
     # Space-join = FTS5 implicit AND (all terms must match)
     return ' '.join(words)
+
+
+# Backwards-compatible alias for pre-public callers.
+_sanitize_fts5 = sanitize_fts5
 
 
 def _split_args(inner: str) -> list[str]:

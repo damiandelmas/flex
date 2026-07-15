@@ -88,22 +88,39 @@ def walk_vault(
                 file_excludes.append(pattern)
 
     for f in sorted(root.rglob('*.md')):
-        if not f.is_file():
-            continue
-
-        rel = unicodedata.normalize('NFD', str(f.relative_to(root)))
-
-        if should_exclude(rel, dir_excludes, file_excludes):
-            continue
-
-        stat = f.stat()
-        folder = str(f.parent.relative_to(root)) if f.parent != root else ''
-
-        yield VaultEntry(
-            path=f,
-            rel_path=rel,
-            folder=folder,
-            stem=f.stem,
-            mtime=stat.st_mtime,
-            size=stat.st_size,
+        entry = entry_for_path(
+            root, f, dir_excludes=dir_excludes, file_excludes=file_excludes,
         )
+        if entry is not None:
+            yield entry
+
+
+def entry_for_path(root: Path, path: Path, *, dir_excludes=None,
+                   file_excludes=None) -> VaultEntry | None:
+    """Validate and describe one vault path without walking the whole vault."""
+    root = root.resolve()
+    path = path.resolve()
+    try:
+        rel_path = path.relative_to(root)
+    except ValueError:
+        return None
+    if path.suffix.lower() != '.md' or not path.is_file():
+        return None
+    if dir_excludes is None or file_excludes is None:
+        config = _load_vault_config(root)
+        dir_excludes = set(DEFAULT_DIR_EXCLUDE)
+        file_excludes = list(DEFAULT_FILE_EXCLUDE)
+        for pattern in config.get('exclude', []):
+            if pattern.endswith('/'):
+                dir_excludes.add(pattern.rstrip('/'))
+            else:
+                file_excludes.append(pattern)
+    rel = unicodedata.normalize('NFD', str(rel_path))
+    if should_exclude(rel, set(dir_excludes), list(file_excludes)):
+        return None
+    try:
+        stat = path.stat()
+    except OSError:
+        return None
+    folder = str(path.parent.relative_to(root)) if path.parent != root else ''
+    return VaultEntry(path, rel, folder, path.stem, stat.st_mtime, stat.st_size)

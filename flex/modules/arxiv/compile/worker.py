@@ -33,6 +33,7 @@ from pathlib import Path
 from datetime import datetime, timezone
 
 from flex.core import open_cell, set_meta, validate_cell, log_op
+from flex.compile.edges_schema import edges_source_ddl
 
 DEFAULT_CELL_NAME = "arxiv"
 DEFAULT_DESCRIPTION = "arXiv papers — public research literature cell"
@@ -48,7 +49,8 @@ PUBLIC_SEED_QUERIES = [
 # SCHEMA DDL
 # ═════════════════════════════════════════════════════
 
-SCHEMA_DDL = """
+SCHEMA_DDL = f"""
+{edges_source_ddl('arxiv')}
 -- RAW LAYER
 CREATE TABLE IF NOT EXISTS _raw_chunks (
     id TEXT PRIMARY KEY,
@@ -81,16 +83,6 @@ CREATE TABLE IF NOT EXISTS _edges_raw_content (
     content_type TEXT DEFAULT 'latex'
 );
 CREATE INDEX IF NOT EXISTS idx_erc_source ON _edges_raw_content(source_id);
-
--- EDGE LAYER
-CREATE TABLE IF NOT EXISTS _edges_source (
-    chunk_id TEXT NOT NULL,
-    source_id TEXT NOT NULL,
-    source_type TEXT DEFAULT 'arxiv',
-    position INTEGER
-);
-CREATE INDEX IF NOT EXISTS idx_es_chunk ON _edges_source(chunk_id);
-CREATE INDEX IF NOT EXISTS idx_es_source ON _edges_source(source_id);
 
 -- TREE LAYER (substrate spec: heading hierarchy as DAG)
 -- First cell to implement _edges_tree per the universal cell substrate design.

@@ -21,13 +21,16 @@ from pathlib import Path
 from datetime import datetime, timezone
 
 from flex.core import open_cell, set_meta, validate_cell, log_op
+from flex.compile.edges_schema import edges_source_ddl
+from flex.manage.chunk_type import upsert_chunk_type
 
 
 # =====================================================
 # SCHEMA DDL
 # =====================================================
 
-SCHEMA_DDL = """
+SCHEMA_DDL = f"""
+{edges_source_ddl('hn')}
 -- RAW LAYER
 CREATE TABLE IF NOT EXISTS _raw_chunks (
     id TEXT PRIMARY KEY,
@@ -48,16 +51,6 @@ CREATE TABLE IF NOT EXISTS _raw_sources (
     hn_url TEXT,
     embedding BLOB
 );
-
--- EDGE LAYER
-CREATE TABLE IF NOT EXISTS _edges_source (
-    chunk_id TEXT NOT NULL,
-    source_id TEXT NOT NULL,
-    source_type TEXT DEFAULT 'hn',
-    position INTEGER
-);
-CREATE INDEX IF NOT EXISTS idx_es_chunk ON _edges_source(chunk_id);
-CREATE INDEX IF NOT EXISTS idx_es_source ON _edges_source(source_id);
 
 -- TYPES LAYER (HN-specific metadata per chunk)
 CREATE TABLE IF NOT EXISTS _types_hn (
@@ -219,6 +212,7 @@ def ingest(threads, db):
             (chunk_id, item_type, author, score, url, story_id, parent_id, hn_url)
             VALUES (?, 'story', ?, ?, ?, ?, NULL, ?)
         """, (chunk_id, author, score, url, item_id, hn_url))
+        upsert_chunk_type(db, chunk_id, 'story')
 
         total_chunks += 1
 
@@ -253,6 +247,7 @@ def ingest(threads, db):
                 VALUES (?, 'comment', ?, ?, ?, ?, ?, NULL)
             """, (c_chunk_id, c_author, c_score, c_url,
                   str(c_story_id), str(c_parent_id)))
+            upsert_chunk_type(db, c_chunk_id, 'comment')
 
             total_chunks += 1
 
@@ -370,6 +365,12 @@ def main():
     db = open_cell(cell_path)
     if not args.append:
         db.executescript(SCHEMA_DDL)
+
+    # Table/index/trigger for _enrich_chunk_type — unconditional (not
+    # gated on args.append) so an append-mode ingest against a cell built
+    # before this fix also gets the guard.
+    from flex.manage.chunk_type import ensure_chunk_type_schema
+    ensure_chunk_type_schema(db)
 
     t0 = time.time()
 
