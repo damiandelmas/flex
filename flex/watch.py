@@ -12,15 +12,18 @@ watchdog callback thread. This keeps the single writer-thread invariant
 (flex/modules/claude_code/compile/worker.py owns the only connection that
 writes to the cell) intact.
 
-Phase 1 registers exactly one cell (claude_code, JSONLs). Generic
-registry-discovered watch cells stay on their existing polling/signature
-paths until typed dispatch for other cell types exists.
+The event adapter currently registers the coding-session JSONL source.
+Other registered watch cells stay on their polling/signature paths until
+typed dispatch for their cell types exists.
 """
 
 from __future__ import annotations
 
 import fnmatch
+import bisect
+import json
 import os
+import sqlite3
 import sys
 import threading
 import time
@@ -121,7 +124,7 @@ class Invalidation:
 class WatchRegistration:
     """One watched root + relative pattern for one cell.
 
-    Phase 1 creates exactly one registration (claude_code JSONLs). Pattern
+    The current adapter creates one registration for coding-session JSONLs. Pattern
     matching always uses the path relative to `root` — never the basename
     — so relative patterns like `**/*.jsonl` are matched correctly.
     """
@@ -157,6 +160,78 @@ class WatchRegistration:
         if self.pattern.startswith("**/"):
             return fnmatch.fnmatch(rel_str, self.pattern[3:])
         return False
+
+
+def registrations_for_cells(cells) -> list[WatchRegistration]:
+    """Expand active watch cells into one registration per declared root.
+
+    ``registry.watch_path`` is a compatibility projection for single-root
+    consumers.  Multi-root local cells carry their complete recipe in
+    ``_meta.selections``; events must cover that whole durable set.
+    """
+    registrations = []
+    seen = set()
+    for cell in cells:
+        if cell.get("lifecycle") != "watch" or not cell.get("active", 1):
+            continue
+        roots = []
+        path = cell.get("path")
+        if path:
+            try:
+                uri = f"file:{Path(path).resolve()}?mode=ro"
+                db = sqlite3.connect(uri, uri=True, timeout=2)
+                row = db.execute(
+                    "SELECT value FROM _meta WHERE key='selections'"
+                ).fetchone()
+                db.close()
+                value = json.loads(row[0]) if row and row[0] else []
+                if isinstance(value, list):
+                    roots.extend(value)
+            except (OSError, sqlite3.Error, TypeError, ValueError):
+                pass
+        if not roots:
+            roots.extend(x for x in (cell.get("watch_path"), cell.get("corpus_path")) if x)
+        pattern = cell.get("watch_pattern") or "**/*"
+        for raw_root in roots:
+            try:
+                root = Path(raw_root).expanduser().resolve()
+            except OSError:
+                continue
+            key = (cell["name"], root, pattern)
+            if key in seen or not root.is_dir():
+                continue
+            seen.add(key)
+            registrations.append(WatchRegistration(
+                cell_name=cell["name"], root=root, pattern=pattern, recursive=True,
+            ))
+    return sorted(registrations, key=lambda r: (r.cell_name, str(r.root)))
+
+
+def fair_batch(conn: sqlite3.Connection, lane: str, items, limit: int):
+    """Return a persisted round-robin slice of keyed work items.
+
+    ``items`` is ``[(stable_key, payload), ...]``. The cursor lives in the
+    cell's existing `_meta` table, so a daemon restart cannot send the largest
+    corpus back to the front of the line.
+    """
+    ordered = sorted(items, key=lambda item: item[0])
+    if not ordered or limit <= 0:
+        return []
+    meta_key = f"drain_cursor:{lane}"
+    try:
+        row = conn.execute("SELECT value FROM _meta WHERE key=?", (meta_key,)).fetchone()
+        cursor = row[0] if row else ""
+    except sqlite3.OperationalError:
+        return ordered[:limit]
+    keys = [item[0] for item in ordered]
+    start = bisect.bisect(keys, cursor)
+    rotated = ordered[start:] + ordered[:start]
+    batch = rotated[:limit]
+    conn.execute(
+        "INSERT OR REPLACE INTO _meta (key,value) VALUES (?,?)",
+        (meta_key, batch[-1][0]),
+    )
+    return batch
 
 
 # ─────────────────────────────────────────────────────────────────────────
@@ -297,12 +372,14 @@ def _make_handler(registration: WatchRegistration, queue: InvalidationQueue):
             if event.is_directory:
                 return
             self._enqueue(event.dest_path, "moved")
+            queue.mark_reconciliation_required()  # old path may now be stale
 
         # Deletes carry no content to validate or sync — reconciliation
         # (and _raw_sources staying put) is the correctness path for
         # removals, not the event queue.
         def on_deleted(self, event):
-            return
+            if not event.is_directory:
+                queue.mark_reconciliation_required()
 
     return _Handler()
 
@@ -383,15 +460,78 @@ class Watcher:
         self.last_error = reason
         self.queue.mark_reconciliation_required()
 
-    def stop(self, timeout: float = 5.0) -> None:
+    def request_stop(self) -> None:
+        """Ask the observer to stop without waiting for its thread."""
+        observer = self._observer
+        if observer is None:
+            return
+        try:
+            observer.stop()
+        except Exception as e:
+            self.last_error = str(e)
+        self.healthy = False
+
+    def join(self, timeout: float = 5.0) -> None:
+        """Wait for a previously stopped observer and release it."""
         observer = self._observer
         self._observer = None
         if observer is None:
             return
         try:
-            observer.stop()
-            observer.join(timeout=timeout)
+            observer.join(timeout=max(0.0, timeout))
         except Exception as e:
             self.last_error = str(e)
-        finally:
-            self.healthy = False
+        self.healthy = False
+
+    def stop(self, timeout: float = 5.0) -> None:
+        self.request_stop()
+        self.join(timeout=timeout)
+
+
+class WatcherSet:
+    """Small lifecycle facade over several root observers sharing one queue."""
+
+    def __init__(self, registrations, queue: InvalidationQueue):
+        self.queue = queue
+        self.watchers = [Watcher(reg, queue) for reg in registrations]
+        self.backend = None
+        self.healthy = False
+        self.last_error = None
+
+    def start(self) -> bool:
+        failures = []
+        for watcher in self.watchers:
+            if not watcher.start():
+                failures.append(f"{watcher.registration.root}: {watcher.last_error}")
+        self.backend = ",".join(sorted({w.backend for w in self.watchers if w.backend})) or None
+        self.healthy = bool(self.watchers) and not failures
+        self.last_error = "; ".join(failures) or None
+        if failures:
+            self.queue.mark_reconciliation_required()
+        return self.healthy
+
+    def check_health(self) -> bool:
+        dead = [w for w in self.watchers if not w.check_health()]
+        self.healthy = bool(self.watchers) and not dead
+        if dead:
+            self.last_error = "; ".join(
+                f"{w.registration.root}: {w.last_error or 'unhealthy'}" for w in dead
+            )
+            self.queue.mark_reconciliation_required()
+        return self.healthy
+
+    def mark_unhealthy(self, reason: str) -> None:
+        self.healthy = False
+        self.last_error = reason
+        self.queue.mark_reconciliation_required()
+
+    def stop(self, timeout: float = 5.0) -> None:
+        # Stop every backend first, then share one deadline across joins.
+        # A per-watcher timeout makes shutdown grow as roots * timeout (49
+        # live roots once did), which exceeds systemd's service deadline.
+        for watcher in self.watchers:
+            watcher.request_stop()
+        deadline = time.monotonic() + max(0.0, timeout)
+        for watcher in self.watchers:
+            watcher.join(timeout=max(0.0, deadline - time.monotonic()))
+        self.healthy = False
