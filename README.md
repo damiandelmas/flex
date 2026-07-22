@@ -8,258 +8,261 @@
 [![License: MIT](https://img.shields.io/badge/License-MIT-blue.svg)](LICENSE)
 [![Python 3.12+](https://img.shields.io/badge/python-3.12+-blue.svg)](https://www.python.org/)
 
-**SQLite knowledge and memory for AI agents**
+**Composable retrieval for AI agents.**
 
-Retrieval was built for a human at a search box — hide the complexity, return ten
-links. Your agent is a different consumer: it can read structure, write queries,
-and compose operations. flex gives it a knowledge base shaped for that consumer
-instead of the old one.
+flex compiles coding-agent sessions, folders, repositories, and supported data
+sources into self-describing SQLite **cells**. An agent can inspect a cell, narrow
+its data with SQL, search it by keywords or meaning, and follow results back to
+source evidence — all through one MCP tool.
 
-flex compiles coding-agent sessions, markdown vaults, and other sources into local
-SQLite databases, then exposes them through one MCP tool with keyword search,
-semantic search, and SQL. Your whole knowledge base is one file on your machine —
-no hosted service, no new tool per source, just `flex_search`.
+A cell is a portable knowledge artifact, not a pile of flattened chunks. It keeps
+the schema, relationships, identity, provenance, and retrieval operations that its
+source can support. flex runs locally by default; a hosted retrieval service is not
+required.
 
-## install
+## quick start
 
-Claude Code:
+Install flex for Claude Code:
 
 ```bash
 curl -sSL https://getflex.dev/install.sh | bash -s -- claude-code
 ```
 
-Codex CLI:
+Or for Codex CLI:
 
 ```bash
 curl -sSL https://getflex.dev/install.sh | bash -s -- codex
 ```
 
-Obsidian / Markdown:
+The installer creates a cell from your existing session history, configures the
+MCP server, and starts background refresh. Start a new client session so it loads
+the new MCP configuration, then ask:
 
-```bash
-curl -sSL https://getflex.dev/install.sh | bash
-flex init --module filesystem --path /path/to/vault --obsidian
+```text
+Use flex to orient me to my coding history, then find the decisions that shaped
+this project in the last week.
 ```
 
-Any mixed folder or repository:
+The agent's first tool call should be the cell's own orientation preset:
+
+```json
+{"cell":"claude_code","query":"@orient"}
+```
+
+Use `codex` instead of `claude_code` when you installed the Codex module.
+
+To verify the installation from the shell:
+
+```bash
+flex health --json
+flex core search --cell claude_code "@orient"
+```
+
+### let your coding agent install it
+
+Paste this into Claude Code or Codex CLI:
+
+```text
+Install flex for this client. Use the installer at https://getflex.dev: pass
+`claude-code` when this is Claude Code or `codex` when this is Codex CLI.
+Preserve existing flex cells and configuration. Treat any non-zero command or
+unhealthy service as a blocking error. Run `flex health --json`, inspect the JSON,
+and require `status` to be `ok`; the command can report degraded state without a
+non-zero exit. Then verify the query path with `flex core search --cell CELL
+"@orient"`. MCP configuration is loaded at client startup, so do not claim the
+flex MCP tool is available in this running session; tell me to start a new session
+and give me the exact first prompt to run.
+```
+
+## compile a folder
+
+Turn a mixed folder or repository into one watched cell:
 
 ```bash
 flex init --module filesystem --path /path/to/folder
 ```
 
-This walks Markdown, Python, JS/TS, and readable text into one watched cell.
-Embeddings default on; add `--no-embed` for the same structure without vectors,
-or `--obsidian` to add vault semantics to Markdown files.
-
-New cells use the pinned Nomic v1.5 fp32 model automatically. The model runs
-locally; no API key or hosted embedding account is required.
-
-To have an agent create the cell, paste:
-
-```text
-Install Flex if needed, then run `flex init --module filesystem --path PATH`.
-Add `--obsidian` only when I ask for Obsidian semantics, and add `--no-embed`
-only when I explicitly want structural-only retrieval. Treat the caller path as
-the sole corpus root. When it finishes, run `flex core search --cell NAME
-"@orient"` and report the indexed file kinds, embedding model, serve dimension,
-and refresh lifecycle.
-```
-
-### upgrading existing cells to 0.52
-
-Cells created before 0.52 keep their original embedding model until you migrate
-them. This is deliberate: flex never relabels vectors from one model as another.
-Preview the work, then migrate with a verified copy and atomic swap:
+The filesystem compiler understands Markdown headings and metadata, Python and
+JS/TS symbols, calls and imports, and readable text. These coexist in one cell and
+remain distinguishable by file kind and source path.
 
 ```bash
-flex reembed --dry-run
-flex reembed
-flex reembed --dry-run
-flex health --json
+# Add Obsidian aliases, tags, Dataview fields, and wikilinks to Markdown files
+flex init --module filesystem --path /path/to/vault --obsidian
+
+# Keep the same source structure but omit semantic vectors
+flex init --module filesystem --path /path/to/folder --no-embed
+
+# Build once instead of watching the folder
+flex init --module filesystem --path /path/to/folder --no-watch
 ```
 
-The live database remains untouched in its old vector space while the copy is
-built. Each converted database is backed up under `~/.flex/backups/reembed-nomic/` and
-only replaced after integrity, vector-width, and sampled reproducibility checks
-pass. Structural `--no-embed` cells and already-converted cells are skipped.
-For a large local migration, `FLEX_ONNX_THREADS=8 flex reembed` can use more CPU.
+Embeddings are enabled by default. New embedded cells use the revision-pinned
+Nomic v1.5 fp32 model locally, with 768-dimensional storage and a 256-dimensional
+Matryoshka query surface. No embedding API key is required.
 
-If you want an agent to perform the upgrade, paste this:
+Refresh is atomic per file: a failed or unreadable update preserves the last good
+indexed version. Filesystem events provide low-latency updates; reconciliation
+catches missed events, restarts, deletions, and edits made while flex was stopped.
 
-```text
-Upgrade this Flex installation to 0.52 safely. First run `flex reembed --dry-run`
-and report the cells and estimated work. Confirm the pinned fp32 model is installed
-with `flex init`. Then run `flex reembed`; do not edit cell databases directly and
-do not delete backups. Treat any ERROR or non-zero exit as blocking. When it
-finishes, rerun `flex reembed --dry-run` and `flex health --json`, and report which
-cells converted, skipped, or failed.
-```
-
-## coding-agent memory
-
-Claude Code and Codex sessions become searchable through one MCP query surface.
-flex indexes session history, tool calls, file edits, source evidence, repo
-context, and sub-agent traces — and keeps updating as you work.
-
-### what's different
-
-**most memory systems start working *after* you install them.** flex works
-retroactively — the moment you install, your existing sessions are queryable. Ask
-how you set up the Cloudflare tunnel yesterday, why a release script changed, or
-what session created a file.
-
-**sessions aren't plain documents.** They have prompts, replies, tool calls, file
-edits, repos, projects, and sub-agents. flex keeps that structure, so your agent
-filters *before* semantic scoring instead of asking vector search to guess what
-matters. Every answer stays attached to its source evidence — the session it came
-from, the files and repos it touched, and where to go next for the full trace.
-
-**vector search usually returns similar content and stops.** flex lets your agent
-compose SQL, semantic, and keyword search with operators for suppression,
-diversity, recency, and trajectory — architecture work but not changelogs, recent
-auth work but not oauth docs, a diverse sample instead of ten near-duplicates.
-
-### what you can ask
-
-**file lineage** — flex tracks sessions, messages, tool calls, and file edits:
-
-```text
-"Use flex: what's the history of worker.py?"
-```
-
-What session created it, what prompts shaped it, what changed later, and why.
-
-**decision archaeology** — the hardest question in software is *why*:
-
-```text
-"Use flex: why did we create registry.py?"
-```
-
-flex finds the session where the decision happened and reconstructs the path —
-which approaches were tried, which failed, and why you landed where you did.
-
-**weekly digest** — grouped by project, touched files, and key decisions:
-
-```text
-"Use flex: what did we build this week?"
-```
-
-Already installed? Run `flex init --module claude-code` (or `--module codex`),
-then ask: `"Use flex: orient me to my Claude Code memory."`
-
-## beyond coding agents
-
-Coding memory is the sharpest use of flex, not its edge. Underneath, flex is a
-substrate: any source that compiles into the cell format becomes queryable through
-the same MCP tool, and adding a source never adds a new tool.
-
-Folders, repositories, Markdown, and Obsidian share one filesystem compiler:
+After creating a cell, start here:
 
 ```bash
-flex init --module filesystem --path /path/to/folder [--obsidian] [--no-embed]
+flex core search --cell CELL "@orient"
 ```
 
-flex indexes Markdown headings and metadata, code symbols/calls/imports, and
-generic text without touching your files. `--obsidian` adds aliases, wikilinks,
-and ghost targets to Markdown sources without narrowing the rest of the folder.
+`@orient` reports the cell's root, source types, schema, embedding mode, freshness,
+presets, and runnable query examples. Trust it over generic documentation: it is
+generated for the cell you are actually querying.
 
-### source modules
+## what flex makes possible
 
-**Core**
+### coding history as a database
 
-| module | what it indexes |
-|---|---|
-| [`claude-code`](https://github.com/damiandelmas/flex/blob/main/flex/modules/claude_code/README.md) | Claude Code sessions: prompts, tool calls, file evidence |
-| [`codex`](https://github.com/damiandelmas/flex/blob/main/flex/modules/codex/README.md) | Codex CLI sessions, same surface |
-| [`filesystem`](https://github.com/damiandelmas/flex/tree/main/flex/modules/fs) | one mixed folder cell: Markdown, code graph, generic text, Nomic semantic retrieval, watched refresh; optional `--obsidian` or `--no-embed` |
-| `instant`, `markdown`, `obsidian`, `codegraph` | compatibility aliases preserving their former narrow/no-embed behavior; new workflows should use `filesystem` |
-| [`tools`](https://github.com/damiandelmas/flex/blob/main/flex/modules/skills/README.md) | the agentic ecosystem catalog: skills, MCP servers, frameworks |
+Claude Code and Codex sessions retain prompts, replies, tool calls, file reads and
+edits, repositories, projects, and sub-agent traces. flex indexes history that
+already exists and keeps it current as you work.
 
-**Beta**
-
-| module | install |
-|---|---|
-| [`goose`](https://github.com/damiandelmas/flex/blob/main/flex/modules/goose/README.md) | `flex init --module goose` |
-| [`github`](https://github.com/damiandelmas/flex/blob/main/flex/modules/github/README.md) | `flex init --module github --github-repos owner/repo` |
-| [`reddit`](https://github.com/damiandelmas/flex/blob/main/flex/modules/reddit/README.md) | `flex init --module reddit --subreddits ClaudeCode,LocalLLaMA --since 30d` |
-| [`hn`](https://github.com/damiandelmas/flex/blob/main/flex/modules/hn/README.md) | `flex init --module hn --hn-queries "claude code,mcp server"` |
-| [`arxiv`](https://github.com/damiandelmas/flex/blob/main/flex/modules/arxiv/README.md) | `flex init --module arxiv --arxiv-query "all:retrieval augmented generation"` |
-
-## extension modules
-
-Extension modules enrich any cell with shared structure — they don't add a source
-or a tool.
-
-### SOMA
-
-Stable identity for files, repos, content, and URLs, so flex follows the same file
-across renames, moves, and repo relocations. That's what makes file history work as
-lineage instead of path search. Ships with Claude Code and Codex.
-
-### knowledge graphs
-
-Hubs, bridges, communities, centrality, and co-edit relationships over sessions and
-files — and backlinks, ghost notes, and hub notes over a Markdown vault. Your agent
-queries them as ordinary SQL columns, not through a separate graph tool.
-
-## how retrieval works
-
-Every query runs three phases in one SQL statement.
+Ask questions such as:
 
 ```text
-SQL pre-filter  ->  Search  ->  SQL compose
+Use flex to find the history of worker.py. Which sessions read or changed it,
+what decisions were made, and where is the full source evidence?
 ```
 
-1. **SQL pre-filter** narrows what enters scoring — by date, source, type, length,
-   project, path, or any SQL expression.
-2. **Search** runs vector, keyword, or hybrid retrieval over the filtered set.
-3. **SQL compose** joins results back to your tables for grouping, filtering,
-   reranking, or source recovery.
+```text
+Use flex to reconstruct why registry.py was introduced. Separate proposed ideas,
+failed approaches, and the implementation that shipped.
+```
 
-The retrieval engine bridges vector scoring, keyword search, and hybrid retrieval
-into SQL.
+```text
+Use flex to summarize what we built this week, grouped by project and touched
+files. Recover the source turns for every major claim.
+```
 
-## flexvec
+Search results are entry points, not the final evidence. Session cells ship
+presets such as `@full`, `@observed-file`, and `@file-history` for moving from a
+matching chunk to the complete turn, file observation, or ordered lineage.
 
-Most vector systems return the nearest chunks and stop. flexvec exposes the score
-array so retrieval becomes programmable.
+### one folder, several retrieval modes
 
-Local memory and knowledge bases are small enough that brute-force similarity is
-practical. Approximate indexes help at huge scale, but they hide the full score
-array. flexvec keeps that array available, which lets your agent suppress a topic,
-diversify results, weight by recency, or search along a conceptual direction before
-selecting rows.
+A filesystem cell can answer structural and semantic questions without forcing
+every problem through vector similarity.
 
-Tokens compose in one query string:
+Exact terms and identifiers:
 
-| token | what it does |
+```sql
+SELECT k.snippet, c.source_id, c.section_title
+FROM keyword('refresh failure') k
+JOIN chunks c ON c.id = k.id
+ORDER BY k.rank DESC
+LIMIT 12
+```
+
+Semantic retrieval with source fields:
+
+```sql
+SELECT v.score, c.source_id, c.section_title, c.content
+FROM vec_ops('durable reconciliation after restart') v
+JOIN chunks c ON c.id = v.id
+ORDER BY v.score DESC
+LIMIT 12
+```
+
+Ordinary structural SQL:
+
+```sql
+SELECT file_kind,
+       count(DISTINCT source_id) AS files,
+       count(*) AS chunks
+FROM chunks
+GROUP BY file_kind
+ORDER BY files DESC
+```
+
+Code-aware cells also expose presets for callers, callees, imports, symbol
+subtrees, and impact analysis. Obsidian-enabled cells add notes, tags, aliases,
+wikilinks, hubs, orphans, and ghost targets without narrowing the rest of the
+folder to Markdown.
+
+## retrieval is a composition
+
+Every retrieval query has three possible stages:
+
+```text
+SQL pre-filter  ->  keyword / semantic scoring  ->  SQL composition
+```
+
+1. **Pre-filter** the candidate set by date, source, type, project, path, or any
+   other SQL predicate.
+2. **Search** the eligible rows with full-text, semantic, or hybrid retrieval.
+3. **Compose** results with the rest of the cell: join source records, group by
+   session, recover files, apply graph features, or rerank.
+
+The important boundary is that filtering happens before scoring. An agent can ask
+for recent assistant turns from one repository and then search that set, instead
+of retrieving globally and hoping a post-filter leaves useful results.
+
+### programmatic vector retrieval
+
+[flexvec](https://github.com/damiandelmas/flexvec) exposes the score array inside
+SQLite so semantic retrieval can be shaped before rows are selected.
+
+| token | operation |
 |---|---|
-| `similar:TEXT` | search for this concept |
-| `suppress:TEXT` | push this topic out of results |
-| `diverse` | spread across subtopics instead of ten versions of the same answer |
+| `similar:TEXT` | search toward a concept |
+| `suppress:TEXT` | push a concept out of the result set |
+| `diverse` | select across subtopics rather than near-duplicates |
 | `decay:N` | favor recent content with an N-day half-life |
 | `centroid:id1,id2` | search from the average of examples |
-| `from:A to:B` | find content along a conceptual arc |
-| `pool:N` | set how many candidates to score |
+| `from:A to:B` | search along a conceptual direction |
+| `pool:N` | control the scored candidate pool |
 
-Example:
+For example:
 
 ```sql
 SELECT v.id, v.score, m.session_id, m.content
 FROM vec_ops(
-  'similar:how the system works architecture
+  'similar:system architecture
    diverse
-   suppress:website landing page design tagline',
-  'SELECT id FROM messages
-   WHERE type = ''assistant'''
+   suppress:landing page copy',
+  'SELECT id FROM messages WHERE type = ''assistant'''
 ) v
-JOIN messages m ON v.id = m.id
+JOIN messages m ON m.id = v.id
 ORDER BY v.score DESC
 LIMIT 5
 ```
 
-This finds architecture messages while suppressing landing-page drafts. Standard
-semantic search usually does only the first half.
+The diversity objective selects rows but does not replace their relevance scores;
+published scores retain their similarity meaning.
+
+## source modules
+
+Stable sources:
+
+| module | source |
+|---|---|
+| [`claude-code`](flex/modules/claude_code/README.md) | Claude Code sessions, tool calls, and file evidence |
+| [`codex`](flex/modules/codex/README.md) | Codex CLI sessions and file evidence |
+| [`filesystem`](flex/modules/fs) | mixed Markdown, code, and text folders; optional Obsidian semantics |
+| [`tools`](flex/modules/skills/README.md) | skills, MCP servers, frameworks, and agent tools |
+
+`instant`, `markdown`, `obsidian`, `codegraph`, and `code` remain compatibility
+aliases for earlier narrow workflows. New folder workflows should use
+`filesystem` with `--obsidian` or `--no-embed` where needed.
+
+Beta sources:
+
+| module | example |
+|---|---|
+| [`goose`](flex/modules/goose/README.md) | `flex init --module goose` |
+| [`github`](flex/modules/github/README.md) | `flex init --module github --github-repos owner/repo` |
+| [`reddit`](flex/modules/reddit/README.md) | `flex init --module reddit --subreddits ClaudeCode,LocalLLaMA --since 30d` |
+| [`hn`](flex/modules/hn/README.md) | `flex init --module hn --hn-queries "claude code,mcp server"` |
+| [`arxiv`](flex/modules/arxiv/README.md) | `flex init --module arxiv --arxiv-query "all:retrieval augmented generation"` |
+
+Adding a supported source creates another cell behind the same query interface. It
+does not add another MCP search tool.
 
 ## architecture
 
@@ -270,107 +273,169 @@ reading its schema, not by learning a new API.
 ### cells
 
 A cell is a portable SQLite database for one knowledge source: Claude Code
-sessions, Codex sessions, a Markdown vault, project history, or another structured
+sessions, Codex sessions, a mixed folder, project history, or another structured
 corpus. Source modules are adapters that read a source format and compile it into
 the shared cell shape.
 
-Cells are the same shape at every level — chunks with edges, types, enrichments,
-and views. A registry at `~/.flex/registry.db` catalogs them by UUID, so names
-resolve to paths and renaming is a single update. Adding a new source adds a new
-cell behind the same query surface — never a new tool.
+Cells share the same conventions at every level — chunks with edges, types,
+enrichments, and views. A registry at `~/.flex/registry.db` catalogs them by UUID,
+so names resolve to paths and renaming is a single update. Adding a new source adds
+a new cell behind the same query surface — never a new search tool.
 
 ### the cell shape
 
 One node type sits at the center: `_raw_chunks` — content, embedding, timestamp.
 Everything else orbits it as tables keyed by `chunk_id`. A document is a grouping
-edge. A module is a table. An enrichment is a score. A view composes them into a
-flat surface the agent queries.
+edge. An enrichment is a score. A view composes them into a flat surface the agent
+queries.
 
-The table prefix *is* the lifecycle declaration:
+The table prefix is a lifecycle declaration:
 
 ```text
-_raw_*      immutable facts        written at compile time   never wiped
-_edges_*    relationships          re-derived on ingest
-_types_*    classification         re-derived on ingest
-_enrich_*   computed structure     always safe to wipe
-(no prefix) views                  composed from the tables above
+_raw_*      source-derived facts      owned by compile and refresh
+_edges_*    relationships             derived from source facts
+_types_*    classification            source or derived labels
+_enrich_*   computed structure        safe to regenerate
+(no prefix) views                     composed query surfaces
 ```
 
-Reading a table name tells an agent what it's looking at: `_enrich_*` is
-recomputable and safe to drop, while `_raw_*` is the durable record that survives
-everything.
+Reading a table name tells an agent what kind of data it is looking at.
+`_enrich_*` is recomputable analytical structure; `_raw_*` is the compiler-owned
+source record that enrichment must not overwrite.
 
 ### self-describing
 
-There is no manifest and no external config. A cell describes itself through
-`sqlite_master`, `PRAGMA table_info`, and a single entry point: `@orient` returns
-the cell's shape, schema, views, presets, and sample content in one call. Agents
-discover view columns instead of hardcoding them, so a cell stays queryable as
-modules add tables and columns.
+A cell exposes its query contract through `sqlite_master`, `PRAGMA table_info`,
+and a single entry point: `@orient` returns its shape, schema, views, presets, and
+sample content in one call. Agents discover view columns instead of hardcoding
+them, so a cell stays queryable as modules add tables and columns. The local
+registry and service configuration locate and operate cells; they do not define a
+cell's query schema.
 
 ### the lifecycle
 
-Three write paths feed one read surface:
+Two write paths feed one read surface:
 
 ```text
-compile  (facts)      ─→  _raw_*, _edges_*, _types_*  ─┐
-                                                       ├─→  views  ─→  agent queries SQL
-enrich   (structure)  ─→  _enrich_*  ──────────────────┘
+compile / refresh  ─→  _raw_*, _edges_*, _types_*  ─┐
+                                                     ├─→  views  ─→  agent queries SQL
+enrich             ─→  _enrich_*  ──────────────────┘
 ```
 
-Compile is deterministic — the same source always produces the same chunks, with
-no interpretation. Enrichment runs offline, reading what compile wrote and
-computing structure (graphs, fingerprints, communities) into `_enrich_*`. Views
-regenerate from whatever tables exist. Content is fact; labels are hypothesis; raw
-data survives everything; and every mutation logs itself to `_ops`, so each cell
-carries its own provenance.
+Compile and refresh translate the source into facts, relationships, and source
+types. Enrichment reads those facts and computes structure such as graphs,
+fingerprints, and communities into `_enrich_*`. Views regenerate from the tables
+that exist. Source content and derived interpretation stay visibly separate.
 
-### modules are tables
+### extensions are tables
 
-A module installs by creating tables with the convention prefixes and uninstalls
-by dropping them — no registration, no coupling. A cell without a given module
-still has full retrieval; those columns are simply absent. SOMA and the graph
-enrichments are modules in exactly this sense — ordinary SQLite tables and columns,
-queried as SQL, never a separate tool.
+Table-level extensions add capabilities by creating convention-prefixed tables;
+removing a recomputable extension removes those tables without changing the query
+transport. SOMA and graph enrichments work in this sense — ordinary SQLite tables
+and columns queried as SQL, never separate MCP tools. Source modules additionally
+own compilation and lifecycle configuration because they connect a cell to an
+external source.
 
 ### one interface, local-first
 
 MCP is transport, not topology. The agent sees a single read-only tool —
 `flex_search` against a named cell — and retrieval happens inside the cell (see
-[how retrieval works](#how-retrieval-works)). The `flex core` CLI is for
-installation and operations: initialize sources, rebuild cells, inspect health.
-The durable artifact is the cell itself — one local SQLite file under
-`~/.flex/cells/`, with no hosted service in the query path.
+[retrieval is a composition](#retrieval-is-a-composition)). The `flex core` CLI is
+for installation and operations: initialize sources, inspect cells, and diagnose
+health. The durable artifact is the cell itself — one local SQLite file, normally
+under `~/.flex/cells/`.
 
-## what's inside
+## local-first, optionally networked
 
-- **MCP server**: one read-only query tool, `flex_search` — the primary interface
-  for agents.
-- **local SQLite databases**: source-specific tables, views, saved queries, and
-  runtime docs your agent can inspect.
-- **CLI**: initialize sources and inspect health.
-- **[flexvec](https://github.com/damiandelmas/flexvec)**: SQL vector retrieval
-  kernel with suppression, diversification, decay, and trajectory operators.
-- **worker**: background refresh for local coding-agent memory.
+Queries run against local SQLite files. The optional hub can distribute prebuilt,
+checksum-verified cells:
+
+```bash
+flex hub view
+flex hub pull CELL
+flex hub status
+```
+
+A pulled cell remains locally queryable without an ongoing network dependency.
+Publishing is explicit and provenance-checked; private local cells are not
+implicitly published.
+
+## upgrade older embedding cells
+
+Cells created before 0.52 retain their original embedding model until explicitly
+migrated. flex never infers a vector space from byte width or silently relabels
+stored vectors.
+
+Preview and run the migration:
+
+```bash
+flex reembed --dry-run
+flex reembed
+flex reembed --dry-run
+flex health --json
+```
+
+For a non-empty cell, migration works on a copy while the original remains
+available in its old vector space. The copy is swapped in only after database
+integrity, vector width, and sampled embedding reproducibility checks pass. Its
+backup is retained under `~/.flex/backups/reembed-nomic/`. An eligible empty cell
+needs no vector rewrite and is stamped directly; already-migrated and
+structural-only cells are skipped.
+
+For larger local migrations, increase ONNX CPU parallelism explicitly:
+
+```bash
+FLEX_ONNX_THREADS=8 flex reembed
+```
+
+## operational commands
+
+```bash
+flex health --json                         # services, cells, refresh, watchers
+flex status                               # cell lifecycle and freshness
+flex core search --cell CELL "@orient"    # inspect a cell's live contract
+flex sync --cell CELL                     # bring one cell into parity
+flex warm                                 # inspect or manage the vector warm set
+```
+
+## benchmarks
+
+Measured, not claimed. On [LongMemEval-S](https://arxiv.org/abs/2410.10813) (470
+questions, session-level), scored with the paper's own evaluation code on the
+identical question set — same tier, same ground truth, no cross-tier comparison:
+
+| retriever | recall@5 | nDCG@10 |
+|---|---|---|
+| **flex hybrid** (`keyword() ∩ vec_ops()`) | **0.860** | **0.913** |
+| paper's best (Contriever + LLM fact-expansion) | 0.774 | 0.837 |
+| Contriever | 0.753 | 0.827 |
+| BM25 | 0.638 | 0.708 |
+
+flex's composed hybrid beats the paper's strongest published technique on its
+own yardstick. On [BEIR](https://github.com/beir-cellar/beir), flexvec's
+modulation properties pass 52/52 tests; on SciFact, `diverse` cuts intra-list
+similarity 13% while keeping 93% of baseline nDCG@10. At the kernel level, a
+composed query (pre-filter → score → rerank) over a 1M-chunk federated corpus
+runs in 82ms with no ANN index — a pre-filtered 3K-chunk scope runs in 0.4ms.
+
+Re-verified on the current default embedder (Nomic v1.5 fp32, 768d) after the
+0.52 migration: hybrid retrieval holds at 0.857 recall@5 / 0.910 nDCG@10 — flat
+versus the original measurement above, because keyword search already saturates
+this benchmark's fact-lookup questions. The embedding upgrade shows up where it
+matters for a weaker retriever: measured in isolation (vector similarity alone,
+no keyword component), the same embedding swap moves recall@1 from 0.43 to 0.82
+and nDCG@10 from 0.67 to 0.90 on identical questions. Full methodology, caveats,
+and what remains unrun or CLAIM-only (not VERIFIED) is in the retrieval kernel
+paper.
 
 ## paper
 
-The retrieval kernel is described in the flexvec paper:
+The retrieval kernel is described in:
 
 [flexvec: SQL Vector Retrieval with Programmatic Embedding Modulation](https://arxiv.org/abs/2603.22587)
 
----
+## license
 
-```bash
-curl -sSL https://getflex.dev/install.sh | bash -s -- claude-code
-```
-
-```bash
-curl -sSL https://getflex.dev/install.sh | bash -s -- codex
-```
-
-```bash
-flex init --module filesystem --path /path/to/folder --obsidian
-```
-
-MIT · Python 3.12 · SQLite · [getflex.dev](https://getflex.dev) · [paper](https://arxiv.org/abs/2603.22587) · [x](https://x.com/damian_delmas)
+MIT · Python 3.12+ · SQLite · [getflex.dev](https://getflex.dev) ·
+[GitHub](https://github.com/damiandelmas/flex) ·
+[paper](https://arxiv.org/abs/2603.22587)
