@@ -4,7 +4,19 @@ Public changes to **flex** ([getflex.dev](https://getflex.dev)).
 
 ---
 
-## 0.54.0 — Unreleased
+## 0.54.1 — Unreleased
+
+### Honest full-sync outcomes
+
+- `flex sync --full` now preserves its existing local-service quiescence during
+  enrichment rebuilds, always attempts captured service restoration, and exits
+  nonzero with a phase-labelled summary if any sync phase fails. A failed or
+  timed-out rebuild can no longer print `Sync complete.` or look successful to
+  shell automation.
+
+---
+
+## 0.54.0 — August 13, 2026
 
 This release makes local flex cells more durable under interruption, gives them
 a continuity layer, and closes the public package around one universal query

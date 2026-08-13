@@ -1643,7 +1643,13 @@ def _check_fts(conn, cell_name: str):
 
 
 def cmd_sync(args):
-    """Bring all three layers (code, data, services) into parity."""
+    """Bring all three layers (code, data, services) into parity.
+
+    Sync is deliberately best-effort: later phases may repair a partial earlier
+    phase, and exclusive work must always resume services.  Its process status
+    is not best-effort, though.  Any recorded phase failure makes the command
+    fail after cleanup so callers never mistake partial parity for success.
+    """
     import sqlite3
     import time
 
@@ -1657,6 +1663,10 @@ def cmd_sync(args):
         return
 
     target = args.cell  # None = all cells
+    failures: list[str] = []
+
+    def record_failure(phase: str, detail: object) -> None:
+        failures.append(f"{phase}: {detail}")
 
     print("flex sync")
     print()
@@ -1677,6 +1687,7 @@ def cmd_sync(args):
             print(f"  {name}: {'seeded' if changed else 'ok'}")
         except sqlite3.Error as error:
             print(f"  {name}: FAILED ({error})")
+            record_failure("query catalogs", f"{name}: {error}")
     # ---- Phase 2: Cell sync (stubs + curated views + auto views + FTS5) ----
     print()
     print("[2/5] Cell sync")
@@ -1721,6 +1732,7 @@ def cmd_sync(args):
                 print(f"  {name}: ok")
         except Exception as e:
             print(f"  {name}: FAILED ({e})")
+            record_failure("cell sync", f"{name}: {e}")
         finally:
             if conn:
                 try:
@@ -1741,17 +1753,21 @@ def cmd_sync(args):
         if not worker_unit.exists() or (not refresh_timer.exists() and not custom_worker):
             print("  Installing missing systemd units")
             try:
-                _install_systemd()
+                if not _install_systemd():
+                    record_failure("services", "systemd unit installation was not confirmed")
             except Exception as e:
                 print(f"  systemd install FAILED: {e}")
+                record_failure("services", f"systemd unit installation: {e}")
         elif custom_worker:
             pass  # custom unit — don't overwrite
         elif "flex.daemon" in worker_text and "--no-refresh" not in worker_text:
             print("  Updating systemd units for local-only worker")
             try:
-                _install_systemd()
+                if not _install_systemd():
+                    record_failure("services", "systemd unit update was not confirmed")
             except Exception as e:
                 print(f"  systemd update FAILED: {e}")
+                record_failure("services", f"systemd unit update: {e}")
 
         for service in ["flex-worker", "flex-mcp"]:
             try:
@@ -1761,9 +1777,12 @@ def cmd_sync(args):
                 )
                 print(f"  {service}: restarted")
             except subprocess.CalledProcessError as e:
-                print(f"  {service}: FAILED ({e.stderr.decode().strip()})")
+                detail = e.stderr.decode().strip()
+                print(f"  {service}: FAILED ({detail})")
+                record_failure("services", f"{service}: {detail}")
             except subprocess.TimeoutExpired:
                 print(f"  {service}: restart timed out")
+                record_failure("services", f"{service}: restart timed out")
             except FileNotFoundError:
                 print(f"  {service}: SKIP (systemctl not found)")
 
@@ -1775,31 +1794,41 @@ def cmd_sync(args):
         if not worker_plist.exists() or (not refresh_plist.exists() and not custom_worker):
             print("  Installing missing launchd agents")
             try:
-                _install_launchd()
+                if not _install_launchd():
+                    record_failure("services", "launchd agent installation was not confirmed")
             except Exception as e:
                 print(f"  launchd install FAILED: {e}")
+                record_failure("services", f"launchd agent installation: {e}")
         elif custom_worker:
             pass  # custom agent — don't overwrite
         elif "flex.daemon" in worker_text and "--no-refresh" not in worker_text:
             print("  Updating launchd agents for local-only worker")
             try:
-                _install_launchd()
+                if not _install_launchd():
+                    record_failure("services", "launchd agent update was not confirmed")
             except Exception as e:
                 print(f"  launchd update FAILED: {e}")
+                record_failure("services", f"launchd agent update: {e}")
         else:
             # Kill any PID-managed processes before launchd takes over
             _kill_pid_services()
             uid = os.getuid()
             for label in ["dev.getflex.worker", "dev.getflex.mcp"]:
                 try:
-                    subprocess.run(
+                    result = subprocess.run(
                         ["launchctl", "kickstart", "-k",
                          f"user/{uid}/{label}"],
                         capture_output=True, timeout=10,
                     )
-                    print(f"  {label}: restarted")
+                    if result.returncode:
+                        detail = _command_error(result) or "non-zero exit"
+                        print(f"  {label}: FAILED ({detail})")
+                        record_failure("services", f"{label}: {detail}")
+                    else:
+                        print(f"  {label}: restarted")
                 except Exception as e:
                     print(f"  {label}: FAILED ({e})")
+                    record_failure("services", f"{label}: {e}")
 
     # Verify services actually started (all platforms)
     time.sleep(1)
@@ -1810,8 +1839,10 @@ def cmd_sync(args):
         worker_ok, mcp_ok = _verify_services()
     if not worker_ok:
         print("  worker: FAILED (could not start)")
+        record_failure("services", "worker could not start")
     if not mcp_ok:
         print("  MCP: FAILED (could not start)")
+        record_failure("services", "MCP could not start")
 
     # ---- Phase 4: MCP wiring ----
     print()
@@ -1829,6 +1860,7 @@ def cmd_sync(args):
             _patch_claude_json()
     except Exception as e:
         print(f"  FAILED ({e})")
+        record_failure("MCP wiring", e)
 
     # ---- Phase 5: Optional enrichment rebuild ----
     if args.full:
@@ -1852,20 +1884,29 @@ def cmd_sync(args):
                 print(f"  done in {elapsed:.1f}s")
             else:
                 print(f"  FAILED (exit {result.returncode})")
+                record_failure("enrichment rebuild", f"exit {result.returncode}")
                 for line in result.stderr.strip().splitlines()[-5:]:
                     print(f"  {line}")
         except subprocess.TimeoutExpired:
             print("  TIMEOUT (>600s)")
+            record_failure("enrichment rebuild", "timeout (>600s)")
         except Exception as e:
             print(f"  ERROR: {e}")
+            record_failure("enrichment rebuild", e)
         finally:
             if receipt is not None:
                 try:
                     _resume_services_after_exclusive_work(receipt)
                 except RuntimeError as error:
                     print(f"  ERROR: services were not restored: {error}")
+                    record_failure("enrichment rebuild", f"services were not restored: {error}")
 
     print()
+    if failures:
+        print(f"Sync failed ({len(failures)} phase error(s)):")
+        for failure in failures:
+            print(f"  - {failure}")
+        raise SystemExit(1)
     print("Sync complete.")
 
 
