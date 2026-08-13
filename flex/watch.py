@@ -39,6 +39,7 @@ DEFAULT_QUIET_WINDOW_S = 0.5
 DEFAULT_MAX_LATENCY_S = 2.0
 DEFAULT_RECONCILE_INTERVAL_S = 60.0
 DEFAULT_QUEUE_MAX = 10_000
+_UNKNOWN_DEBT_CELL = "__unknown__"
 
 ENV_QUIET_WINDOW_MS = "FLEX_WATCH_QUIET_WINDOW_MS"
 ENV_MAX_LATENCY_MS = "FLEX_WATCH_MAX_LATENCY_MS"
@@ -193,18 +194,41 @@ def registrations_for_cells(cells) -> list[WatchRegistration]:
             roots.extend(x for x in (cell.get("watch_path"), cell.get("corpus_path")) if x)
         pattern = cell.get("watch_pattern") or "**/*"
         for raw_root in roots:
+            root_pattern = pattern
             try:
                 root = Path(raw_root).expanduser().resolve()
             except OSError:
                 continue
-            key = (cell["name"], root, pattern)
+            # A registered singleton SQLite source historically used the file
+            # itself as watch_path.  Watchdog schedules directories, and WAL
+            # mode publishes authored changes through `<database>-wal`, so
+            # normalize that durable declaration into a parent-directory
+            # registration covering the database and its sidecars.
+            if root.is_file():
+                source_name = root.name
+                if root_pattern in ("**/*", source_name):
+                    root_pattern = f"{source_name}*"
+                root = root.parent
+            key = (cell["name"], root, root_pattern)
             if key in seen or not root.is_dir():
                 continue
             seen.add(key)
             registrations.append(WatchRegistration(
-                cell_name=cell["name"], root=root, pattern=pattern, recursive=True,
+                cell_name=cell["name"], root=root, pattern=root_pattern, recursive=True,
             ))
-    return sorted(registrations, key=lambda r: (r.cell_name, str(r.root)))
+    # Session runtimes are the latency-sensitive source plane: install those
+    # observers before large repository/context trees. All registrations still
+    # participate; this ordering only determines how soon live conversations
+    # begin feeding the shared queue during asynchronous startup.
+    session_cells = {"claude_code", "codex", "goose"}
+    return sorted(
+        registrations,
+        key=lambda r: (
+            0 if r.cell_name in session_cells else 1,
+            r.cell_name,
+            str(r.root),
+        ),
+    )
 
 
 def fair_batch(conn: sqlite3.Connection, lane: str, items, limit: int):
@@ -265,10 +289,18 @@ class InvalidationQueue:
 
         self._lock = threading.Lock()
         self._entries: dict[tuple, dict] = {}
-        self._reconciliation_required = False
+        # Debt is scoped and versioned by cell. A clean Claude session scan
+        # must never acknowledge an unrelated corpus overflow, nor erase new
+        # debt that arrived while that scan was running.
+        self._reconciliation_debt: dict[str, int] = {}
+        self._debt_epoch = 0
         self._queued_total = 0
         self._coalesced_total = 0
         self._drained_total = 0
+        self._requeued_total = 0
+        self._deferred_total = 0
+        self._backoff_total = 0
+        self._failed_total = 0
         self._dropped_total = 0
 
     def put(self, inv: Invalidation) -> None:
@@ -277,7 +309,7 @@ class InvalidationQueue:
             existing = self._entries.get(key)
             if existing is None:
                 if len(self._entries) >= self.max_size:
-                    self._reconciliation_required = True
+                    self._mark_reconciliation_required_locked({inv.cell_name})
                     self._dropped_total += 1
                     return
                 self._entries[key] = {
@@ -293,8 +325,10 @@ class InvalidationQueue:
 
     def drain_ready(self, now: float) -> list:
         """Return invalidations whose quiet window elapsed or that hit
-        maximum latency, removing them from the queue. Deterministically
-        ordered by (cell_name, source_path) for stable, testable behavior.
+        maximum latency, removing them from the queue. This is a dequeue,
+        rather than an acknowledgement of successful processing: callers must
+        requeue a batch if their handler fails. Deterministically ordered by
+        (cell_name, source_path) for stable, testable behavior.
         """
         ready = []
         with self._lock:
@@ -309,17 +343,116 @@ class InvalidationQueue:
         ready.sort(key=lambda inv: (inv.cell_name, str(inv.source_path)))
         return ready
 
-    def reconciliation_required(self) -> bool:
-        with self._lock:
-            return self._reconciliation_required
+    def requeue(self, invalidations, *, reason: str = "handler_failure") -> int:
+        """Restore a dequeued batch after a handler failure or deferral.
 
-    def mark_reconciliation_required(self) -> None:
-        with self._lock:
-            self._reconciliation_required = True
+        The original observation time is retained, so a retry is immediately
+        eligible when its quiet window already elapsed. If a newer callback
+        has already enqueued the same key, retain that newer event's kind but
+        make the combined entry eligible at the earlier deadline. Capacity
+        overflow still requires reconciliation, which remains the durable
+        correctness backstop when a retry cannot fit in memory.
 
-    def clear_reconciliation_required(self) -> None:
+        ``reason`` controls observability only: ``handler_failure`` increments
+        ``failed_total``; ``deferred`` and ``backoff`` have separate counters.
+        Returns the number of entries restored or merged back into the queue.
+        """
+        if reason not in {"handler_failure", "deferred", "backoff"}:
+            raise ValueError(f"unknown invalidation requeue reason: {reason}")
+        restored = 0
+        failed = 0
         with self._lock:
-            self._reconciliation_required = False
+            for inv in invalidations:
+                failed += 1
+                key = (inv.cell_name, inv.source_path)
+                existing = self._entries.get(key)
+                if existing is None:
+                    if len(self._entries) >= self.max_size:
+                        self._mark_reconciliation_required_locked({inv.cell_name})
+                        self._dropped_total += 1
+                        continue
+                    self._entries[key] = {
+                        "first": inv.observed_at,
+                        "deadline": inv.observed_at + self.quiet_window,
+                        "kind": inv.kind,
+                    }
+                else:
+                    existing["first"] = min(existing["first"], inv.observed_at)
+                    existing["deadline"] = min(
+                        existing["deadline"], inv.observed_at + self.quiet_window,
+                    )
+                restored += 1
+            self._requeued_total += restored
+            if reason == "handler_failure":
+                # Count every affected invalidation, including one that could
+                # only fall back to full reconciliation because the queue was
+                # full.
+                self._failed_total += failed
+            elif reason == "deferred":
+                self._deferred_total += failed
+            else:
+                self._backoff_total += failed
+        return restored
+
+    @staticmethod
+    def _debt_cells(cell_names) -> set[str]:
+        if cell_names is None:
+            return {_UNKNOWN_DEBT_CELL}
+        if isinstance(cell_names, str):
+            return {cell_names}
+        return {str(name) for name in cell_names}
+
+    def _mark_reconciliation_required_locked(self, cells: set[str]) -> None:
+        if not cells:
+            return
+        self._debt_epoch += 1
+        for cell in cells:
+            self._reconciliation_debt[cell] = self._debt_epoch
+
+    def reconciliation_required(self, cell_name: str | None = None) -> bool:
+        """Return any debt, or debt relevant to one cell when named."""
+        with self._lock:
+            if cell_name is None:
+                return bool(self._reconciliation_debt)
+            return cell_name in self._reconciliation_debt
+
+    def reconciliation_debt_generation(self, cell_name: str) -> int | None:
+        """Return the current debt generation for compare-and-clear acks."""
+        with self._lock:
+            return self._reconciliation_debt.get(cell_name)
+
+    def reconciliation_debt_cells(self) -> tuple[str, ...]:
+        """Return the named debt scopes for health and authority routing."""
+        with self._lock:
+            return tuple(sorted(self._reconciliation_debt))
+
+    def mark_reconciliation_required(self, cell_names=None) -> None:
+        """Record reconciliation debt for one or more cells.
+
+        Omitting scope preserves the legacy conservative behavior and marks
+        unknown/global debt. Callers that know the invalidation's cell should
+        always pass it so another cell cannot falsely acknowledge the debt.
+        """
+        with self._lock:
+            self._mark_reconciliation_required_locked(self._debt_cells(cell_names))
+
+    def clear_reconciliation_required(self, cell_names=None, *,
+                                      through_generation: int | None = None) -> None:
+        """Clear all legacy debt, or only a proven named generation.
+
+        ``through_generation`` is a compare-and-clear guard: debt created
+        after an authority started its scan remains owed.
+        """
+        with self._lock:
+            if cell_names is None:
+                self._reconciliation_debt.clear()
+            else:
+                for cell in self._debt_cells(cell_names):
+                    generation = self._reconciliation_debt.get(cell)
+                    if generation is not None and (
+                        through_generation is None or generation <= through_generation
+                    ):
+                        del self._reconciliation_debt[cell]
 
     def stats(self) -> dict:
         with self._lock:
@@ -327,9 +460,17 @@ class InvalidationQueue:
                 "pending": len(self._entries),
                 "queued_total": self._queued_total,
                 "coalesced_total": self._coalesced_total,
+                # `drained_total` is the legacy name for dequeues. It does
+                # not imply the handler acknowledged the work successfully.
                 "drained_total": self._drained_total,
+                "dequeued_total": self._drained_total,
+                "requeued_total": self._requeued_total,
+                "deferred_total": self._deferred_total,
+                "backoff_total": self._backoff_total,
+                "failed_total": self._failed_total,
                 "dropped_total": self._dropped_total,
-                "reconciliation_required": self._reconciliation_required,
+                "reconciliation_required": bool(self._reconciliation_debt),
+                "reconciliation_required_cells": sorted(self._reconciliation_debt),
             }
 
 
@@ -372,14 +513,14 @@ def _make_handler(registration: WatchRegistration, queue: InvalidationQueue):
             if event.is_directory:
                 return
             self._enqueue(event.dest_path, "moved")
-            queue.mark_reconciliation_required()  # old path may now be stale
+            queue.mark_reconciliation_required(registration.cell_name)  # old path may be stale
 
         # Deletes carry no content to validate or sync — reconciliation
         # (and _raw_sources staying put) is the correctness path for
         # removals, not the event queue.
         def on_deleted(self, event):
             if not event.is_directory:
-                queue.mark_reconciliation_required()
+                queue.mark_reconciliation_required(registration.cell_name)
 
     return _Handler()
 
@@ -420,6 +561,9 @@ class Watcher:
             observer.schedule(
                 handler, str(self.registration.root), recursive=self.registration.recursive
             )
+            # Publish the backend before start() so a concurrent service stop
+            # can interrupt an expensive recursive watch initialization.
+            self._observer = observer
             observer.start()
         except Exception as e:
             self.last_error = str(e)
@@ -428,9 +572,9 @@ class Watcher:
                 observer.stop()
             except Exception:
                 pass
+            self._observer = None
             return False
 
-        self._observer = observer
         self.backend = type(observer).__name__
         self.healthy = True
         self.last_error = None
@@ -452,13 +596,13 @@ class Watcher:
         if self.healthy and not self.is_alive():
             self.healthy = False
             self.last_error = self.last_error or "observer thread died"
-            self.queue.mark_reconciliation_required()
+            self.queue.mark_reconciliation_required(self.registration.cell_name)
         return self.healthy
 
     def mark_unhealthy(self, reason: str) -> None:
         self.healthy = False
         self.last_error = reason
-        self.queue.mark_reconciliation_required()
+        self.queue.mark_reconciliation_required(self.registration.cell_name)
 
     def request_stop(self) -> None:
         """Ask the observer to stop without waiting for its thread."""
@@ -497,41 +641,80 @@ class WatcherSet:
         self.backend = None
         self.healthy = False
         self.last_error = None
+        self._starting = False
+        self._start_thread = None
+        self._stop_requested = False
 
     def start(self) -> bool:
+        self._starting = True
         failures = []
-        for watcher in self.watchers:
-            if not watcher.start():
-                failures.append(f"{watcher.registration.root}: {watcher.last_error}")
-        self.backend = ",".join(sorted({w.backend for w in self.watchers if w.backend})) or None
-        self.healthy = bool(self.watchers) and not failures
-        self.last_error = "; ".join(failures) or None
-        if failures:
-            self.queue.mark_reconciliation_required()
-        return self.healthy
+        try:
+            for watcher in self.watchers:
+                if self._stop_requested:
+                    break
+                if not watcher.start():
+                    failures.append(f"{watcher.registration.root}: {watcher.last_error}")
+            self.backend = ",".join(sorted({w.backend for w in self.watchers if w.backend})) or None
+            self.healthy = (
+                bool(self.watchers) and not failures and not self._stop_requested
+            )
+            self.last_error = "; ".join(failures) or None
+            if failures:
+                self.queue.mark_reconciliation_required(
+                    watcher.registration.cell_name for watcher in self.watchers
+                )
+            return self.healthy
+        finally:
+            self._starting = False
+
+    def start_background(self) -> None:
+        """Initialize recursive observers without blocking structural capture."""
+        if self._start_thread is not None and self._start_thread.is_alive():
+            return
+        self._stop_requested = False
+        self._starting = True
+        self.healthy = bool(self.watchers)
+        self._start_thread = threading.Thread(
+            target=self.start,
+            name="flex-watch-start",
+            daemon=True,
+        )
+        self._start_thread.start()
 
     def check_health(self) -> bool:
+        # Reconciliation already runs immediately at worker startup. Do not
+        # declare every not-yet-started observer dead while recursive watch
+        # installation proceeds in the background.
+        if self._starting:
+            return True
         dead = [w for w in self.watchers if not w.check_health()]
         self.healthy = bool(self.watchers) and not dead
         if dead:
             self.last_error = "; ".join(
                 f"{w.registration.root}: {w.last_error or 'unhealthy'}" for w in dead
             )
-            self.queue.mark_reconciliation_required()
+            self.queue.mark_reconciliation_required(
+                watcher.registration.cell_name for watcher in dead
+            )
         return self.healthy
 
     def mark_unhealthy(self, reason: str) -> None:
         self.healthy = False
         self.last_error = reason
-        self.queue.mark_reconciliation_required()
+        self.queue.mark_reconciliation_required(
+            watcher.registration.cell_name for watcher in self.watchers
+        )
 
     def stop(self, timeout: float = 5.0) -> None:
         # Stop every backend first, then share one deadline across joins.
         # A per-watcher timeout makes shutdown grow as roots * timeout (49
         # live roots once did), which exceeds systemd's service deadline.
+        self._stop_requested = True
         for watcher in self.watchers:
             watcher.request_stop()
         deadline = time.monotonic() + max(0.0, timeout)
+        if self._start_thread is not None:
+            self._start_thread.join(timeout=max(0.0, deadline - time.monotonic()))
         for watcher in self.watchers:
             watcher.join(timeout=max(0.0, deadline - time.monotonic()))
         self.healthy = False
