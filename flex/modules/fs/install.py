@@ -34,10 +34,14 @@ def register_args(parser) -> None:
     _add_arg(parser, "--description", default=None, help="Cell description")
     _add_arg(parser, "--obsidian", action="store_true",
              help="Add Obsidian tags, aliases, Dataview, and wikilink semantics")
+    _add_arg(parser, "--minimal-presets", action="store_true",
+             help="Keep only @orient; use SQL and retrieval primitives for the rest")
     _add_arg(parser, "--exclude", action="append", default=[],
              help="Exclude a path or filename pattern (repeatable)")
     _add_arg(parser, "--no-watch", action="store_true",
              help="Build a static cell instead of keeping it current")
+    _add_arg(parser, "--no-mcp", action="store_true",
+             help="Do not install Claude MCP configuration or Flex skills")
 
 
 def _slug(value: str) -> str:
@@ -91,6 +95,7 @@ def run(args, console) -> None:
     kinds_value = getattr(args, "_filesystem_file_kinds", None)
     file_kinds = tuple(kinds_value) if kinds_value else None
     lifecycle = "static" if getattr(args, "no_watch", False) else "watch"
+    minimal_presets = bool(getattr(args, "minimal_presets", False))
 
     db = create(name, description, cell_type="filesystem", schema=FILESYSTEM_SCHEMA_DDL)
     db_path = Path(db.execute("PRAGMA database_list").fetchone()[2])
@@ -131,6 +136,9 @@ def run(args, console) -> None:
             watch_path=None if lifecycle == "static" else str(root),
             watch_pattern="**/*" if lifecycle == "watch" else None,
         )
+        if minimal_presets:
+            db.execute("DELETE FROM _presets WHERE name <> 'orient'")
+            db.commit()
     except Exception:
         db.close()
         try:
@@ -140,7 +148,9 @@ def run(args, console) -> None:
         raise
     db.close()
 
-    _install_claude_assets(("flex", "flex:filesystem", "flex:markdown", "flex:codegraph"))
+    install_mcp = not getattr(args, "no_mcp", False)
+    if install_mcp:
+        _install_claude_assets(("flex",))
     console.print(
         f"  filesystem          [green]{sources} files, {chunks} chunks[/green]"
     )
@@ -156,5 +166,8 @@ def run(args, console) -> None:
         worker_ok, mcp_ok = _verify_services()
         if not worker_ok or not mcp_ok:
             _start_services_direct()
-    _patch_claude_json()
-    console.print(f"  Query               [bold]flex core search --cell {name} \"@orient\"[/bold]")
+    if install_mcp:
+        _patch_claude_json()
+    else:
+        console.print("  MCP                 [yellow]not configured (--no-mcp)[/yellow]")
+    console.print(f"  Query               [bold]flex search --cell {name} \"@orient\"[/bold]")

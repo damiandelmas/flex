@@ -123,8 +123,16 @@ _MIGRATIONS = [
     "ALTER TABLE cells ADD COLUMN reconciliation_required INTEGER DEFAULT 0",
     "ALTER TABLE cells ADD COLUMN watch_path TEXT",
     "ALTER TABLE cells ADD COLUMN watch_pattern TEXT",
+    # Detector is deliberately separate from lifecycle: a cell can be locally
+    # watched yet declare active_append, events, or signature reconciliation.
+    "ALTER TABLE cells ADD COLUMN detector TEXT",
+    "ALTER TABLE cells ADD COLUMN detector_config TEXT",
     # Active/inactive: active cells get VectorCache at startup, inactive are lazy-loaded on first query
     "ALTER TABLE cells ADD COLUMN active INTEGER DEFAULT 1",
+    # Explicit opt-in for a sovereign database whose authoritative location is
+    # outside FLEX_HOME. The permission is stored on the exact registry row;
+    # ordinary external paths remain rejected.
+    "ALTER TABLE cells ADD COLUMN allow_external INTEGER DEFAULT 0",
 ]
 
 
@@ -281,6 +289,10 @@ def register_cell(
     refresh_module: str | None = None,
     watch_path: str | Path | None = None,
     watch_pattern: str | None = None,
+    detector: str | None = None,
+    detector_config: str | None = None,
+    allow_external: bool | int | None = None,
+    cell_id: str | None = None,
 ) -> str:
     """Register or update a cell in the registry.
 
@@ -296,8 +308,16 @@ def register_cell(
     now = datetime.now(timezone.utc).isoformat()
     path_str = str(Path(path).resolve())
 
-    # Validate cell path is within safe boundaries
-    if not _is_safe_cell_path(Path(path_str)):
+    existing = db.execute(
+        "SELECT id, COALESCE(allow_external,0) AS allow_external "
+        "FROM cells WHERE name = ?", (name,)
+    ).fetchone()
+    external_allowed = bool(allow_external) or bool(
+        existing and existing['allow_external']
+    )
+
+    # External authoritative databases require an explicit, durable opt-in.
+    if not (_is_safe_cell_path(Path(path_str)) or external_allowed):
         raise ValueError(f"Cell path must be within {FLEX_HOME}: {path_str}")
 
     corpus_str = str(Path(corpus_path).resolve()) if corpus_path else None
@@ -312,18 +332,22 @@ def register_cell(
             description = detected_desc
 
     # Check if cell already has an id
-    existing = db.execute(
-        "SELECT id FROM cells WHERE name = ?", (name,)
-    ).fetchone()
-    cell_id = existing['id'] if existing and existing['id'] else str(uuid.uuid4())
+    if existing and existing['id']:
+        if cell_id is not None and str(existing['id']) != cell_id:
+            raise ValueError(
+                f"Cell {name!r} is already registered with a different identity"
+            )
+        cell_id = str(existing['id'])
+    else:
+        cell_id = cell_id or str(uuid.uuid4())
 
     db.execute("""
         INSERT INTO cells (id, name, path, corpus_path, cell_type, description,
                            unlisted, active, source_url, checksum, origin,
                            lifecycle, refresh_interval, refresh_script, refresh_module,
-                           watch_path, watch_pattern,
-                           created_at, updated_at)
-        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                           watch_path, watch_pattern, detector, detector_config,
+                           allow_external, created_at, updated_at)
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
         ON CONFLICT(name) DO UPDATE SET
             id = COALESCE(cells.id, excluded.id),
             path = excluded.path,
@@ -348,13 +372,17 @@ def register_cell(
             END,
             watch_path = COALESCE(excluded.watch_path, cells.watch_path),
             watch_pattern = COALESCE(excluded.watch_pattern, cells.watch_pattern),
+            detector = COALESCE(excluded.detector, cells.detector),
+            detector_config = COALESCE(excluded.detector_config, cells.detector_config),
+            allow_external = COALESCE(excluded.allow_external, cells.allow_external),
             updated_at = excluded.updated_at
     """, (cell_id, name, path_str, corpus_str, cell_type, description,
           None if unlisted is None else int(bool(unlisted)),
           None if active is None else int(bool(active)),
           source_url, checksum, origin,
           lifecycle, refresh_interval, refresh_script, refresh_module,
-          watch_str, watch_pattern,
+          watch_str, watch_pattern, detector, detector_config,
+          None if allow_external is None else int(bool(allow_external)),
           now, now))
     db.commit()
     db.close()
@@ -395,12 +423,13 @@ def resolve_cell(name: str) -> Optional[Path]:
     try:
         db = _open_registry_readonly()
         row = db.execute(
-            "SELECT path FROM cells WHERE name = ?", (name,)
+            "SELECT path, COALESCE(allow_external,0) AS allow_external "
+            "FROM cells WHERE name = ?", (name,)
         ).fetchone()
         db.close()
         if row:
             p = Path(row[0])
-            if p.exists() and _is_safe_cell_path(p):
+            if p.exists() and (_is_safe_cell_path(p) or bool(row['allow_external'])):
                 return p
     except Exception:
         pass
@@ -428,8 +457,9 @@ def get_cell_metadata(name: str) -> dict | None:
             "COALESCE(refresh_generation,0) AS refresh_generation, "
             "COALESCE(refresh_pending,0) AS refresh_pending, source_high_water, "
             "COALESCE(reconciliation_required,0) AS reconciliation_required, "
-            "watch_path, watch_pattern, "
+            "watch_path, watch_pattern, detector, detector_config, "
             "created_at, updated_at, COALESCE(unlisted, 0) as unlisted, "
+            "COALESCE(allow_external,0) AS allow_external, "
             "COALESCE(active, 1) as active "
             "FROM cells WHERE name = ?",
             (name,),
@@ -478,8 +508,9 @@ def list_cells() -> list[dict]:
             "COALESCE(refresh_generation,0) AS refresh_generation, "
             "COALESCE(refresh_pending,0) AS refresh_pending, source_high_water, "
             "COALESCE(reconciliation_required,0) AS reconciliation_required, "
-            "watch_path, watch_pattern, "
+            "watch_path, watch_pattern, detector, detector_config, "
             "created_at, updated_at, COALESCE(unlisted, 0) as unlisted, "
+            "COALESCE(allow_external,0) AS allow_external, "
             "COALESCE(active, 1) as active "
             "FROM cells ORDER BY name"
         ).fetchall()
@@ -596,6 +627,10 @@ def classify_refresh_state(cell: dict, now: datetime | None = None) -> dict:
             due = True
         elif is_running:
             due = False
+        # A refresh module can commit a bounded slice and report more work.
+        # Do not wait an entire interval before the scheduler resumes it.
+        elif cell.get('refresh_pending'):
+            due = True
         elif not last_dt:
             due = True
         elif interval_s:
@@ -658,6 +693,9 @@ def discover_refreshable() -> list[dict]:
         rows = db.execute("""
             SELECT name, path, lifecycle, refresh_script, refresh_module,
                    refresh_interval, last_refresh_at, refresh_status,
+                   refresh_started_at, refresh_finished_at,
+                   COALESCE(refresh_pending,0) AS refresh_pending,
+                   COALESCE(reconciliation_required,0) AS reconciliation_required,
                    COALESCE(unlisted, 0) as unlisted,
                    COALESCE(active, 1) as active
             FROM cells
@@ -688,7 +726,7 @@ def discover_watched() -> list[dict]:
         db = _open_registry()
         rows = db.execute("""
             SELECT name, path, cell_type, refresh_module, refresh_script,
-                   watch_path, watch_pattern,
+                   watch_path, watch_pattern, detector, detector_config,
                    COALESCE(unlisted, 0) as unlisted,
                    COALESCE(active, 1) as active
             FROM cells
@@ -709,6 +747,7 @@ def discover_watched() -> list[dict]:
 
 
 def mark_refresh_started(name: str, *, pending: int | None = None,
+                         reconciliation_required: bool | None = None,
                          timestamp: str | None = None) -> None:
     """Record work beginning without advancing the committed freshness receipt."""
     try:
@@ -717,8 +756,11 @@ def mark_refresh_started(name: str, *, pending: int | None = None,
         db.execute(
             "UPDATE cells SET refresh_status='running', refresh_started_at=?, "
             "refresh_error=NULL, refresh_pending=COALESCE(?,refresh_pending), "
+            "reconciliation_required=COALESCE(?,reconciliation_required), "
             "updated_at=? WHERE name=?",
-            (ts, pending, ts, name),
+            (ts, pending,
+             None if reconciliation_required is None else int(reconciliation_required),
+             ts, name),
         )
         db.commit()
         db.close()

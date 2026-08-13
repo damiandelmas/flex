@@ -924,17 +924,10 @@ def main():
     from flex.views import regenerate_views
     regenerate_views(db)
 
-    # Presets
-    from flex.retrieve.presets import install_presets
-    preset_dir = Path(__file__).resolve().parent.parent.parent.parent / 'retrieve' / 'presets' / 'general'
-    if preset_dir.exists():
-        install_presets(db, preset_dir)
-    platform_preset_dir = Path(__file__).parent.parent / 'stock' / 'presets'
-    if platform_preset_dir.exists():
-        install_presets(db, platform_preset_dir)
-
     # Metadata
     set_meta(db, 'cell_type', 'tools')
+    from flex.manage.install_presets import ensure_cell_presets
+    ensure_cell_presets(db, 'tools')
     set_meta(db, 'substrate', 'skills')
     set_meta(db, 'surface', 'tools')
     set_meta(db, 'implementation_module', 'flex.modules.skills')

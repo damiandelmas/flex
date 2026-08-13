@@ -1,0 +1,4 @@
+interface:
+  display_name: "Flex Ledger"
+  short_description: "Annotate and recover exact Flex objects"
+  default_prompt: "Use $flex:ledger to annotate an exact Flex object or recover session continuity."

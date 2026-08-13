@@ -2,22 +2,19 @@
 # Flex installer — https://getflex.dev
 #
 # Usage:
-#   curl -sSL https://getflex.dev/install.sh | bash                    # base (flex index only)
+#   curl -sSL https://getflex.dev/install.sh | bash                    # base (flex compile only)
 #   curl -sSL https://getflex.dev/install.sh | bash -s -- claude-code  # + sessions, worker, MCP
 #   curl -sSL https://getflex.dev/install.sh | bash -s -- obsidian     # + auto-detect vault, index, MCP
 #
 # Options (via env vars or flags):
 #   FLEX_VERSION=0.20.0     pin a specific version (default: fetched from getflex.dev)
 #   VAULT=/path/to/vault    specify Obsidian vault path (obsidian module)
-#   --uninstall            remove flex completely
+#   --uninstall            remove flex runtime (keeps local cells and data)
 #   --reinstall            wipe venv and reinstall from scratch
 #   --no-init              install only, skip flex init
 #   --help                 show usage
 #
-# Modules:
-#   claude-code            scan sessions, start worker, register MCP
-#   obsidian               index Obsidian vault, start worker, register MCP
-#   (default)              base install — flex index, flex core search, no module
+# Supported on macOS and Linux. Windows requires a native installer/runtime.
 
 main() {
     set -eo pipefail
@@ -61,6 +58,7 @@ main() {
     DO_UNINSTALL=false
     DO_REINSTALL=false
     DO_INIT=true
+    DO_NO_MCP=false
     MODULE=""
 
     for arg in "$@"; do
@@ -68,18 +66,22 @@ main() {
             --uninstall)  DO_UNINSTALL=true ;;
             --reinstall)  DO_REINSTALL=true ;;
             --no-init)    DO_INIT=false ;;
+            --no-mcp)     DO_NO_MCP=true ;;
             --help|-h)
                 echo "Usage: curl -sSL https://getflex.dev/install.sh | bash [-s -- MODULE]"
                 echo ""
                 echo "Modules:"
-                echo "  claude-code     scan sessions, start worker, register MCP"
-                echo "  obsidian        index Obsidian vault, start worker, register MCP"
-                echo "  (none)          base install — flex index, flex core search"
+                echo "  claude-code     index Claude Code sessions, register MCP"
+                echo "  codex           index Codex CLI sessions, register MCP"
+                echo "  filesystem      index a folder (pass --path through flex init)"
+                echo "  obsidian        index an Obsidian vault, register MCP"
+                echo "  (none)          base install — flex compile and search"
                 echo ""
                 echo "Options:"
-                echo "  --uninstall     remove flex (venv + symlink)"
+                echo "  --uninstall     remove flex runtime (venv + symlink; keeps data)"
                 echo "  --reinstall     wipe venv and reinstall from scratch"
                 echo "  --no-init       install only, skip flex init"
+                echo "  --no-mcp        pass through to supported modules; skip Claude MCP setup"
                 echo ""
                 echo "Environment:"
                 echo "  FLEX_VERSION    pin a specific version (default: latest from getflex.dev)"
@@ -259,17 +261,29 @@ main() {
             fail "Download failed — got an invalid file instead of a wheel.\n  Try: curl -L -o /tmp/getflex.whl ${_whl_url}\n       ${VENV_DIR}/bin/pip install /tmp/getflex.whl"
         fi
 
-        # Verify SHA256 checksum (if sidecar available)
+        # Verify SHA256 checksum using the already-created Python runtime. This
+        # works on macOS as well as Linux (macOS does not ship ``sha256sum``).
         local _sha_url="${_whl_url}.sha256"
         local _sha_tmp="${_whl_dir}/expected.sha256"
-        if curl -sSLf -o "$_sha_tmp" "$_sha_url" 2>/dev/null; then
-            local _expected _actual
-            _expected=$(cat "$_sha_tmp" | tr -d '[:space:]')
-            _actual=$(sha256sum "$_whl_tmp" | cut -d' ' -f1)
-            if [ "$_expected" != "$_actual" ]; then
-                rm -rf "$_whl_dir"
-                fail "Wheel checksum mismatch.\n  Expected: ${_expected}\n  Got:      ${_actual}\n  The download may have been tampered with."
-            fi
+        if ! curl -sSLf -o "$_sha_tmp" "$_sha_url" 2>/dev/null; then
+            fail "Failed to download the wheel checksum.\n  URL: ${_sha_url}\n  Refusing an unverifiable installation."
+        fi
+        local _expected _actual
+        _expected=$(cat "$_sha_tmp" | tr -d '[:space:]')
+        _actual=$("${VENV_DIR}/bin/python" - "$_whl_tmp" <<'PY'
+import hashlib
+import sys
+
+digest = hashlib.sha256()
+with open(sys.argv[1], "rb") as wheel:
+    for block in iter(lambda: wheel.read(1024 * 1024), b""):
+        digest.update(block)
+print(digest.hexdigest())
+PY
+)
+        if [ "$_expected" != "$_actual" ]; then
+            rm -rf "$_whl_dir"
+            fail "Wheel checksum mismatch.\n  Expected: ${_expected}\n  Got:      ${_actual}\n  The download may have been tampered with."
         fi
 
         _spin_start "install" "pip install getflex ${FLEX_VERSION}"
@@ -350,6 +364,9 @@ main() {
         fi
         if [ "$MODULE" = "obsidian" ] && [ -n "${VAULT:-}" ]; then
             _init_args="$_init_args --vault $VAULT"
+        fi
+        if [ "$DO_NO_MCP" = true ]; then
+            _init_args="$_init_args --no-mcp"
         fi
 
         # Reconnect /dev/tty so flex init can prompt interactively

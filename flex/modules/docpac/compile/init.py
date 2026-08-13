@@ -682,23 +682,16 @@ def main():
     regenerate_views(db, views={'sections': 'chunk', 'documents': 'source'})
 
     # ═════════════════════════════════════════════════
-    # 11. INSTALL PRESETS
+    # 11. VALIDATE QUERY CONTRACT
     # ═════════════════════════════════════════════════
-    print("Installing presets...")
-    from flex.retrieve.presets import install_presets
-
-    general_presets = FLEX_ROOT / 'flex' / 'retrieve' / 'presets' / 'general'
-    install_presets(db, general_presets)
-    docpac_presets = FLEX_ROOT / 'flex' / 'modules' / 'docpac' / 'stock' / 'presets'
-    install_presets(db, docpac_presets)
-    # Phase B: cell-shipped presets (.flexpresets.json) install AFTER stock so a
-    # fresh-named cell preset survives a rebuild that wipes+reinstalls stock.
+    # Cell-authored .flexpresets.json remains a compatibility exception. Stock
+    # SQL is resolved from its source files and is never copied into the cell.
     from flex.compile.flexpresets import install_flexpresets
     _fp = install_flexpresets(db, corpus_root, warn=lambda m: print(m))
     if _fp['installed']:
         print(f"Installed {_fp['installed']} cell preset(s) from .flexpresets.json.")
-    preset_count = db.execute("SELECT COUNT(*) FROM _presets").fetchone()[0]
-    print(f"Installed {preset_count} presets.")
+    from flex.manage.install_presets import ensure_cell_presets
+    ensure_cell_presets(db, 'docpac', corpus_root=corpus_root)
 
     # ═════════════════════════════════════════════════
     # 12. REGISTER IN CELL REGISTRY

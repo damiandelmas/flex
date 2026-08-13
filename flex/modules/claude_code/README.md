@@ -12,6 +12,11 @@
 
 flex compiles your Claude Code session history into a queryable SQLite database with vector and hybrid retrieval. your AI agent connects via MCP, discovers the schema at runtime, and writes SQL against your history.
 
+> **Local data scope.** Installation reads the existing JSONL sessions under
+> `~/.claude/projects/`. Those transcripts can contain prompts, tool output, and
+> local paths. The resulting cell remains local under `~/.flex/`; review that
+> scope before installing on a shared or sensitive machine.
+
 **install:**
 
 ```bash
@@ -28,7 +33,7 @@ flex works retroactively — as soon as you install, all of your sessions become
 
 **retrieval tools typically have minimal metadata to filter on.**
 
-flex captures everything: the exact session, whether it spawned agents, what files and repos it touched, which project it belongs to. filtering happens before scoring — the vector engine only scores what survives. on top of that, flex builds knowledge graphs automatically — community structure, hub sessions, file co-edit patterns, project attribution.
+flex captures recorded session evidence: the exact session, whether it spawned agents, what files and repos it touched, and which project it belongs to. filtering happens before scoring — the vector engine only scores what survives.
 
 **vector search typically surfaces similar content and stops there.**
 
@@ -104,9 +109,9 @@ MCP is the normal agent interface. use raw CLI access when an agent or operator
 needs direct terminal queries, debugging, or scripting:
 
 ```bash
-flex core search --cell claude_code "@digest days=3"
-flex core search --cell claude_code "@file path=src/worker.py"
-flex core search --cell claude_code "SELECT COUNT(*) FROM sessions WHERE project = 'myapp'"
+flex search --cell claude_code "@digest days=3"
+flex search --cell claude_code "@file path=src/worker.py"
+flex search --cell claude_code "SELECT COUNT(*) FROM sessions WHERE project = 'myapp'"
 ```
 
 same query surface, direct from the terminal.

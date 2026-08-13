@@ -28,6 +28,7 @@ HANDLEBARS_RE = re.compile(r'\{\{[\s\S]*?\}\}')
 FOOTNOTE_DEF_RE = re.compile(r'^\[\^[^\]]+\]:.*$', re.MULTILINE)
 WIKILINK_DISPLAY_RE = re.compile(r'\[\[([^\]|]+)(?:\|([^\]]+))?\]\]')
 HEADING_RE = re.compile(r'^(#{1,6})\s')
+HTML_COMMENT_RE = re.compile(r'<!--[\s\S]*?-->')
 
 
 # ─── Dataclass ────────────────────────────────────────────────────────────────
@@ -58,6 +59,24 @@ def strip_footnotes_for_embedding(text: str) -> str:
     return FOOTNOTE_DEF_RE.sub('', text)
 
 
+def strip_html_comments(text: str) -> str:
+    """Remove non-rendered metadata from searchable Markdown content.
+
+    Chunk ``raw_content`` remains untouched, so Dataview fields embedded in
+    comments still compile into typed tables while hidden manifests do not
+    become prose or embedding input.
+    """
+    return HTML_COMMENT_RE.sub('', text)
+
+
+def _mask_html_comments(text: str) -> str:
+    """Hide comments without changing offsets used by sliding windows."""
+    return HTML_COMMENT_RE.sub(
+        lambda match: ''.join('\n' if char == '\n' else ' ' for char in match.group()),
+        text,
+    )
+
+
 def resolve_wikilinks_for_display(text: str) -> str:
     """Replace [[wikilinks]] with display text for embedding."""
     def _replace(m):
@@ -74,6 +93,7 @@ def resolve_wikilinks_for_display(text: str) -> str:
 
 def _clean_for_embedding(text: str) -> str:
     """Full cleaning pipeline for embedding input. Ephemeral."""
+    text = strip_html_comments(text)
     text = strip_template_syntax(text)
     text = resolve_wikilinks_for_display(text)
     text = strip_tags_for_embedding(text)
@@ -111,26 +131,37 @@ def _sliding_window(text: str, note_title: str, heading_chain: list,
     max_chars = MAX_SECTION_CJK if is_cjk_dominant(text) else MAX_SECTION_CHARS
     chunks = []
     prefix = " > ".join([note_title] + heading_chain) if heading_chain else note_title
+    searchable_text = _mask_html_comments(text)
+    # Dataview extraction consumes ``raw_content`` downstream. A large HTML
+    # comment must therefore remain whole even though searchable prose is
+    # windowed. Keep visible bytes aligned in every window, but attach each
+    # complete hidden comment exactly once to the first substantive chunk.
+    hidden_metadata = "\n".join(
+        match.group() for match in HTML_COMMENT_RE.finditer(text)
+    )
+    metadata_attached = False
     offset = 0
     pos = start_position
 
     while offset < len(text):
         end = min(offset + max_chars, len(text))
-        window = text[offset:end]
-
-        cleaned = _clean_for_embedding(window)
-        content = f"{prefix}\n{cleaned}" if prefix else cleaned
-
-        chunks.append(ChunkEntry(
-            content=content,
-            raw_content=f"{prefix}\n{window}" if prefix else window,
-            section_title=section_title,
-            heading_depth=heading_depth,
-            heading_chain=list(heading_chain),
-            position=pos,
-            word_count=len(window.split()),
-        ))
-        pos += 1
+        cleaned = _clean_for_embedding(searchable_text[offset:end])
+        if cleaned:
+            content = f"{prefix}\n{cleaned}" if prefix else cleaned
+            raw_window = searchable_text[offset:end]
+            if hidden_metadata and not metadata_attached:
+                raw_window = f"{raw_window}\n{hidden_metadata}"
+                metadata_attached = True
+            chunks.append(ChunkEntry(
+                content=content,
+                raw_content=f"{prefix}\n{raw_window}" if prefix else raw_window,
+                section_title=section_title,
+                heading_depth=heading_depth,
+                heading_chain=list(heading_chain),
+                position=pos,
+                word_count=len(cleaned.split()),
+            ))
+            pos += 1
 
         if end >= len(text):
             break

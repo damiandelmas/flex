@@ -960,7 +960,7 @@ def run(args, console) -> None:
     panel.append(f"{soma_status}\n", style="green")
     panel.append("Mode        ", style="")
     panel.append("no embeddings · no graph · unlisted · subtree preset shipped\n\n", style="yellow")
-    panel.append("  flex core search --cell ", style="bold")
+    panel.append("  flex search --cell ", style="bold")
     panel.append(f"{name} ", style="bold green")
     panel.append('"@orient"\n', style="bold")
     panel.append("  grow:    flex init --module instant --path FOLDER\n", style="dim")

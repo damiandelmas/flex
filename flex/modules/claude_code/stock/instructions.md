@@ -272,6 +272,27 @@ LIMIT 10;
 
 ## Session Navigation
 
+`sessions.primary_cwd` is the directory where a session began. It is launch
+context, not a claim that the session worked in only one repository.
+
+`session_repository_evidence` is the occurrence-level surface for repositories
+and paths a session actually touched. It preserves `evidence_path` even when
+SOMA cannot yet resolve a stable repository identity. `repo_path`, `repo_root`,
+and `project` are nullable enrichments; `resolution` says how they were derived.
+
+Use path boundaries explicitly. A prefix such as `/projects/app%` also matches
+`application` and `app-tools`.
+
+```sql
+SELECT DISTINCT session_id
+FROM session_repository_evidence
+WHERE evidence_path = :repo_root
+   OR evidence_path LIKE :repo_root || '/%';
+```
+
+Do not collapse launch cwd, touched repositories, and scalar project labels
+into one attribution. They answer different questions and compose through SQL.
+
 Use `@story` for one session before pulling a full transcript.
 
 ```text
@@ -407,6 +428,7 @@ Useful presets:
 
 - `@orient`
 - `@story session=<session_id>`
+- `@message-index session=<session_id> limit=<n>`
 - `@digest days=<n>`
 - `@file path=<path-fragment>`
 - `@file-search query=<terms>`

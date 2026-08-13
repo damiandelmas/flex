@@ -238,8 +238,13 @@ def backfill(conn: sqlite3.Connection, dry_run: bool = False, limit: int = 0):
           file=sys.stderr)
 
     # --- Phase 4: Batch insert ---
-    cur.executemany("INSERT OR IGNORE INTO _raw_content VALUES (?,?,?,?,?)", raw_content_rows)
-    cur.executemany("INSERT OR IGNORE INTO _edges_raw_content VALUES (?,?)", raw_content_edges)
+    cur.executemany(
+        "INSERT OR IGNORE INTO _raw_content "
+        "(hash, content, tool_name, byte_length, first_seen) VALUES (?,?,?,?,?)",
+        raw_content_rows)
+    cur.executemany(
+        "INSERT OR IGNORE INTO _edges_raw_content (chunk_id, content_hash) VALUES (?,?)",
+        raw_content_edges)
     cur.executemany(
         "INSERT OR IGNORE INTO _raw_chunks (id, content, embedding, timestamp) VALUES (?,?,NULL,?)",
         fb_chunk_rows)
@@ -247,8 +252,15 @@ def backfill(conn: sqlite3.Connection, dry_run: bool = False, limit: int = 0):
         "INSERT OR IGNORE INTO _edges_source (chunk_id, source_id, source_type, position) "
         "VALUES (?,?,'file-body',?)",
         fb_source_rows)
-    cur.executemany("INSERT OR IGNORE INTO _types_file_body VALUES (?,?,?,?)", fb_type_rows)
-    cur.executemany("INSERT OR REPLACE INTO _file_body_index VALUES (?,?,?,?,?)", fb_index_rows)
+    cur.executemany(
+        "INSERT OR IGNORE INTO _types_file_body "
+        "(chunk_id, target_file, title, position) VALUES (?,?,?,?)",
+        fb_type_rows)
+    cur.executemany(
+        "INSERT OR REPLACE INTO _file_body_index "
+        "(target_file, content_hash, parent_chunk_id, chunk_count, updated_at) "
+        "VALUES (?,?,?,?,?)",
+        fb_index_rows)
 
     conn.commit()
 

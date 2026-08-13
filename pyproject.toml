@@ -1,6 +1,6 @@
 [project]
 name = "getflex"
-version = "0.53.0"
+version = "0.54.0"
 description = "Knowledge engine for AI agents. Compile any data source into a queryable SQLite cell with embeddings, graph intelligence, and full-text search."
 license = "MIT"
 license-files = ["LICENSE"]
@@ -36,6 +36,7 @@ dependencies = [
 ]
 
 [project.optional-dependencies]
+test = ["jsonschema>=4"]
 
 [project.urls]
 Homepage = "https://getflex.dev"
@@ -51,7 +52,9 @@ flex = [
     "modules/arxiv/**/*.md",
     "modules/claude_code/**/*.sql",
     "modules/claude_code/**/*.md",
+    "modules/claude_code/assets/*.png",
     "modules/codex/**/*.md",
+    "modules/extension/ledger/**/*.sql",
     "modules/docpac/stock/**/*.sql",
     "modules/docpac/stock/**/*.md",
     "modules/docpac/stock/**/*.json",

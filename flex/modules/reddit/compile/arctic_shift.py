@@ -37,6 +37,14 @@ _rate_state = {
 }
 
 
+class ArcticShiftRequestError(RuntimeError):
+    """A request exhausted retries and therefore cannot be treated as EOF."""
+
+
+class ArcticShiftPaginationError(RuntimeError):
+    """An API page cannot advance its timestamp cursor safely."""
+
+
 def _parse_rate_headers(resp) -> None:
     """Read x-ratelimit headers and adapt pacing."""
     remaining = resp.headers.get("x-ratelimit-remaining")
@@ -87,7 +95,9 @@ def api_fetch(endpoint: str, params: dict) -> dict:
             if is_last:
                 print(f"  [!] {endpoint} — FAILED after {MAX_RETRIES + 1} "
                       f"attempts: {err_str}", file=sys.stderr)
-                return {"data": []}
+                raise ArcticShiftRequestError(
+                    f"{endpoint} failed after {MAX_RETRIES + 1} attempts: {err_str}"
+                ) from e
 
             # Exponential backoff with jitter
             wait = BACKOFF_BASE * (2 ** attempt) + random.uniform(0, 1)
@@ -124,7 +134,13 @@ def pull_posts(subreddit: str, after: int = 0, before: int = 0,
 
         normalized = [normalize_post(p, subreddit) for p in batch]
         all_posts.extend(normalized)
-        cursor = batch[-1].get("created_utc", 0)
+        next_cursor = batch[-1].get("created_utc", 0)
+        if len(batch) >= BATCH_SIZE and next_cursor <= cursor:
+            raise ArcticShiftPaginationError(
+                f"posts/search for r/{subreddit} returned a non-advancing full page "
+                f"at {cursor}"
+            )
+        cursor = next_cursor
 
         if not quiet:
             print(f"  posts: {len(all_posts)} (latest: "
@@ -181,7 +197,13 @@ def pull_comments(subreddit: str, after: int = 0, before: int = 0,
             else:
                 all_comments.extend(normalized)
 
-            cursor = batch[-1].get("created_utc", 0)
+            next_cursor = batch[-1].get("created_utc", 0)
+            if len(batch) >= BATCH_SIZE and next_cursor <= cursor:
+                raise ArcticShiftPaginationError(
+                    f"comments/search for r/{subreddit} returned a non-advancing full page "
+                    f"at {cursor}"
+                )
+            cursor = next_cursor
             if not quiet:
                 print(f"  comments: {total} (latest: "
                       f"{datetime.fromtimestamp(cursor, tz=timezone.utc).date()})",
@@ -257,7 +279,13 @@ def pull_posts_by_author(author: str, after: int = 0, before: int = 0,
         # Each post carries its own subreddit — normalize per-item
         normalized = [normalize_post(p, p.get("subreddit", "")) for p in batch]
         all_posts.extend(normalized)
-        cursor = batch[-1].get("created_utc", 0)
+        next_cursor = batch[-1].get("created_utc", 0)
+        if len(batch) >= BATCH_SIZE and next_cursor <= cursor:
+            raise ArcticShiftPaginationError(
+                f"posts/search for u/{author} returned a non-advancing full page "
+                f"at {cursor}"
+            )
+        cursor = next_cursor
 
         if not quiet:
             print(f"  posts by u/{author}: {len(all_posts)} (latest: "
@@ -301,7 +329,13 @@ def pull_comments_by_author(author: str, after: int = 0, before: int = 0,
 
         normalized = [normalize_comment(c, c.get("subreddit", "")) for c in batch]
         all_comments.extend(normalized)
-        cursor = batch[-1].get("created_utc", 0)
+        next_cursor = batch[-1].get("created_utc", 0)
+        if len(batch) >= BATCH_SIZE and next_cursor <= cursor:
+            raise ArcticShiftPaginationError(
+                f"comments/search for u/{author} returned a non-advancing full page "
+                f"at {cursor}"
+            )
+        cursor = next_cursor
 
         if not quiet:
             print(f"  comments by u/{author}: {len(all_comments)} (latest: "

@@ -1,18 +1,14 @@
-"""
-Install .sql preset files into cell _presets tables.
+"""Seed database-backed SQL programs from packaged defaults.
 
-Infrastructure utility — not a domain operation. Bakes filesystem presets
-(the authoring format) into cell databases (the runtime source).
-
-Usage:
-    python -m flex.manage.install_presets           # all cells
-    python -m flex.manage.install_presets claude_code  # specific cell
+The database is the runtime authority.  Files are compile-time defaults only;
+this module never scans skills or chooses among runtime filesystem sources.
+Existing rows are preserved so SQL edits remain authoritative.
 """
 import sqlite3
 import sys
 from pathlib import Path
 
-from flex.retrieve.presets import install_presets
+from flex.retrieve.presets import PresetLoader
 from flex.registry import resolve_cell, list_cells
 from flex.modules.specs import module_spec_for, normalize_cell_type, stock_subdirs
 
@@ -52,13 +48,66 @@ def _preset_dirs_for(cell_type: str | None) -> list[Path]:
     return dirs
 
 
-def install_cell(cell_name: str, preset_dirs: list[Path] = None):
-    """Install presets into a single cell.
+def _expected_presets(cell_type: str | None) -> dict[str, str]:
+    """Resolve the final stock name→SQL contract in installation order."""
+    expected: dict[str, str] = {}
+    for directory in _preset_dirs_for(cell_type):
+        for path in sorted(directory.glob("*.sql")):
+            text = path.read_text()
+            name = PresetLoader._parse(text, path.stem)["name"]
+            expected[name] = text
+    return expected
 
-    Args:
-        cell_name: Name of the cell (resolved via registry).
-        preset_dirs: Override preset directories. If None, auto-detected from cell_type.
-    """
+
+def _packaged_variants(cell_type: str | None) -> dict[str, set[str]]:
+    """Return every packaged default that may legitimately be superseded."""
+    variants: dict[str, set[str]] = {}
+    for directory in _preset_dirs_for(cell_type):
+        for path in sorted(directory.glob("*.sql")):
+            text = path.read_text(encoding="utf-8")
+            name = PresetLoader._parse(text, path.stem)["name"]
+            variants.setdefault(name, set()).add(text)
+    return variants
+
+
+def ensure_cell_presets(
+    conn: sqlite3.Connection,
+    cell_type: str | None,
+    corpus_root: str | Path | None = None,
+) -> bool:
+    """Add missing packaged defaults without replacing SQL-owned rows."""
+    del corpus_root
+    conn.execute(
+        "CREATE TABLE IF NOT EXISTS _presets ("
+        "name TEXT PRIMARY KEY, description TEXT, params TEXT DEFAULT '', "
+        "sql TEXT, source TEXT)"
+    )
+    before = conn.total_changes
+    variants = _packaged_variants(cell_type)
+    for name, sql in _expected_presets(cell_type).items():
+        parsed = PresetLoader._parse(sql, name)
+        existing = conn.execute(
+            "SELECT sql FROM _presets WHERE name=?", (name,)
+        ).fetchone()
+        values = (parsed.get("description", ""), parsed.get("params", ""), sql, name)
+        if existing is None:
+            conn.execute(
+                "INSERT INTO _presets(name,description,params,sql) VALUES (?,?,?,?)",
+                (name, *values[:3]),
+            )
+        elif existing[0] != sql and existing[0] in variants.get(name, set()):
+            conn.execute(
+                "UPDATE _presets SET description=?,params=?,sql=? WHERE name=?",
+                values,
+            )
+    changed = conn.total_changes != before
+    if changed:
+        conn.commit()
+    return changed
+
+
+def install_cell(cell_name: str, preset_dirs: list[Path] = None):
+    """Seed missing SQL programs into one registered cell."""
     db_path = resolve_cell(cell_name)
     if db_path is None or not db_path.exists():
         print(f"  {cell_name}: SKIP (not found)")
@@ -78,28 +127,22 @@ def install_cell(cell_name: str, preset_dirs: list[Path] = None):
         conn.row_factory = sqlite3.Row
         conn.execute("PRAGMA journal_mode=WAL")
         conn.execute("PRAGMA busy_timeout=30000")
-
-        # Ensure table exists
-        conn.execute("""
-            CREATE TABLE IF NOT EXISTS _presets (
-                name TEXT PRIMARY KEY,
-                description TEXT,
-                params TEXT DEFAULT '',
-                sql TEXT,
-                source TEXT
-            )
-        """)
-        try:
-            conn.execute("ALTER TABLE _presets ADD COLUMN params TEXT DEFAULT ''")
-        except sqlite3.OperationalError:
-            pass
-
-        # Wipe existing presets — ensures orphans from cell_type changes are removed
-        conn.execute("DELETE FROM _presets")
-
-        for pd in preset_dirs:
-            if pd.exists():
-                install_presets(conn, pd)
+        conn.execute(
+            "CREATE TABLE IF NOT EXISTS _presets ("
+            "name TEXT PRIMARY KEY, description TEXT, params TEXT DEFAULT '', "
+            "sql TEXT, source TEXT)"
+        )
+        for directory in preset_dirs:
+            for path in sorted(Path(directory).glob("*.sql")):
+                text = path.read_text(encoding="utf-8")
+                parsed = PresetLoader._parse(text, path.stem)
+                conn.execute(
+                    "INSERT OR IGNORE INTO _presets"
+                    "(name,description,params,sql) VALUES (?,?,?,?)",
+                    (parsed["name"], parsed["description"], parsed.get("params", ""), text),
+                )
+        conn.commit()
+        print(f"  {cell_name}: database query catalog ready")
 
         conn.close()
     except sqlite3.OperationalError as e:
@@ -107,8 +150,8 @@ def install_cell(cell_name: str, preset_dirs: list[Path] = None):
 
 
 def install_all():
-    """Install presets into all registered cells."""
-    print("Installing presets...")
+    """Seed missing default SQL programs into registered cells."""
+    print("Checking database query catalogs...")
     cells = list_cells()
     if not cells:
         print("  No cells registered. Run 'flex init' first.")

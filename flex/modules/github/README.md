@@ -6,8 +6,8 @@ the general `@orient` surface.
 
 ```bash
 flex init --module github --github-repos owner/repo
-flex core search --cell github "@orient"
-flex core search --cell github "@open-issues days=30"
+flex search --cell github "@orient"
+flex search --cell github "@open-issues days=30"
 ```
 
 Authentication is optional for public repositories. Set `GITHUB_TOKEN` or run

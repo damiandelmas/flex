@@ -1,16 +1,8 @@
-"""
-Flex Presets — SQL skills stored in the cell.
+"""Parse and execute SQL programs stored in a Flex cell's ``_presets`` table.
 
-Presets live in the _presets table (name, description, sql).
-The sql column contains annotated SQL text with @multi, @query, @params.
-Parse logic extracts structure from annotations — same format as .sql files.
-
-Discovery:
-    SELECT name, description FROM _presets;
-
-Execution:
-    PresetLoader(db).execute(db, 'orient')
-    PresetLoader(db).execute(db, 'sessions', {'limit': 5})
+Files may seed this relation while compiling a cell, but query execution has
+one authority: the SQL stored in the database.  There is no runtime filesystem
+discovery, precedence, inheritance, or fallback path.
 """
 
 import re
@@ -19,24 +11,99 @@ from pathlib import Path
 from typing import Optional
 
 
-class PresetLoader:
-    """Load and execute SQL presets from the _presets table."""
+def parse_preset(text: str, name: str) -> dict:
+    """Parse annotated SQL text into the established preset contract."""
+    preset = {
+        'name': name,
+        'description': '',
+        'params': '',
+        'multi': False,
+        'queries': [],
+        'defaults': {}
+    }
 
-    def __init__(self, db: sqlite3.Connection):
+    current_query_name = None
+    current_sql_lines = []
+
+    for line in text.split('\n'):
+        stripped = line.strip()
+
+        # Parse annotations
+        if stripped.startswith('-- @'):
+            match = re.match(r'-- @(\w+):\s*(.+)', stripped)
+            if match:
+                key, value = match.group(1), match.group(2).strip()
+                if key == 'name':
+                    preset['name'] = value
+                elif key == 'description':
+                    preset['description'] = value
+                elif key == 'multi':
+                    preset['multi'] = value.lower() == 'true'
+                elif key == 'query':
+                    # Save previous query
+                    if current_query_name is not None and current_sql_lines:
+                        sql = '\n'.join(current_sql_lines).strip()
+                        if sql:
+                            preset['queries'].append({
+                                'name': current_query_name,
+                                'sql': sql
+                            })
+                    current_query_name = value
+                    current_sql_lines = []
+                elif key in ('param', 'params'):
+                    preset['params'] = value
+                    # Parse "name (default: value)" patterns
+                    for part in value.split(','):
+                        part = part.strip()
+                        default_match = re.match(
+                            r'(\w+)\s*\(default:\s*(.+?)\)', part)
+                        if default_match:
+                            pname = default_match.group(1)
+                            pval = default_match.group(2).strip()
+                            try:
+                                preset['defaults'][pname] = int(pval)
+                            except ValueError:
+                                preset['defaults'][pname] = pval
+            continue
+
+        # Skip empty comment lines
+        if stripped == '--':
+            continue
+
+        current_sql_lines.append(line)
+
+    # Save last query.
+    # If no -- @query: was ever seen, this is a single-query preset — use 'default'.
+    final_name = current_query_name if current_query_name is not None else 'default'
+    if current_sql_lines:
+        sql = '\n'.join(current_sql_lines).strip()
+        if sql:
+            preset['queries'].append({
+                'name': final_name,
+                'sql': sql
+            })
+
+    return preset
+
+
+class PresetLoader:
+    """Load and execute SQL programs from the selected database."""
+
+    def __init__(self, db: sqlite3.Connection, **_compat):
         self.db = db
         self._cache: dict[str, dict] = {}
 
     def list_presets(self) -> list[str]:
-        """List available preset names."""
+        """List the SQL programs stored in this database."""
         try:
             rows = self.db.execute("SELECT name FROM _presets ORDER BY name").fetchall()
-            return [r[0] for r in rows]
+            return [str(row[0]) for row in rows]
         except sqlite3.OperationalError:
             return []
 
     def load(self, name: str) -> dict:
         """
-        Load a preset from the _presets table.
+        Load a preset from the database.
 
         Returns:
             {
@@ -77,8 +144,14 @@ class PresetLoader:
         self._cache[name] = preset
         return preset
 
-    def execute(self, db: sqlite3.Connection, name: str,
-                params: dict = None) -> list[dict]:
+    def execute(
+        self,
+        db: sqlite3.Connection,
+        name: str,
+        params: dict = None,
+        *,
+        materializer=None,
+    ) -> list[dict]:
         """
         Execute a preset and return results.
 
@@ -98,7 +171,7 @@ class PresetLoader:
             results = []
             for query in preset['queries']:
                 sql, positional = self._interpolate(query['sql'], params)
-                sql = self._materialize(db, sql)
+                sql = self._materialize(db, sql, materializer=materializer)
                 if sql.startswith('{"error"'):
                     results.append({
                         'query': query['name'],
@@ -106,24 +179,37 @@ class PresetLoader:
                     })
                     continue
                 try:
+                    if materializer is not None:
+                        from flex.mcp_core import search_authorizer
+                        db.set_authorizer(search_authorizer)
                     rows = db.execute(sql, positional).fetchall()
                     results.append({
                         'query': query['name'],
                         'results': [dict(r) for r in rows]
                     })
-                except sqlite3.OperationalError as e:
+                except sqlite3.DatabaseError as e:
                     results.append({
                         'query': query['name'],
                         'error': str(e)
                     })
+                finally:
+                    if materializer is not None:
+                        db.set_authorizer(None)
             return results
         else:
             sql, positional = self._interpolate(preset['queries'][0]['sql'], params)
-            sql = self._materialize(db, sql)
+            sql = self._materialize(db, sql, materializer=materializer)
             if sql.startswith('{"error"'):
                 return [{"error": sql}]
-            rows = db.execute(sql, positional).fetchall()
-            return [dict(r) for r in rows]
+            try:
+                if materializer is not None:
+                    from flex.mcp_core import search_authorizer
+                    db.set_authorizer(search_authorizer)
+                rows = db.execute(sql, positional).fetchall()
+                return [dict(r) for r in rows]
+            finally:
+                if materializer is not None:
+                    db.set_authorizer(None)
 
     @staticmethod
     def _check_missing_params(preset: dict, params: dict) -> list[str]:
@@ -152,9 +238,15 @@ class PresetLoader:
         except ImportError:
             return sql
 
-    @staticmethod
-    def _materialize(db: sqlite3.Connection, sql: str) -> str:
+    def _materialize(self, db: sqlite3.Connection, sql: str, *, materializer=None) -> str:
         """Materialize preset-local table sources before execution."""
+        if materializer is not None:
+            from flex.mcp_core import materialize_authorizer
+            try:
+                db.set_authorizer(materialize_authorizer)
+                return materializer(db, sql)
+            finally:
+                db.set_authorizer(None)
         try:
             from flex.retrieve.doc_mounts import materialize_docs
             sql = materialize_docs(db, sql)
@@ -166,78 +258,8 @@ class PresetLoader:
 
     @staticmethod
     def _parse(text: str, name: str) -> dict:
-        """Parse annotated SQL text into structured dict."""
-        preset = {
-            'name': name,
-            'description': '',
-            'params': '',
-            'multi': False,
-            'queries': [],
-            'defaults': {}
-        }
-
-        current_query_name = None
-        current_sql_lines = []
-
-        for line in text.split('\n'):
-            stripped = line.strip()
-
-            # Parse annotations
-            if stripped.startswith('-- @'):
-                match = re.match(r'-- @(\w+):\s*(.+)', stripped)
-                if match:
-                    key, value = match.group(1), match.group(2).strip()
-                    if key == 'name':
-                        preset['name'] = value
-                    elif key == 'description':
-                        preset['description'] = value
-                    elif key == 'multi':
-                        preset['multi'] = value.lower() == 'true'
-                    elif key == 'query':
-                        # Save previous query
-                        if current_query_name is not None and current_sql_lines:
-                            sql = '\n'.join(current_sql_lines).strip()
-                            if sql:
-                                preset['queries'].append({
-                                    'name': current_query_name,
-                                    'sql': sql
-                                })
-                        current_query_name = value
-                        current_sql_lines = []
-                    elif key in ('param', 'params'):
-                        preset['params'] = value
-                        # Parse "name (default: value)" patterns
-                        for part in value.split(','):
-                            part = part.strip()
-                            default_match = re.match(
-                                r'(\w+)\s*\(default:\s*(.+?)\)', part)
-                            if default_match:
-                                pname = default_match.group(1)
-                                pval = default_match.group(2).strip()
-                                try:
-                                    preset['defaults'][pname] = int(pval)
-                                except ValueError:
-                                    preset['defaults'][pname] = pval
-                continue
-
-            # Skip empty comment lines
-            if stripped == '--':
-                continue
-
-            current_sql_lines.append(line)
-
-        # Save last query.
-        # If no -- @query: was ever seen, this is a single-query preset — use 'default'.
-        final_name = current_query_name if current_query_name is not None else 'default'
-        if current_sql_lines:
-            sql = '\n'.join(current_sql_lines).strip()
-            if sql:
-                preset['queries'].append({
-                    'name': final_name,
-                    'sql': sql
-                })
-
-        return preset
+        """Compatibility entry point for callers that used the old static parser."""
+        return parse_preset(text, name)
 
     @staticmethod
     def _interpolate(sql: str, params: dict) -> tuple[str, list]:
@@ -262,12 +284,14 @@ class PresetLoader:
         return new_sql, positional
 
 
-def install_presets(db: sqlite3.Connection, preset_dir: Path):
-    """Read .sql files from a directory and INSERT into _presets table.
-
-    Used by init scripts to bake filesystem presets into the cell.
-    The .sql files are the authoring format; the DB is the runtime source.
-    """
+def install_presets(
+    db: sqlite3.Connection,
+    preset_dir: Path,
+    *,
+    commit: bool = True,
+    record_operation: bool = True,
+):
+    """Compile annotated ``.sql`` files into the database query catalog."""
     preset_dir = Path(preset_dir)
     if not preset_dir.exists():
         return
@@ -276,15 +300,16 @@ def install_presets(db: sqlite3.Connection, preset_dir: Path):
     for f in sorted(preset_dir.glob('*.sql')):
         text = f.read_text()
         # Extract name, description, and params from annotations
-        parsed = PresetLoader._parse(text, f.stem)
+        parsed = parse_preset(text, f.stem)
         db.execute(
             "INSERT OR REPLACE INTO _presets (name, description, params, sql) VALUES (?, ?, ?, ?)",
             (parsed['name'], parsed['description'], parsed.get('params', ''), text)
         )
         installed.append(parsed['name'])
-    db.commit()
+    if commit:
+        db.commit()
 
-    if installed:
+    if installed and record_operation:
         from flex.core import log_op
         log_op(db, 'install_presets', '_presets',
                params={'presets': installed, 'source_dir': str(preset_dir)},

@@ -160,12 +160,12 @@ def _resolve_obsidian_links(conn: sqlite3.Connection) -> None:
         resolved = resolve_wikilink(target, maps, source_id)
         if resolved:
             conn.execute(
-                "INSERT INTO _edges_wikilink(chunk_id,from_path,to_path) VALUES(?,?,?)",
+                "INSERT OR IGNORE INTO _edges_wikilink(chunk_id,from_path,to_path) VALUES(?,?,?)",
                 (first_chunks.get(source_id, source_id), source_id, resolved),
             )
         else:
             conn.execute(
-                "INSERT INTO _edges_wikilink_unresolved(from_path,raw_target) VALUES(?,?)",
+                "INSERT OR IGNORE INTO _edges_wikilink_unresolved(from_path,raw_target) VALUES(?,?)",
                 (source_id, target),
             )
 

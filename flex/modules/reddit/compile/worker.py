@@ -456,18 +456,10 @@ def main():
     regenerate_views(db)
     print("  Views regenerated.")
 
-    # Install presets (general + reddit-specific)
-    from flex.retrieve.presets import install_presets
-    preset_dir = Path(__file__).resolve().parent.parent.parent.parent / 'retrieve' / 'presets' / 'general'
-    if preset_dir.exists():
-        install_presets(db, preset_dir)
-    reddit_preset_dir = Path(__file__).parent.parent / 'stock' / 'presets'
-    if reddit_preset_dir.exists():
-        install_presets(db, reddit_preset_dir)
-    print("  Presets installed.")
-
     # Set metadata
     set_meta(db, 'cell_type', 'reddit')
+    from flex.manage.install_presets import ensure_cell_presets
+    ensure_cell_presets(db, 'reddit')
     set_meta(db, 'description', args.description or f'r/{subreddit} posts and comments')
     set_meta(db, 'corpus_path', str(corpus_dir))
     set_meta(db, 'created_at', datetime.now(timezone.utc).isoformat())

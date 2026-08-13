@@ -35,6 +35,7 @@ SELECT 'view' as kind, m.name as name, GROUP_CONCAT(p.name, ', ') as columns,
         WHEN 'agent_key_chunks' THEN 'High-signal agent timeline: prompts, plans, edits, delegation, failed tools, summaries/gaps. Best pre-filter for intent/state queries.'
         WHEN 'files' THEN 'File body sub-chunks only. file, section, ext columns. Use chunks view for unified search.'
         WHEN 'sessions' THEN 'Sources with graph intelligence, fingerprints'
+        WHEN 'session_repository_evidence' THEN 'Occurrence-grained session→repository/path evidence. Query repo_path when resolved; evidence_path always preserves the observed path.'
         ELSE ''
     END as note
 FROM sqlite_master m, pragma_table_info(m.name) p
@@ -170,7 +171,13 @@ SELECT 'parent_uuid',
 UNION ALL
 SELECT 'raw_content',
     (SELECT COUNT(*) FROM _raw_content) || ' rows',
-    'Tool inputs/outputs. JOIN via _edges_raw_content.';
+    'Tool inputs/outputs. JOIN via _edges_raw_content.'
+UNION ALL
+SELECT 'primary_cwd',
+    ROUND(100.0 *
+      (SELECT COUNT(*) FROM _raw_sources WHERE primary_cwd IS NOT NULL AND primary_cwd != '') /
+      MAX((SELECT COUNT(*) FROM _raw_sources), 1), 1) || '%',
+    'Session launch context. Distinct from repositories touched later.';
 
 -- @query: sample
 SELECT substr(content, 1, 180) as preview

@@ -28,6 +28,7 @@ Wire format observations (from external vendor/goose source + live sessions.db):
 from __future__ import annotations
 
 import json
+import hashlib
 import sqlite3
 import sys
 import time
@@ -37,6 +38,8 @@ from typing import Optional
 
 # Vendored CC helpers — used as a dependency, not modified.
 from flex.modules.claude_code.compile.worker import (
+    _ensure_content_tables,
+    _ensure_core_tables,
     _ingest_file_body,
     _store_content_raw,
     ensure_source_exists,
@@ -51,6 +54,27 @@ except ImportError:  # pragma: no cover - older Flex installs without shared bri
 
 
 DEFAULT_GOOSE_DB = Path.home() / ".local" / "share" / "goose" / "sessions" / "sessions.db"
+
+
+def compute_source_signature(source_path: Path) -> tuple[str, int]:
+    """Return a WAL-aware signature for Goose's SQLite source.
+
+    Goose writes through SQLite WAL mode, so the main database byte size is
+    not a freshness signal by itself.  The structural source state is the
+    main database plus its WAL sidecar; the SHM file carries coordination
+    state rather than authored session content.
+    """
+    source = Path(source_path).expanduser()
+    payload = []
+    for candidate in (source, Path(f"{source}-wal")):
+        try:
+            stat = candidate.stat()
+            payload.append((candidate.name, stat.st_size, stat.st_mtime_ns))
+        except OSError:
+            payload.append((candidate.name, None, None))
+    main_size = source.stat().st_size
+    encoded = json.dumps(payload, separators=(",", ":")).encode("utf-8")
+    return hashlib.sha256(encoded).hexdigest(), main_size
 
 
 # ── Tool-name mapping (wire format: (ext, bare_name) → canonical CC) ────────
@@ -103,6 +127,14 @@ def ensure_goose_tables(conn: sqlite3.Connection) -> None:
     """Create Goose-specific optional tables. Idempotent."""
     for ddl in GOOSE_OPTIONAL_TABLES_DDL:
         conn.execute(ddl)
+
+
+def ensure_goose_cell_schema(conn: sqlite3.Connection) -> None:
+    """Heal the shared coding-agent envelope before provider writes."""
+    _ensure_core_tables(conn)
+    _ensure_content_tables(conn)
+    ensure_goose_tables(conn)
+    conn.commit()
 
 
 def _map_tool_name(raw_name: str, goose_extension: Optional[str]) -> str:

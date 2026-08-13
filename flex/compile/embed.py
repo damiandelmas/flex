@@ -18,12 +18,16 @@ import sys
 
 
 def _cell_tag(db) -> str | None:
-    """Read the cell's `vec:model` tag from `_meta` (None = untagged/default)."""
-    try:
-        row = db.execute("SELECT value FROM _meta WHERE key='vec:model'").fetchone()
-        return row[0] if row else None
-    except Exception:
-        return None
+    """Read the cell's `vec:model` tag (None = untagged/default)."""
+    from flex.core import get_meta
+
+    return get_meta(db, "vec:model")
+
+
+def _has_table(db, name: str) -> bool:
+    return db.execute(
+        "SELECT 1 FROM sqlite_master WHERE type='table' AND name=?", (name,)
+    ).fetchone() is not None
 
 
 def _resolve_ingest_target(db):
@@ -46,6 +50,55 @@ def _resolve_ingest_target(db):
     dim = 768 if tag in ('nomic-v1.5', 'nomic-v1.5-fp32') else STORE_DIM
     _, embed_doc = _query_embedder_for(tag, serve_dim=dim)
     return embed_doc, dim, tag
+
+
+def ensure_initial_vector_contract(db) -> str | None:
+    """Declare the fp32 Nomic contract before a fresh cell's first vector.
+
+    Existing untagged cells that already contain vectors remain legacy MiniLM
+    cells.  The helper deliberately does *not* commit: ingestion may be inside
+    a savepoint, and contract metadata must share that publication boundary.
+    """
+    tag = _cell_tag(db)
+    if tag is not None:
+        return tag
+
+    vector_tables = [
+        table for table in ("_raw_chunks", "_raw_sources")
+        if _has_table(db, table)
+    ]
+    if not vector_tables:
+        return None
+
+    for table in vector_tables:
+        has_vectors = db.execute(
+            f"SELECT EXISTS(SELECT 1 FROM {table} WHERE embedding IS NOT NULL)"
+        ).fetchone()[0]
+        if has_vectors:
+            return None
+
+    from flex.retrieve.embeddings import set_active_model
+
+    # A surface with no vectors is new even when it still carries the legacy
+    # `_meta` spelling. `set_active_model()` promotes that spelling to the
+    # canonical metadata relation, preserving its compatibility view. Keep
+    # the writes inside the caller's transaction: an aborted publication must
+    # not leave a model contract without the rows it describes.
+    set_active_model(db, "nomic-v1.5-fp32", 256, commit=False)
+    from flex.envelope import metadata_relation
+
+    relation = metadata_relation(db)
+    assert relation is not None
+    db.execute(
+        f"INSERT INTO {relation}(key,value) VALUES('embedding_model',?) "
+        "ON CONFLICT(key) DO UPDATE SET value=excluded.value",
+        ("nomic-embed-text-v1.5-fp32",),
+    )
+    db.execute(
+        f"INSERT INTO {relation}(key,value) VALUES('embedding_dim','768') "
+        "ON CONFLICT(key) DO UPDATE SET value=excluded.value"
+    )
+    return "nomic-v1.5-fp32"
 
 
 def embed_new(db, batch_size=128, commit_every=500, enrich_fn=None):
@@ -74,29 +127,7 @@ def embed_new(db, batch_size=128, commit_every=500, enrich_fn=None):
         _recover_orphaned_sources(db, commit_every)
         return 0
 
-    tag = _cell_tag(db)
-    if tag is None:
-        # A genuinely new vector column enters the public fp32 space. Existing
-        # untagged cells are pre-0.52 MiniLM cells, so the presence of even one
-        # stored vector is authoritative and keeps them on the legacy path.
-        existing_vectors = db.execute(
-            "SELECT EXISTS(SELECT 1 FROM _raw_chunks WHERE embedding IS NOT NULL) "
-            "OR EXISTS(SELECT 1 FROM _raw_sources WHERE embedding IS NOT NULL)"
-        ).fetchone()[0]
-        if not existing_vectors:
-            from flex.retrieve.embeddings import set_active_model
-            set_active_model(db, 'nomic-v1.5-fp32', 256)
-            db.execute(
-                "INSERT INTO _meta(key,value) VALUES('embedding_model',?) "
-                "ON CONFLICT(key) DO UPDATE SET value=excluded.value",
-                ('nomic-embed-text-v1.5-fp32',),
-            )
-            db.execute(
-                "INSERT INTO _meta(key,value) VALUES('embedding_dim','768') "
-                "ON CONFLICT(key) DO UPDATE SET value=excluded.value"
-            )
-            db.commit()
-            tag = 'nomic-v1.5-fp32'
+    tag = ensure_initial_vector_contract(db)
     tag_blind_ok = tag is None or tag == 'minilm'
 
     # enrich_fn requires Python path (Rust binary can't call Python); a
@@ -207,13 +238,13 @@ def _python_embed(db, batch_size=64, commit_every=500, enrich_fn=None):
     if total > 1000:
         print(file=sys.stderr)
 
-    sources = db.execute("""
-        SELECT DISTINCT e.source_id FROM _edges_source e
-        JOIN _raw_sources s ON e.source_id = s.source_id
-        WHERE s.embedding IS NULL
-    """).fetchall()
-
-    _mean_pool_sources(db, sources, commit_every)
+    if _has_table(db, "_raw_sources") and _has_table(db, "_edges_source"):
+        sources = db.execute("""
+            SELECT DISTINCT e.source_id FROM _edges_source e
+            JOIN _raw_sources s ON e.source_id = s.source_id
+            WHERE s.embedding IS NULL
+        """).fetchall()
+        _mean_pool_sources(db, sources, commit_every)
     return embedded
 
 
@@ -258,6 +289,8 @@ def _find_ort_lib():
 
 def _recover_orphaned_sources(db, commit_every=500):
     """Find and mean-pool sources orphaned by a previous crash."""
+    if not (_has_table(db, "_raw_sources") and _has_table(db, "_edges_source")):
+        return
     sources = db.execute("""
         SELECT DISTINCT e.source_id FROM _edges_source e
         JOIN _raw_sources s ON e.source_id = s.source_id

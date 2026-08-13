@@ -33,6 +33,8 @@ CREATE INDEX IF NOT EXISTS idx_observations_time
     ON _enrich_observations(timestamp);
 CREATE INDEX IF NOT EXISTS idx_soft_ops_chunk
     ON _edges_soft_ops(chunk_id);
+CREATE INDEX IF NOT EXISTS idx_soft_ops_path
+    ON _edges_soft_ops(file_path);
 """
 
 

@@ -156,10 +156,7 @@ ORDER BY sections DESC
 LIMIT 30;
 
 -- @query: presets
--- source labels cell-shipped (.flexpresets.json) vs stock presets; COALESCE covers
--- rows/cells written before the source column existed.
-SELECT name, description, params, COALESCE(source, 'stock') AS source
-FROM _presets ORDER BY source DESC, name;
+SELECT name, description, params FROM _presets ORDER BY name;
 
 -- @query: examples
 SELECT 'recent_overviews' AS use_case,

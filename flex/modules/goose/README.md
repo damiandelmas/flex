@@ -8,7 +8,7 @@ cell named `goose`.
 
 ```bash
 flex init --module goose
-flex core search --cell goose "@orient"
+flex search --cell goose "@orient"
 ```
 
 Use `--goose-db` to point at a copied database or fixture:
@@ -23,19 +23,14 @@ The public module surface is intentionally small:
 
 - `install.py` declares the module spec and calls the shared coding-agent
   install runner.
-- `refresh.py` polls the recorded Goose database path and resyncs only when the
-  source file grows.
+- `refresh.py` provides WAL-aware structural capture and drains semantic debt
+  independently.
 - `compile/worker.py` is the Goose-specific transpiler. It reads native Goose
   rows and writes `_raw_chunks`, `_raw_sources`, `_edges_source`,
   `_edges_tool_ops`, `_types_message`, `_types_file_body`, and related shared
   coding-agent tables.
 - `stock/instructions.md` explains the query surface that appears through
   `@orient` document mounts.
-
-The benchmark/source corpus directory `_corpus/` is not part of the public
-module. It contained private benchmark prompts, generated results, fixtures,
-and Goose-native parity adapter source. Those artifacts are excluded from this
-public-ready surface.
 
 ## Sidecar
 
@@ -56,8 +51,9 @@ thread metadata.
 
 ## Refresh
 
-The install path records `goose_db_path` and `goose_db_size` in `_meta`. Refresh
-opens that recorded database path, compares the current byte size with the last
-recorded size, and skips work when unchanged. This keeps the daemon path safe
-for local Goose stores and makes fixture/copy validation possible without
-mutating the live database.
+The install path records `goose_db_path`, `goose_source_signature`, and the
+compatibility `goose_db_size` receipt in `_meta`. Watch events on the database
+or its WAL publish text, metadata, FTS, and relations in one structural
+transaction. Embeddings remain nullable debt and converge through the separate
+semantic refresh lane. Periodic signature comparison remains the missed-event
+correctness floor.

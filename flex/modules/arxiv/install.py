@@ -103,5 +103,5 @@ def run(args, console) -> None:
     )
 
     console.print()
-    console.print("  Query: [bold]flex core search --cell %s \"@orient\"[/bold]" % cell)
+    console.print("  Query: [bold]flex search --cell %s \"@orient\"[/bold]" % cell)
     console.print("  Refresh: [bold]python -m flex.refresh --cells %s --dry-run[/bold]" % cell)

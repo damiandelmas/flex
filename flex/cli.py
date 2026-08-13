@@ -1,16 +1,17 @@
 #!/usr/bin/env python3
 """
-Flex CLI — flex init + flex core search.
+Flex CLI — flex init + flex search.
 
 pip install getflex
 flex init              # storage + model + MCP wiring
-flex core search --cell claude_code "query"    # raw terminal query
+flex search --cell claude_code "query"    # raw terminal query
 """
 
 import argparse
 import json
 import os
 import shutil
+import sqlite3
 import subprocess
 import sys
 import time
@@ -23,7 +24,7 @@ CLAUDE_JSON = Path.home() / ".claude.json"
 SYSTEMD_DIR = Path.home() / ".config" / "systemd" / "user"
 LAUNCHD_DIR = Path.home() / "Library" / "LaunchAgents"
 WORKER_DAEMON_ARGS = ["-m", "flex.daemon", "--no-refresh", "--no-background"]
-REFRESH_DAEMON_ARGS = ["-m", "flex.refresh"]
+REFRESH_DAEMON_ARGS = ["-m", "flex.refresh", "--due"]
 
 
 def _python_command(args: list[str]) -> str:
@@ -149,10 +150,7 @@ def _install_claude_assets(skill_names=None):
         "flex:hn": ("skills/flex-hn/", "skills/flex-hn/"),
         "flex:github": ("skills/flex-github/", "skills/flex-github/"),
         "flex:arxiv": ("skills/flex-arxiv/", "skills/flex-arxiv/"),
-        "flex:markdown": ("skills/flex-markdown/", "skills/flex-markdown/"),
-        "flex:filesystem": ("skills/flex-filesystem/", "skills/flex-filesystem/"),
-        "flex:codegraph": ("skills/flex-codegraph/", "skills/flex-codegraph/"),
-        "flex:tools": ("skills/flex-tools/", "skills/flex-tools/"),
+        "flex:ledger": ("skills/flex-ledger/", "skills/flex-ledger/"),
     }
 
     skill_mode = os.environ.get("FLEX_SKILL_MODE", "mcp").strip().lower()
@@ -329,6 +327,17 @@ def _install_systemd():
     return True
 
 
+def _launchd_domain() -> str:
+    """Return the per-login launchd domain used by Flex user agents."""
+    return f"gui/{os.getuid()}"
+
+
+def _command_error(result) -> str:
+    """Render a subprocess diagnostic regardless of capture text mode."""
+    value = getattr(result, "stderr", b"") or getattr(result, "stdout", b"")
+    return value.decode(errors="replace").strip() if isinstance(value, bytes) else str(value).strip()
+
+
 def _install_launchd():
     """Generate and install launchd user agents (macOS). Returns True if installed."""
     if sys.platform != "darwin":
@@ -408,6 +417,7 @@ def _install_launchd():
         <string>{python}</string>
         <string>-m</string>
         <string>flex.refresh</string>
+        <string>--due</string>
     </array>
     <key>StartInterval</key>
     <integer>1800</integer>
@@ -428,34 +438,52 @@ def _install_launchd():
 
     (FLEX_HOME / "logs").mkdir(parents=True, exist_ok=True)
 
-    uid = os.getuid()
+    domain = _launchd_domain()
+    installed = True
     for name, content in _LAUNCHD_PLISTS.items():
         plist_path = LAUNCHD_DIR / name
         label = name.replace(".plist", "")
         # Check if already loaded — skip bootstrap if so
-        probe = subprocess.run(
-            ["launchctl", "print", f"user/{uid}/{label}"],
-            capture_output=True, timeout=10,
-        )
+        try:
+            probe = subprocess.run(
+                ["launchctl", "print", f"{domain}/{label}"],
+                capture_output=True, timeout=10,
+            )
+        except (FileNotFoundError, subprocess.TimeoutExpired) as error:
+            print(f"  [warn] launchctl probe {name}: {error}", file=sys.stderr)
+            installed = False
+            continue
         already_loaded = probe.returncode == 0
         if already_loaded:
             # Update plist in place, kickstart to pick up changes
             plist_path.write_text(content)
             if label != "dev.getflex.refresh":
-                subprocess.run(
-                    ["launchctl", "kickstart", "-k", f"user/{uid}/{label}"],
-                    capture_output=True, timeout=10,
-                )
+                try:
+                    result = subprocess.run(
+                        ["launchctl", "kickstart", "-k", f"{domain}/{label}"],
+                        capture_output=True, timeout=10,
+                    )
+                    if result.returncode != 0:
+                        print(f"  [warn] launchctl kickstart {name}: {_command_error(result)}", file=sys.stderr)
+                        installed = False
+                except (FileNotFoundError, subprocess.TimeoutExpired) as error:
+                    print(f"  [warn] launchctl kickstart {name}: {error}", file=sys.stderr)
+                    installed = False
         else:
             plist_path.write_text(content)
-            result = subprocess.run(
-                ["launchctl", "bootstrap", f"user/{uid}", str(plist_path)],
-                capture_output=True, timeout=10,
-            )
-            if result.returncode != 0:
-                print(f"  [warn] launchctl bootstrap {name}: {result.stderr.decode().strip()}", file=sys.stderr)
+            try:
+                result = subprocess.run(
+                    ["launchctl", "bootstrap", domain, str(plist_path)],
+                    capture_output=True, timeout=10,
+                )
+                if result.returncode != 0:
+                    print(f"  [warn] launchctl bootstrap {name}: {_command_error(result)}", file=sys.stderr)
+                    installed = False
+            except (FileNotFoundError, subprocess.TimeoutExpired) as error:
+                print(f"  [warn] launchctl bootstrap {name}: {error}", file=sys.stderr)
+                installed = False
 
-    return True
+    return installed
 
 
 def _is_port_open(port: int) -> bool:
@@ -467,7 +495,7 @@ def _is_port_open(port: int) -> bool:
 
 
 def _is_worker_alive() -> bool:
-    """Check if worker daemon is running via PID file or process scan."""
+    """Check whether this Flex home's worker daemon is alive."""
     pid_file = FLEX_HOME / "worker.pid"
     if pid_file.exists():
         try:
@@ -480,9 +508,19 @@ def _is_worker_alive() -> bool:
     try:
         r = subprocess.run(
             ["pgrep", "-f", "flex.daemon"],
-            capture_output=True, timeout=5,
+            capture_output=True, text=True, timeout=5,
         )
-        return r.returncode == 0
+        if r.returncode != 0:
+            return False
+        try:
+            our_home = FLEX_HOME.resolve()
+        except (OSError, RuntimeError):
+            our_home = FLEX_HOME
+        return any(
+            _flex_home_of_pid(int(pid)) == our_home
+            for pid in r.stdout.split()
+            if pid.isdigit()
+        )
     except Exception:
         return False
 
@@ -651,6 +689,89 @@ def _kill_pid_services():
         time.sleep(0.5)
 
 
+def _managed_service_active(service: str) -> bool:
+    """Return whether Flex's named service is running under its manager."""
+    try:
+        if sys.platform == "linux":
+            return subprocess.run(
+                ["systemctl", "--user", "is-active", service],
+                capture_output=True, timeout=5,
+            ).returncode == 0
+        if sys.platform == "darwin":
+            label = {"flex-worker": "dev.getflex.worker", "flex-mcp": "dev.getflex.mcp"}[service]
+            return subprocess.run(
+                ["launchctl", "print", f"{_launchd_domain()}/{label}"],
+                capture_output=True, timeout=5,
+            ).returncode == 0
+    except (FileNotFoundError, subprocess.TimeoutExpired):
+        return False
+    return False
+
+
+def _quiesce_services_for_exclusive_work() -> dict:
+    """Stop all Flex service owners before an exclusive cell replacement.
+
+    Registry ``active`` remains a discovery/warmup declaration, never a lock.
+    The returned receipt records only services this call stopped, so restore is
+    exact and does not accidentally start an inactive service.
+    """
+    worker_live = _is_worker_alive()
+    mcp_live = _is_port_open(7134)
+    stopped: list[str] = []
+
+    for service in ("flex-worker", "flex-mcp"):
+        if not _managed_service_active(service):
+            continue
+        try:
+            if sys.platform == "linux":
+                command = ["systemctl", "--user", "stop", service]
+            else:
+                label = {"flex-worker": "dev.getflex.worker", "flex-mcp": "dev.getflex.mcp"}[service]
+                command = ["launchctl", "bootout", f"{_launchd_domain()}/{label}"]
+            result = subprocess.run(command, capture_output=True, timeout=20)
+            if result.returncode:
+                raise RuntimeError(_command_error(result) or "non-zero exit")
+            stopped.append(service)
+        except (FileNotFoundError, subprocess.TimeoutExpired, RuntimeError) as error:
+            _resume_services_after_exclusive_work({"stopped": stopped, "direct": False})
+            raise RuntimeError(f"could not pause {service}: {error}") from error
+
+    # After manager-owned units are down, reaping a direct/orphan process can
+    # no longer race a supervisor restart.
+    _kill_pid_services()
+    if _is_worker_alive() or _is_port_open(7134):
+        _resume_services_after_exclusive_work({"stopped": stopped, "direct": False})
+        raise RuntimeError("could not prove Flex worker and MCP are stopped")
+
+    return {
+        "stopped": stopped,
+        "direct": (worker_live and "flex-worker" not in stopped)
+        or (mcp_live and "flex-mcp" not in stopped),
+    }
+
+
+def _resume_services_after_exclusive_work(receipt: dict) -> None:
+    """Restore precisely the service state captured by quiescence."""
+    errors: list[str] = []
+    for service in receipt.get("stopped", []):
+        try:
+            if sys.platform == "linux":
+                command = ["systemctl", "--user", "start", service]
+            else:
+                label = {"flex-worker": "dev.getflex.worker", "flex-mcp": "dev.getflex.mcp"}[service]
+                command = ["launchctl", "bootstrap", _launchd_domain(), str(LAUNCHD_DIR / f"{label}.plist")]
+            result = subprocess.run(command, capture_output=True, timeout=20)
+            if result.returncode:
+                errors.append(f"{service}: {_command_error(result) or 'non-zero exit'}")
+        except (FileNotFoundError, subprocess.TimeoutExpired) as error:
+            errors.append(f"{service}: {error}")
+
+    if receipt.get("direct"):
+        _start_services_direct()
+    if errors:
+        raise RuntimeError("could not restore services: " + "; ".join(errors))
+
+
 def _patch_claude_json():
     """Add MCP server entry to ~/.claude.json.
 
@@ -692,7 +813,7 @@ def _run_enrichment_quiet(conn, progress_cb=None) -> tuple[int, list[str]]:
         from flex.modules.claude_code.manage.enrich_soma_repos import run as _register_soma_repos
         from flex.modules.claude_code.manage.enrich_repo_project import run as run_repo_project
         from flex.views import regenerate_views, install_views
-        from flex.manage.install_presets import install_cell as install_presets_cell
+        from flex.manage.install_presets import ensure_cell_presets
     except ImportError:
         return 0, []
 
@@ -718,20 +839,11 @@ def _run_enrichment_quiet(conn, progress_cb=None) -> tuple[int, list[str]]:
                 failures.append(step)
 
         if progress_cb:
-            progress_cb("presets")
+            progress_cb("query catalog")
         try:
-            # Use existing conn directly to avoid a second connection fighting for
-            # the write lock while conn is still open.
-            from flex.manage.install_presets import install_presets, _preset_dirs_for
-            for pd in _preset_dirs_for('claude-code'):
-                if pd.exists():
-                    install_presets(conn, pd)
-            conn.commit()
-            n_presets = conn.execute("SELECT COUNT(*) FROM _presets").fetchone()[0]
-            if n_presets == 0:
-                failures.append("presets (0 installed)")
+            ensure_cell_presets(conn, "claude-code")
         except Exception:
-            failures.append("presets")
+            failures.append("query catalog")
 
         if progress_cb:
             progress_cb("views")
@@ -849,9 +961,6 @@ def cmd_init(args):
     # 1. Storage
     FLEX_HOME.mkdir(parents=True, exist_ok=True)
     (FLEX_HOME / "cells").mkdir(exist_ok=True)
-    from flex.instructions import ensure_instructions_cell
-    ensure_instructions_cell()
-
     buf = io.StringIO()
     with contextlib.redirect_stdout(buf), contextlib.redirect_stderr(buf):
         try:
@@ -890,11 +999,11 @@ def cmd_init(args):
 
     # 3. Dispatch to module hook (or print base panel)
     if not _module:
-        _install_claude_assets(("flex",))
+        _install_claude_assets(("flex", "flex:ledger"))
         console.print()
         panel_content = Text()
         panel_content.append("Flex is ready.\n\n", style="cyan")
-        panel_content.append("  flex core search     ", style="bold")
+        panel_content.append("  flex search     ", style="bold")
         panel_content.append("raw terminal query\n", style="dim")
         panel_content.append("For Claude Code session search:\n", style="dim")
         panel_content.append("  curl -sSL https://getflex.dev/install.sh | bash -s -- claude-code\n", style="bold")
@@ -1163,7 +1272,7 @@ def cmd_hub_push(args):
 
     _, _, push_all = _push_api()
     if push_all is None:
-        print("  publishing requires the private flex.hub push submodule", file=sys.stderr)
+        print("  publishing support is not installed", file=sys.stderr)
         sys.exit(1)
 
     cell_names = list(getattr(args, "cells", None) or []) or None
@@ -1185,9 +1294,9 @@ def cmd_hub_status(args):
     from flex.hub import _push_api
     _, _, push_all = _push_api()
     if push_all is not None:
-        console.print("  Publish   [green]available[/green] (private push submodule present)")
+        console.print("  Publish   [green]available[/green] (publishing support installed)")
     else:
-        console.print("  Publish   [dim]unavailable[/dim] (private push submodule not installed)")
+        console.print("  Publish   [dim]unavailable[/dim] (publishing support not installed)")
 
 
 def cmd_hub_relay(args):
@@ -1351,8 +1460,16 @@ def _open_cell_for_search(cell_name: str, query: str | None = None):
     needs_vectors = 'vec_ops(' in (query or '')
     if query and query.lstrip().startswith('@'):
         preset_name = query.lstrip()[1:].split(None, 1)[0]
-        row = db.execute("SELECT sql FROM _presets WHERE name=?", (preset_name,)).fetchone()
-        needs_vectors = bool(row and 'vec_ops(' in (row[0] or ''))
+        try:
+            from flex.retrieve.presets import PresetLoader
+
+            preset = PresetLoader(db).load(preset_name)
+            needs_vectors = any(
+                'vec_ops(' in str(item.get('sql') or '').lower()
+                for item in preset.get('queries', [])
+            )
+        except (KeyError, ValueError, sqlite3.Error):
+            needs_vectors = False
 
     # Structural SQL/recovery must not pay to load a multi-gigabyte vector
     # matrix. Semantic queries still use the exact shared engine resolver.
@@ -1417,12 +1534,20 @@ def cmd_search(args):
     # Lazy import — avoids pulling in mcp deps at CLI startup
     from flex.mcp_server import execute_query
 
-    db = _open_cell_for_search(args.cell, args.query)
+    query = args.query
+    if query.startswith('!'):
+        query = query[1:].lstrip()
+    if args.cell == "ledger":
+        # Ledger is self-provisioning at its query boundary. Route both reads
+        # and mutations through that shared kernel so a raw shell query has the
+        # same first-use behavior as MCP and does not require an install verb.
+        from flex.mcp_server import _execute_cell_query
+        print(_execute_cell_query(args.cell, query))
+        return
+
+    db = _open_cell_for_search(args.cell, query)
     try:
-        query = args.query
-        if query.startswith('!'):
-            query = query[1:].lstrip()
-        result = execute_query(db, query)
+        result = execute_query(db, query, cell=args.cell)
         print(result)
     finally:
         db.close()
@@ -1523,12 +1648,11 @@ def cmd_sync(args):
     import time
 
     from flex.registry import list_cells, resolve_cell
+    from flex.manage.install_presets import ensure_cell_presets
     from flex.views import regenerate_views, install_views
-    from flex.manage.install_presets import install_cell as install_presets_cell
-    from flex.instructions import ensure_instructions_cell
 
     cells = list_cells()
-    if not cells and args.cell not in (None, "instructions"):
+    if not cells and args.cell is not None:
         print("No cells registered. Run 'flex init' first.")
         return
 
@@ -1537,23 +1661,22 @@ def cmd_sync(args):
     print("flex sync")
     print()
 
-    # ---- Phase 1: Presets ----
-    print("[1/5] Presets")
+    # ---- Phase 1: Database query catalogs ----
+    print("[1/5] Database query catalogs")
     for cell in cells:
         name = cell['name']
         if target and name != target:
             continue
+        db_path = resolve_cell(name)
+        if not db_path or not db_path.exists():
+            print(f"  {name}: SKIP (not found)")
+            continue
         try:
-            install_presets_cell(name)
-        except Exception as e:
-            print(f"  {name}: FAILED ({e})")
-    if target in (None, "instructions"):
-        try:
-            ensure_instructions_cell()
-            print("  instructions: ok")
-        except Exception as e:
-            print(f"  instructions: FAILED ({e})")
-
+            with sqlite3.connect(str(db_path), timeout=30) as conn:
+                changed = ensure_cell_presets(conn, cell.get("cell_type"))
+            print(f"  {name}: {'seeded' if changed else 'ok'}")
+        except sqlite3.Error as error:
+            print(f"  {name}: FAILED ({error})")
     # ---- Phase 2: Cell sync (stubs + curated views + auto views + FTS5) ----
     print()
     print("[2/5] Cell sync")
@@ -1711,7 +1834,9 @@ def cmd_sync(args):
     if args.full:
         print()
         print("[5/5] Enrichment rebuild (claude_code)")
+        receipt = None
         try:
+            receipt = _quiesce_services_for_exclusive_work()
             t0 = time.time()
             result = subprocess.run(
                 [sys.executable, "-m", "flex.modules.claude_code.manage.rebuild_all"],
@@ -1733,6 +1858,12 @@ def cmd_sync(args):
             print("  TIMEOUT (>600s)")
         except Exception as e:
             print(f"  ERROR: {e}")
+        finally:
+            if receipt is not None:
+                try:
+                    _resume_services_after_exclusive_work(receipt)
+                except RuntimeError as error:
+                    print(f"  ERROR: services were not restored: {error}")
 
     print()
     print("Sync complete.")
@@ -2173,26 +2304,40 @@ def cmd_reembed(args):
 
     dry_run = bool(getattr(args, 'dry_run', False))
     force = bool(getattr(args, 'force', False))
-    for name, path in targets:
-        if not dry_run:
-            print(f"{name}: migrating to nomic-v1.5-fp32 (live cell stays intact until verified swap)")
-        # Pass the registry name, not only its path, so the migration can
-        # freeze ingest and restore the cell's exact prior active state.
-        result = reembed_cell(name, dry_run=dry_run, force=force)
-        status = result.get('status')
-        if status == 'converted':
-            print(f"{name}: converted ({result['chunks']} chunks)  "
-                  f"backup={result['backup']}")
-        elif status == 'skipped':
-            print(f"{name}: skipped ({result['reason']})")
-        elif status == 'dry-run':
-            note = f"  — {result['note']}" if result.get('note') else ""
-            print(f"{name}: {result['pending']} pending / {result['chunks']} total chunks, "
-                  f"~{result['eta_seconds']}s ETA{note}")
-        else:
-            had_error = True
-            print(f"{name}: ERROR — {result.get('reason')}"
-                  + (f"  backup={result['backup']}" if result.get('backup') else ""))
+    receipt = None
+    if not dry_run:
+        try:
+            receipt = _quiesce_services_for_exclusive_work()
+        except RuntimeError as error:
+            print(f"ERROR — reembed did not start: {error}")
+            raise SystemExit(1) from error
+
+    try:
+        for name, path in targets:
+            if not dry_run:
+                print(f"{name}: migrating to nomic-v1.5-fp32 (services paused until verified swap)")
+            result = reembed_cell(name, dry_run=dry_run, force=force)
+            status = result.get('status')
+            if status == 'converted':
+                print(f"{name}: converted ({result['chunks']} chunks)  "
+                      f"backup={result['backup']}")
+            elif status == 'skipped':
+                print(f"{name}: skipped ({result['reason']})")
+            elif status == 'dry-run':
+                note = f"  — {result['note']}" if result.get('note') else ""
+                print(f"{name}: {result['pending']} pending / {result['chunks']} total chunks, "
+                      f"~{result['eta_seconds']}s ETA{note}")
+            else:
+                had_error = True
+                print(f"{name}: ERROR — {result.get('reason')}"
+                      + (f"  backup={result['backup']}" if result.get('backup') else ""))
+    finally:
+        if receipt is not None:
+            try:
+                _resume_services_after_exclusive_work(receipt)
+            except RuntimeError as error:
+                had_error = True
+                print(f"ERROR — reembed finished but services were not restored: {error}")
     if had_error:
         raise SystemExit(1)
 
@@ -2345,17 +2490,29 @@ def _gnu_flex_proxy():
             "GNU flex doesn't appear to be installed on this system.\n"
             "\n"
             "  Install GNU flex:  apt install flex  /  brew install flex\n"
-            "  Use getflex:       flex init  |  flex core search  |  flex sync",
+            "  Use getflex:       flex init  |  flex search  |  flex sync",
             file=sys.stderr,
         )
         sys.exit(1)
+
+
+def _rewrite_legacy_index_command(argv: list[str]) -> list[str]:
+    """Map the retired source-ingest spelling onto the compiler surface."""
+    if argv and argv[0] == "index":
+        print(
+            "`flex index PATH` is now `flex compile PATH`; "
+            "@index is reserved for navigational cell projections.",
+            file=sys.stderr,
+        )
+        return ["compile", *argv[1:]]
+    return argv
 
 
 def main():
     _gnu_flex_proxy()
     from flex.registry import load_plugins
     load_plugins()
-    # Register built-in SDK commands such as `flex index` before CLI parsing.
+    # Register built-in SDK commands such as `flex compile` before CLI parsing.
     import flex.sdk  # noqa: F401
     # Register cell-distribution hooks (daemon refresh, private publish-on-refresh)
     # backing `flex hub`.
@@ -2367,20 +2524,17 @@ def main():
     raw_argv = sys.argv[1:]
     if raw_argv and raw_argv[0] == "core":
         raw_argv = raw_argv[1:]
-    elif raw_argv and raw_argv[0] == "search":
-        print(
-            "Top-level search moved to `flex core search`.\n"
-            "Use MCP for agent retrieval, or `flex core search --cell <name> <query>` for raw CLI debugging.",
-            file=sys.stderr,
-        )
-        sys.exit(2)
     elif raw_argv and raw_argv[0] in {"context", "sessions", "memory"}:
         print(
             f"`flex {raw_argv[0]}` project commands are deprecated.\n"
-            "Use the Flex MCP tool for agent retrieval, or `flex core search --cell <name> <query>` for raw CLI debugging.",
+            "Use the Flex MCP tool for agent retrieval, or `flex search --cell <name> <query>` for raw CLI debugging.",
             file=sys.stderr,
         )
         sys.exit(2)
+
+    # `flex index PATH` predated the navigational @index contract. Keep old
+    # scripts working, but advertise only the precise compiler vocabulary.
+    raw_argv = _rewrite_legacy_index_command(raw_argv)
 
     parser = argparse.ArgumentParser(
         prog="flex",
@@ -2426,8 +2580,8 @@ def main():
             except Exception as _e:
                 print(f"[cli] register_args({_entry['folder']}) failed: {_e}", file=sys.stderr)
 
-    # legacy top-level search shim
-    search_p = sub.add_parser("search", help="Search your sessions")
+    # flex search — direct SQL/preset access to one registered cell
+    search_p = sub.add_parser("search", help="Query a registered Flex cell")
     search_p.add_argument("query", help="SQL query, @preset, or vec_ops expression")
     search_p.add_argument("--cell", default="claude_code", help="Cell to query (default: claude_code)")
     search_p.add_argument("--json", action="store_true", help="Output raw JSON")

@@ -11,6 +11,7 @@ import os
 import sqlite3
 import subprocess
 import sys
+import threading
 from pathlib import Path
 from typing import Optional
 
@@ -86,6 +87,7 @@ _FILE_IDENTITY = None
 _CONTENT_IDENTITY = None
 _REPO_IDENTITY = None
 _URL_IDENTITY = None
+_IDENTITIES = threading.local()
 AVAILABLE = False
 
 try:
@@ -93,10 +95,7 @@ try:
     from flex.modules.soma.lib.identity.content_identity import ContentIdentity
     from flex.modules.soma.lib.identity.repo_identity import RepoIdentity
     from flex.modules.soma.lib.identity.url_identity import URLIdentity
-    _FILE_IDENTITY = FileIdentity()
-    _CONTENT_IDENTITY = ContentIdentity()
     _REPO_IDENTITY = RepoIdentity()
-    _URL_IDENTITY = URLIdentity()
     AVAILABLE = True
 except ImportError:
     pass
@@ -115,6 +114,44 @@ def ensure_tables(conn: sqlite3.Connection):
 # ─────────────────────────────────────────────────────────────────────────────
 # Private helpers
 # ─────────────────────────────────────────────────────────────────────────────
+
+def _file_identity():
+    """Return this thread's FileIdentity connection owner.
+
+    SQLite's default thread affinity is intentional here: capture can enrich on
+    daemon worker threads, so sharing the import-time identity object would make
+    a later call use the wrong connection.  A thread-local owner also keeps the
+    identity subsystem's normal connection lifetime (the worker lifetime).
+    """
+    if not AVAILABLE:
+        return None
+    identity = getattr(_IDENTITIES, 'file', None)
+    if identity is None:
+        identity = FileIdentity()
+        _IDENTITIES.file = identity
+    return identity
+
+
+def _content_identity():
+    """Return this thread's ContentIdentity connection owner."""
+    if not AVAILABLE:
+        return None
+    identity = getattr(_IDENTITIES, 'content', None)
+    if identity is None:
+        identity = ContentIdentity()
+        _IDENTITIES.content = identity
+    return identity
+
+
+def _url_identity():
+    """Return this thread's URL identity owner (including its content DB)."""
+    if not AVAILABLE:
+        return None
+    identity = getattr(_IDENTITIES, 'url', None)
+    if identity is None:
+        identity = URLIdentity()
+        _IDENTITIES.url = identity
+    return identity
 
 def _is_git_tracked(file_path: str, repo: str) -> bool:
     """Check if a file is tracked by git (not just in a git repo)."""
@@ -192,19 +229,20 @@ def _get_git_info(file_path: str, cwd: str = "", tool: str = "") -> dict:
 def _get_content_hash(file_path: str, session: str = "", msg: int = 0,
                       blob_hash: str = "") -> Optional[str]:
     """Compute and store content hash (SHA-256) via ContentIdentity."""
-    if not file_path or not _CONTENT_IDENTITY:
+    if not file_path or not AVAILABLE:
         return None
     if not os.path.isfile(file_path):
         return None
 
     try:
+        identity = _content_identity()
         content = Path(file_path).read_bytes()
-        content_hash = _CONTENT_IDENTITY.store(content)
+        content_hash = identity.store(content)
 
         if session:
-            _CONTENT_IDENTITY.add_ref(content_hash, "episode", f"{session}:{msg}")
+            identity.add_ref(content_hash, "episode", f"{session}:{msg}")
         if blob_hash:
-            _CONTENT_IDENTITY.add_ref(content_hash, "blob", blob_hash)
+            identity.add_ref(content_hash, "blob", blob_hash)
 
         return content_hash
     except Exception as e:
@@ -252,9 +290,9 @@ def enrich(chunk: dict) -> dict:
             print(f"[soma] repo_identity failed for {file_path}: {e}", file=sys.stderr)
 
     # FileIdentity UUID (stable across renames/moves)
-    if file_path and _FILE_IDENTITY:
+    if file_path and AVAILABLE:
         try:
-            file_uuid = _FILE_IDENTITY.assign(file_path)
+            file_uuid = _file_identity().assign(file_path)
             if file_uuid:
                 chunk["file_uuid"] = file_uuid
         except Exception as e:
@@ -263,16 +301,17 @@ def enrich(chunk: dict) -> dict:
     # URL identity for WebFetch/WebSearch
     url = chunk.get("url", "")
     web_content = chunk.get("web_content", "")
-    if url and _URL_IDENTITY:
+    if url and AVAILABLE:
         try:
+            identity = _url_identity()
             is_search = tool == "WebSearch"
-            url_uuid = _URL_IDENTITY.assign(url, is_search=is_search)
+            url_uuid = identity.assign(url, is_search=is_search)
             if url_uuid:
                 chunk["url_uuid"] = url_uuid
 
                 # Store web content if present (WebFetch)
                 if web_content and tool == "WebFetch":
-                    content_hash = _URL_IDENTITY.record_fetch(
+                    content_hash = identity.record_fetch(
                         url_uuid,
                         content=web_content,
                         status_code=chunk.get("web_status", 200),
@@ -343,16 +382,16 @@ def insert_edges(conn: sqlite3.Connection, chunk: dict):
 
 def find_content_by_blob(blob_hash: str) -> Optional[str]:
     """Find content_hash from blob_hash."""
-    if not _CONTENT_IDENTITY or not blob_hash:
+    if not AVAILABLE or not blob_hash:
         return None
-    return _CONTENT_IDENTITY.find_by_ref("blob", blob_hash)
+    return _content_identity().find_by_ref("blob", blob_hash)
 
 
 def find_episodes_by_content(content_hash: str) -> list[str]:
     """Find all episode references for a content_hash."""
-    if not _CONTENT_IDENTITY or not content_hash:
+    if not AVAILABLE or not content_hash:
         return []
-    refs = _CONTENT_IDENTITY.get_refs(content_hash)
+    refs = _content_identity().get_refs(content_hash)
     return [ref_id for ref_type, ref_id in refs if ref_type == "episode"]
 
 
@@ -362,7 +401,7 @@ def find_episodes_by_content(content_hash: str) -> list[str]:
 
 def extract_tool_result_images(tools_used: str, session: str = "", msg: int = 0) -> tuple[str, list]:
     """Extract base64 images from tool_result content, store in content-store."""
-    if not tools_used or not _CONTENT_IDENTITY:
+    if not tools_used or not AVAILABLE:
         return tools_used, []
 
     try:
@@ -405,10 +444,11 @@ def extract_tool_result_images(tools_used: str, session: str = "", msg: int = 0)
                 continue
 
             try:
-                content_hash = _CONTENT_IDENTITY.store(image_bytes, mime_type=media_type)
+                identity = _content_identity()
+                content_hash = identity.store(image_bytes, mime_type=media_type)
 
                 if session:
-                    _CONTENT_IDENTITY.add_ref(content_hash, "image", f"{session}:{msg}")
+                    identity.add_ref(content_hash, "image", f"{session}:{msg}")
 
                 image_hashes.append({
                     "hash": content_hash,

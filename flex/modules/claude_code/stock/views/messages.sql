@@ -9,6 +9,7 @@
 -- file_body: actual file content for Write/Edit/Read/Bash chunks. NULL for non-file messages.
 --            For BM25 search across file bodies use @file-search preset (faster than LIKE).
 --            For inline inspection: WHERE file_body LIKE '%pattern%' AND tool_name IN ('Write', 'Edit')
+-- exclude_paths: _meta key (JSON array of LIKE patterns) filters target_file. Chunks with NULL target_file pass through.
 
 DROP VIEW IF EXISTS messages;
 CREATE VIEW messages AS
@@ -31,14 +32,47 @@ SELECT
     cr.agent_type,
     cr.file_uuids,
     (
+        -- One chunk may carry several bodies, labelled by _edges_raw_content.role:
+        --   input = tool call args (JSON) | output = the payload | status = *_end exit info
+        -- file_body is the OUTPUT. NULL means no output was captured (see tool_input).
         SELECT rc.content
         FROM _edges_raw_content erc
         JOIN _raw_content rc ON rc.hash = erc.content_hash
         WHERE erc.chunk_id = r.id
-        ORDER BY erc.content_hash
+          AND (
+                erc.role = 'output'
+             OR erc.role IS NULL
+             OR erc.role NOT IN ('input','status')
+          )
+        ORDER BY
+            CASE
+                WHEN erc.role = 'output' THEN 0
+                WHEN erc.role IS NULL THEN 1
+                WHEN erc.role NOT IN ('input','status','backup') THEN 2
+                WHEN erc.role = 'backup' THEN 3
+                ELSE 4
+            END,
+            erc.ordinal DESC,
+            erc.content_hash
         LIMIT 1
     ) AS file_body,
-    tp.branch_id
+    tp.branch_id,
+    (
+        SELECT rc.content
+        FROM _edges_raw_content erc
+        JOIN _raw_content rc ON rc.hash = erc.content_hash
+        WHERE erc.chunk_id = r.id AND erc.role = 'input'
+        ORDER BY erc.ordinal, erc.content_hash
+        LIMIT 1
+    ) AS tool_input,
+    (
+        SELECT rc.content
+        FROM _edges_raw_content erc
+        JOIN _raw_content rc ON rc.hash = erc.content_hash
+        WHERE erc.chunk_id = r.id AND erc.role = 'status'
+        ORDER BY erc.ordinal DESC, erc.content_hash
+        LIMIT 1
+    ) AS exit_status
 FROM _raw_chunks r
 LEFT JOIN _edges_source s ON r.id = s.chunk_id
 LEFT JOIN _raw_sources src ON s.source_id = src.source_id

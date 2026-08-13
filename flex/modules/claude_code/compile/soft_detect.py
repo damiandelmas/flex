@@ -298,6 +298,23 @@ def detect_file_ops(command: str, cwd: str = None) -> list[SoftFileOp]:
                 confidence="high"
             ))
 
+    # Pattern: sed -n SCRIPT file (read-only range/pattern print)
+    # sed -n '1,120p' README.md
+    # sed -n -e '/start/,/end/p' /repo/config.toml
+    # Keep this intentionally narrower than general sed parsing: -i belongs to
+    # the edit detector above, while scripts fed on stdin have no file target.
+    sed_read = re.findall(
+        r"\bsed\s+-n\s+(?:-e\s+)?(?:'[^']*'|\"[^\"]*\"|[^\s;&|]+)\s+([^\s|><&;]+)",
+        cmd,
+    )
+    for filepath in sed_read:
+        if not filepath.startswith("-"):
+            ops.append(SoftFileOp(
+                file_path=_resolve_path(filepath, cwd),
+                inferred_op="read",
+                confidence="high"
+            ))
+
     # Clean targets and drop tokens that are shell syntax rather than paths
     # (unexpanded $vars, brace expansion, globs, quotes, trailing punctuation).
     cleaned = []

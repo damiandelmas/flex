@@ -95,7 +95,9 @@ def backfill(conn, dry_run=False, limit=0):
 
                 if not dry_run:
                     cur.execute(
-                        "INSERT OR IGNORE INTO _raw_content VALUES (?,?,?,?,?)",
+                        "INSERT OR IGNORE INTO _raw_content "
+                        "(hash, content, tool_name, byte_length, first_seen) "
+                        "VALUES (?,?,?,?,?)",
                         (h, text, '_file_backup', len(text), ts)
                     )
 
@@ -104,7 +106,8 @@ def backfill(conn, dry_run=False, limit=0):
                     if key in pointer_map:
                         chunk_id, _filepath = pointer_map[key]
                         cur.execute(
-                            "INSERT OR IGNORE INTO _edges_raw_content VALUES (?,?)",
+                            "INSERT OR IGNORE INTO _edges_raw_content "
+                            "(chunk_id, content_hash, role) VALUES (?,?,'backup')",
                             (chunk_id, h)
                         )
                         linked += 1

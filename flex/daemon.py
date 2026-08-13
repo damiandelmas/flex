@@ -94,6 +94,56 @@ def _refresh_loop(interval: int = 60):
         time.sleep(interval)
 
 
+def _module_watch_loop(interval: float = 60):
+    """Run one Registry-owned local reconciliation pass per interval.
+
+    The coordinator is the only scheduling owner. Provider refresh modules are
+    still isolated by :func:`flex.refresh.refresh_cell` when materialization is
+    required; no second ``flex.refresh --watches`` CLI process is created.
+    """
+    print(f"[flex-daemon] Module reconciliation: {interval:g}s", file=sys.stderr)
+    while True:
+        try:
+            from flex.refresh import run_due_watches
+            run_due_watches()
+        except Exception as e:
+            print(f"[watch] Error: {e}", file=sys.stderr)
+        time.sleep(interval)
+
+
+def _codex_structural_tick_loop(interval: float = 2.0) -> None:
+    """Publish growth in known active Codex rollouts independently of corpus work.
+
+    Discovery and deletion truth remain in the ordinary watcher/reconciliation
+    lanes. This loop follows already-receipted provider addresses only, so a
+    large repository or Markdown walk cannot delay live conversation text,
+    metadata, relationships, and FTS.
+    """
+    from flex.lifecycle import coordinator
+    from flex.modules.codex.compile.worker import scan_codex_cells
+
+    while True:
+        started = time.time()
+        try:
+            stats = coordinator(lambda *_a, **_k: None).active_append_pass(
+                lambda names: scan_codex_cells(
+                    deadline=started + max(1.0, interval),
+                    embed=False,
+                    discover=False,
+                    cell_names=names,
+                )
+            ) or {}
+            if stats.get("indexed", 0):
+                print(
+                    f"[flex-daemon] codex structural indexed={stats['indexed']}",
+                    file=sys.stderr,
+                )
+        except Exception as exc:
+            print(f"[flex-daemon] Codex structural tick error: {exc}", file=sys.stderr)
+        elapsed = time.time() - started
+        time.sleep(max(0.1, interval - elapsed))
+
+
 def _build_claude_watcher():
     """Phase 1 composition: build the Claude Code filesystem observer.
 
@@ -181,10 +231,14 @@ def _build_local_watchers():
         max_size=config.queue_max,
     )
     watchers = WatcherSet(registrations, queue)
-    watchers.start()
+    # Recursive observer setup can take minutes across a large registry. Event
+    # callbacks may begin filling the shared queue as individual roots come
+    # online, while the worker immediately starts structural reconciliation and
+    # capture instead of waiting for the whole watch topology.
+    watchers.start_background()
     print(
-        f"[flex-daemon] Filesystem events enabled for {len(registrations)} roots "
-        f"(backend={watchers.backend or 'degraded'})",
+        f"[flex-daemon] Filesystem event initialization started for "
+        f"{len(registrations)} roots",
         file=sys.stderr,
     )
     return queue, watchers, config
@@ -260,6 +314,27 @@ def main():
             daemon=True,
         )
         t.start()
+
+    # Watch reconciliation is distinct from lifecycle='refresh' pulls.  Keep
+    # it alive for the installed ``--no-refresh`` local worker, but make its
+    # thread a subprocess-only supervisor so it never imports refresh modules.
+    from flex.watch import load_watch_config
+    _watch_config = load_watch_config()
+    t = threading.Thread(
+        target=_module_watch_loop,
+        kwargs={"interval": _watch_config.reconcile_interval},
+        daemon=True,
+    )
+    t.start()
+
+    # Structural coding-session capture is independent of general corpus and
+    # semantic scheduling. It opens its own provider connections each tick.
+    t = threading.Thread(
+        target=_codex_structural_tick_loop,
+        name="codex-structural-tick",
+        daemon=True,
+    )
+    t.start()
 
     # Typed local observers are built before the worker loop and stopped on
     # every exit path, including signal-driven shutdown.

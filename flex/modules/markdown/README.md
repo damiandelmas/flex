@@ -16,13 +16,13 @@ flex init --module obsidian --vault /path/to/vault --name my_vault
 For a plain Markdown folder:
 
 ```bash
-flex index /path/to/notes --name my_notes
+flex compile /path/to/notes --name my_notes
 ```
 
 After setup, orient the cell:
 
 ```bash
-flex core search --cell my_vault "@orient"
+flex search --cell my_vault "@orient"
 ```
 
 The init path also registers the cell with `lifecycle='watch'` and the vault
@@ -47,7 +47,7 @@ forms are cleaned only for embedding input.
 Start with:
 
 ```bash
-flex core search --cell my_vault "@orient"
+flex search --cell my_vault "@orient"
 ```
 
 Primary views:

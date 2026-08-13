@@ -58,6 +58,8 @@ def reconcile_cell(conn: sqlite3.Connection, root: Path, *, embed_fn=None,
     ensure_schema(conn)
     conn.commit()
     root = Path(root).expanduser().resolve()
+    if (root / ".publishing").exists():
+        return _empty_stats()
     cache = process_cache if process_cache is not None else {}
     use_obsidian = _bool_meta(conn, "obsidian") if obsidian is None else obsidian
     entries = [
@@ -138,6 +140,20 @@ def drain_paths(conn: sqlite3.Connection, root: Path, paths, *, embed_fn=None,
     ensure_schema(conn)
     conn.commit()
     root = Path(root).expanduser().resolve()
+    marker = root / ".publishing"
+    paths = list(paths)
+    if marker.exists():
+        stats = _empty_stats()
+        stats["skipped"] = len(paths)
+        return stats
+    if any(Path(path).name == marker.name for path in paths):
+        # Marker removal is the commit event for a generated source snapshot.
+        # Reconcile the complete tree in one SQLite transaction rather than
+        # publishing a sequence of per-page watcher states.
+        return reconcile_cell(
+            conn, root, embed_fn=embed_fn, obsidian=obsidian,
+            exclude=exclude, file_kinds=file_kinds,
+        )
     use_obsidian = _bool_meta(conn, "obsidian") if obsidian is None else obsidian
     stats = {"indexed": 0, "empty": 0, "unchanged": 0, "skipped": 0, "deleted": 0}
     failures = []
@@ -292,7 +308,29 @@ def daemon_loop(interval: float = 2, *, invalidation_queue=None, watcher=None,
             try:
                 ready = invalidation_queue.drain_ready(time.monotonic())
                 if ready:
-                    drain_filesystem_invalidations(ready)
+                    from flex.registry import list_cells
+                    code_names = {
+                        c['name'] for c in list_cells()
+                        if c.get('cell_type') == 'code' and c.get('active', 1)
+                    }
+                    code_events = [i for i in ready if i.cell_name in code_names]
+                    fs_events = [i for i in ready if i.cell_name not in code_names]
+                    if fs_events:
+                        drain_filesystem_invalidations(fs_events)
+                    if code_events:
+                        try:
+                            from flex.modules.engines import drain_corpus_paths
+                        except ImportError:
+                            # The filesystem worker can run without the optional
+                            # aggregate integration. Reconciliation below
+                            # remains the correctness floor for those cells.
+                            invalidation_queue.mark_reconciliation_required(
+                                {item.cell_name for item in code_events}
+                            )
+                        else:
+                            event_stats = drain_corpus_paths(code_events)
+                            for invalidation in event_stats.get('deferred') or ():
+                                invalidation_queue.put(invalidation)
             except Exception as exc:
                 print(f"[filesystem-worker] event drain: {exc}", file=sys.stderr)
         due = (
@@ -302,11 +340,20 @@ def daemon_loop(interval: float = 2, *, invalidation_queue=None, watcher=None,
             or (watcher is not None and not watcher.healthy)
         )
         if due:
+            reconciled = True
             try:
                 scan_filesystem_cells()
+            except Exception as exc:
+                reconciled = False
+                print(f"[filesystem-worker] filesystem reconcile: {exc}", file=sys.stderr)
+            try:
+                from flex.modules.fs.compile.index_code import scan_code_cells
+                scan_code_cells({})
+            except Exception as exc:
+                reconciled = False
+                print(f"[filesystem-worker] code reconcile: {exc}", file=sys.stderr)
+            if reconciled:
                 last_reconcile = time.monotonic()
                 if invalidation_queue is not None:
                     invalidation_queue.clear_reconciliation_required()
-            except Exception as exc:
-                print(f"[filesystem-worker] reconcile: {exc}", file=sys.stderr)
         time.sleep(interval)

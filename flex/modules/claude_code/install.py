@@ -81,12 +81,12 @@ def run(args, console) -> None:
         _stub_conn.commit()
         try:
             from flex.views import install_views as _siv, regenerate_views as _srv
-            from flex.manage.install_presets import install_cell as _sip
+            from flex.manage.install_presets import ensure_cell_presets as _validate_presets
             for _svd in _find_view_dirs('claude_code', 'claude-code'):
                 _siv(_stub_conn, _svd)
             _srv(_stub_conn)
             _stub_conn.commit()
-            _sip('claude_code')
+            _validate_presets(_stub_conn, 'claude-code')
         except Exception:
             pass
     finally:
@@ -117,15 +117,15 @@ def run(args, console) -> None:
 
             try:
                 from flex.views import install_views as _iv, regenerate_views as _rv
-                from flex.manage.install_presets import install_cell as _install_presets_cell
+                from flex.manage.install_presets import ensure_cell_presets as _validate_presets
                 for _vd in _find_view_dirs('claude_code', 'claude-code'):
                     _iv(conn, _vd)
                 _rv(conn)
-                _install_presets_cell('claude_code')
+                _validate_presets(conn, 'claude-code')
                 conn.commit()
             except Exception as e:
-                print(f"[init] Views/presets install failed: {e}", file=sys.stderr)
-                _warnings.append(f"Views/presets: {e}")
+                print(f"[init] Views/preset contract failed: {e}", file=sys.stderr)
+                _warnings.append(f"Views/preset contract: {e}")
 
             _already = conn.execute("SELECT COUNT(*) FROM _raw_sources").fetchone()[0]
             if _already > 0:
@@ -260,14 +260,26 @@ def run(args, console) -> None:
 
     # 5. Services
     if sys.platform != "win32":
-        _install_systemd() or _install_launchd()
+        managed = _install_systemd() or _install_launchd()
         time.sleep(1)
         worker_ok, mcp_ok = _verify_services()
+        used_fallback = False
         if not worker_ok or not mcp_ok:
             _start_services_direct()
+            used_fallback = True
             time.sleep(1)
             worker_ok, mcp_ok = _verify_services()
         _status = lambda ok: "[green]running[/green]" if ok else "[red]failed[/red]"
+        if used_fallback and not managed and (worker_ok or mcp_ok):
+            _warnings.append(
+                "Service manager installation failed; using unmanaged processes "
+                "that will not survive logout or reboot"
+            )
+            _status = lambda ok: (
+                "[yellow]running (unmanaged)[/yellow]" if ok else "[red]failed[/red]"
+            )
+        elif not managed:
+            _warnings.append("Service manager registration could not be verified")
         console.print(f"  worker             {_status(worker_ok)}")
         console.print(f"  MCP                {_status(mcp_ok)}")
 

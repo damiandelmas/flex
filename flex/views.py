@@ -47,11 +47,17 @@ def regenerate_views(db: sqlite3.Connection, views: dict = None):
             branch_at TEXT,
             relation TEXT NOT NULL,
             depth INTEGER DEFAULT 0,
+            position INTEGER,
             PRIMARY KEY (id, parent_id)
         );
         CREATE INDEX IF NOT EXISTS idx_tree_parent ON _edges_tree(parent_id);
         CREATE INDEX IF NOT EXISTS idx_tree_relation ON _edges_tree(relation);
     """)
+    tree_columns = {
+        row[1] for row in db.execute("PRAGMA table_info(_edges_tree)")
+    }
+    if "position" not in tree_columns:
+        db.execute("ALTER TABLE _edges_tree ADD COLUMN position INTEGER")
 
     all_tables = (
         _discover_tables(db, '_edges_%') +
@@ -102,6 +108,11 @@ def _detect_existing_views(db: sqlite3.Connection) -> dict:
         "SELECT name, sql FROM sqlite_master WHERE type='view'"
     ).fetchall()
     for name, sql in rows:
+        # Internal compatibility and contract views are not provider
+        # projections. In particular, rebuilding canonical `_meta` as a
+        # chunk view destroys the writable alias over `_metadata`.
+        if name.startswith("_"):
+            continue
         if sql and 'FROM _raw_sources' in sql and 'FROM _raw_chunks' not in sql:
             views[name] = 'source'
         else:
@@ -659,7 +670,13 @@ def _ensure_chunk_rollup_fresh(db: sqlite3.Connection) -> None:
     db.commit()
 
 
-def install_views(db: sqlite3.Connection, view_dir: Path):
+def install_views(
+    db: sqlite3.Connection,
+    view_dir: Path,
+    *,
+    prepare_provider_state: bool = True,
+    record_operation: bool = True,
+):
     """Read .sql files, execute CREATE VIEW, write metadata to _views."""
     db.execute("""CREATE TABLE IF NOT EXISTS _views (
         name TEXT PRIMARY KEY,
@@ -672,19 +689,21 @@ def install_views(db: sqlite3.Connection, view_dir: Path):
     # so there is no window where a freshly (re)installed chunks/messages
     # view reads an empty rollup and silently returns NULL for the whole
     # historical backlog.
-    try:
-        _ensure_chunk_rollup_fresh(db)
-    except sqlite3.OperationalError:
-        pass
+    if prepare_provider_state:
+        try:
+            _ensure_chunk_rollup_fresh(db)
+        except sqlite3.OperationalError:
+            pass
 
     # Same self-heal, for the social-module `_enrich_chunk_type` rollup
     # (see flex.manage.chunk_type) — no-op on cells without a supported
     # social-module type sidecar.
-    try:
-        from flex.manage.chunk_type import ensure_chunk_type_fresh
-        ensure_chunk_type_fresh(db)
-    except sqlite3.OperationalError:
-        pass
+    if prepare_provider_state:
+        try:
+            from flex.manage.chunk_type import ensure_chunk_type_fresh
+            ensure_chunk_type_fresh(db)
+        except sqlite3.OperationalError:
+            pass
 
     installed = []
     for sql_file in sorted(view_dir.glob('*.sql')):
@@ -700,7 +719,7 @@ def install_views(db: sqlite3.Connection, view_dir: Path):
 
     db.commit()
 
-    if installed:
+    if installed and record_operation:
         from flex.core import log_op
         log_op(db, 'install_views', '_views',
                params={'views': installed, 'source_dir': str(view_dir)},

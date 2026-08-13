@@ -4,7 +4,118 @@ Public changes to **flex** ([getflex.dev](https://getflex.dev)).
 
 ---
 
-## 0.53.0 — Unreleased
+## 0.54.0 — Unreleased
+
+This release makes local flex cells more durable under interruption, gives them
+a continuity layer, and closes the public package around one universal query
+surface. It is a substantial reliability and recovery release, not a new
+hosted-service dependency: cells and their evidence remain local SQLite files.
+
+### Reliable local operation
+
+- Background capture, reconciliation, and enrichment now run within explicit
+  time budgets and report their work honestly, so long-running maintenance does
+  not monopolize the local worker.
+- Refresh has explicit admission and committed freshness receipts. A worker can
+  distinguish queued work from a completed publication, preserve pending work
+  across interruption, and retry a failed filesystem reconciliation immediately
+  rather than waiting for the next full cadence.
+- Fresh and legacy vector cells establish the correct Nomic embedding contract
+  before ingestion. Full sync and re-embedding quiesce local services first,
+  then restore them after the exclusive operation completes.
+- Filesystem identity remains portable when extended attributes are unavailable,
+  and watcher/event failures fall back to reconciliation rather than silently
+  claiming the cell is current.
+- Lifecycle, registry, health, and refresh reporting now surface worker state,
+  committed generations, source high-water marks, and reconciliation needs as
+  separate facts.
+
+### Evidence and continuity
+
+- Claude Code and Codex recovery retain repository/path occurrence evidence,
+  recover full message bodies more reliably, and preserve useful partial
+  captures rather than discarding the surrounding session.
+- New recovery views and presets support exact session, message, observed-file,
+  file-provenance, and path-history investigation without requiring a vector
+  scan to answer a structural question.
+- Large query results are windowed locally and can be continued without
+  re-running the original SQL, keeping MCP responses bounded while preserving
+  the complete result set.
+
+#### flex Ledger: continuity over evidence
+
+**flex Ledger is a new local, SQL-native continuity layer for agents that need
+to resume real work, not merely retrieve a recollection.** It creates its own
+SQLite cell on first use and attaches durable annotations to exact objects in
+any other flex cell—sessions, messages, source files, or other addressable
+evidence—without rewriting a target cell's canonical content or schema.
+
+- **An agent chooses what becomes memory.** It can inspect its own current
+  session structurally, open the provider's ordered message index, distinguish
+  complete messages from deliberately compact stubs, and annotate the exact
+  turn that contains a decision, discovery, correction, or unresolved boundary.
+  The annotation is an authored landmark; the provider-native message remains
+  the evidence.
+- **Every landmark remains provable and revisable.** Annotation identity is
+  derived from its exact target, with explicit runtime provenance, full-text
+  retrieval, and transactional revision history. An interpretation can evolve
+  without losing earlier wording, source order, or the link back to the object
+  that prompted it.
+- **Compaction has a recovery path.** After a context reset, `@hydrate`
+  reconstructs the selected lineage with the current exact message bodies in
+  provider-native order. It follows bounded result pages to completion, rather
+  than replacing the lost context with an opaque generated summary.
+- **Continuity is navigable, not just searchable.** `@index` materializes a
+  local map of selected landmarks, revisions, relationships, and neighboring
+  objects. `self()` binds the work to the calling runtime's exact session and
+  can expand it into a selected world of related objects across registered
+  cells. The result stays relational and SQL-composable: annotations,
+  provenance, target objects, and relationships remain visible.
+- **Ledger writes only its own layer.** Other cells remain read-only. Ledger's
+  declared `annotations` relation accepts direct SQL insert, update, and delete
+  operations while preserving its history and leaving attached cells untouched.
+
+Ledger's local-first spatial vocabulary—wings, halls, and rooms—is inspired by
+[MemPalace](https://github.com/MemPalace/mempalace). The crucial difference is
+that Ledger is not a separate semantic memory store over conversation text: it
+is an independent, evidence-native system that lets agents intentionally mark,
+inspect, and rehydrate exact objects from the live flex world.
+
+### One universal flex interface
+
+- MCP now advertises one universal query tool, `flex(cell, query)`. Existing
+  `flex_search` calls remain accepted for installed clients during migration,
+  but new clients and packaged skills use `flex`.
+- Cell orientation, saved SQL, keyword retrieval, semantic retrieval, and
+  exact source recovery remain cell-defined capabilities behind that one
+  interface—MCP is transport, not a separate topology for every module.
+- Optional remote relay control is clearly separated from the query interface;
+  it is an operational capability, not another retrieval surface.
+
+### Filesystem and module operation
+
+- The generic filesystem compiler has a public worker fallback for event
+  invalidation and reconciliation when richer optional lifecycle integrations
+  are not installed.
+- Public source modules share safer refresh behavior and more complete
+  orientation/freshness contracts, including coding-agent, document, and
+  external-source cells.
+- `flex init --module filesystem --no-mcp` creates a generic filesystem cell
+  without modifying Claude MCP configuration or installing Claude skills.
+
+### Public distribution and installation
+
+- The installer verifies a required SHA-256 sidecar with Python on both macOS
+  and Linux, instead of relying on Linux-only `sha256sum`.
+- Installer help now covers Codex and filesystem use, accurately describes
+  uninstall data retention, and documents current macOS/Linux support. Native
+  Windows support is not claimed yet.
+- Public package data includes the shipped Claude banner asset, and the PyPI
+  README uses the public repository image URL.
+
+---
+
+## 0.53.0 — July 14, 2026
 
 ### Unified filesystem compiler
 
@@ -38,7 +149,7 @@ and query surfaces that expose ambiguity or unavailability instead of guessing.
   artifact and tokenizer from a revision-pinned upstream URL, verifies both by
   SHA-256, and installs them atomically. Existing pre-0.52 cells remain pinned
   to their retained legacy model until `flex reembed` safely migrates them by
-  copy, verification, and atomic swap; Flex never silently interprets stored
+  copy, verification, and atomic swap; flex never silently interprets stored
   vectors as a different space.
 - **Production-scale coding-agent recovery** — Claude Code and Codex gain an
   indexed observation projection for `@full`, observed-file, path-history, and
@@ -235,7 +346,7 @@ flex became installable from PyPI as `getflex`, published through GitHub Actions
 
 ### Changes
 
-#### Flex SDK
+#### flex SDK
 
 Introduced the SDK for building a cell from any source without writing view SQL or importing module internals. `index()` indexes a text list or folder in one line; the structured path — `create`, `source`, `ingest`, `link`, `embed`, `graph`, `register` — adds typed metadata, tree edges, and graph intelligence. `create()` reuses an existing cell path instead of orphaning databases, and `register()` carries lifecycle and refresh controls (`static` / `refresh` / `watch`).
 

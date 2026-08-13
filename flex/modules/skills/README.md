@@ -25,7 +25,7 @@ filling the cell:
 
 ```bash
 python -m flex.modules.skills.compile.refresh --cell tools
-flex core search --cell tools "@orient"
+flex search --cell tools "@orient"
 ```
 
 ### GitHub funnel

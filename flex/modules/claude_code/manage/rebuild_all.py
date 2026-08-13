@@ -93,21 +93,64 @@ def reembed_sources(db):
 
     # Null out any chunk embeddings with wrong dimension (e.g. legacy 384d MiniLM).
     # The worker re-embeds NULL chunks at the configured dim on its next cycle.
-    # length(embedding) / 4 = dims (float32). Read the expected dim from _meta,
-    # falling back to STORE_DIM if the cell predates that key.
-    try:
-        target_dim = int(get_meta(db, 'embedding_dim') or STORE_DIM)
-    except (TypeError, ValueError):
-        target_dim = STORE_DIM
-    target_bytes = target_dim * 4
-    nulled = db.execute("""
-        UPDATE _raw_chunks SET embedding = NULL
-        WHERE embedding IS NOT NULL AND length(embedding) != ?
-    """, (target_bytes,)).rowcount
-    if nulled:
-        db.commit()
-        print(f"  Nulled {nulled} chunks with wrong embedding dimension (will re-embed at {target_dim}d)")
+    #
+    # THIS DELETED 944,612 EMBEDDINGS ON 2026-07-16. The cell had no
+    # 'embedding_dim' key, so `or STORE_DIM` fell back to the module constant
+    # (128 → 512 bytes) while every stored vector was 3072 bytes (768d fp32).
+    # "Null the wrong-dimension rows" then matched EVERY row in the cell.
+    #
+    # Worse, it could not converge: the tick's sweep re-embedded at 768d, the next
+    # cycle nulled them again for not being 512, forever — an embed→wipe loop that
+    # burned the tick and looked like "the backlog never drains".
+    #
+    # Two rules now, both from the same principle — a destructive migration that
+    # cannot establish its target must do NOTHING, not guess:
+    #   1. No 'embedding_dim' in _meta → skip. A module constant is not evidence
+    #      about what THIS cell stores. ("Never infer vector space from width",
+    #      260714-0153 — and never infer the width itself from a global default.)
+    #   2. If the cleanup would wipe most of the column, refuse and say so. A
+    #      legacy-dim cleanup is meant to catch a residue; matching ~everything
+    #      means the premise is wrong, not that the cell is entirely legacy.
+    _dim_meta = get_meta(db, 'embedding_dim')
+    if not _dim_meta:
+        print("  Skipping legacy-dim cleanup: _meta.embedding_dim is unset, so the "
+              "target width is unknown. Refusing to guess (a STORE_DIM fallback "
+              "here nulled 944,612 live vectors on 2026-07-16).")
         sys.stdout.flush()
+    else:
+        try:
+            target_dim = int(_dim_meta)
+        except (TypeError, ValueError):
+            target_dim = None
+        if target_dim:
+            target_bytes = target_dim * 4
+            _wrong = db.execute(
+                "SELECT COUNT(*) FROM _raw_chunks "
+                "WHERE embedding IS NOT NULL AND length(embedding) != ?",
+                (target_bytes,)).fetchone()[0]
+            _have = db.execute(
+                "SELECT COUNT(*) FROM _raw_chunks WHERE embedding IS NOT NULL"
+            ).fetchone()[0]
+            if _have and _wrong > _have * 0.5:
+                print(f"  REFUSING legacy-dim cleanup: it would null {_wrong} of "
+                      f"{_have} embeddings ({100.0 * _wrong / _have:.0f}%). A "
+                      f"cleanup that matches most of the column means "
+                      f"embedding_dim={target_dim} disagrees with what this cell "
+                      f"actually stores — fix the metadata, do not wipe the data.")
+                sys.stdout.flush()
+            else:
+                nulled = db.execute("""
+                    UPDATE _raw_chunks SET embedding = NULL
+                    WHERE embedding IS NOT NULL AND length(embedding) != ?
+                """, (target_bytes,)).rowcount
+                # Commit unconditionally: this UPDATE is a full scan that takes the
+                # write lock whether or not it matches a row, so committing only
+                # `if nulled` left the lock open through everything below.
+                db.commit()
+                if nulled:
+                    print(f"  Nulled {nulled} chunks with wrong embedding dimension "
+                          f"(will re-embed at {target_dim}d)")
+                    sys.stdout.flush()
 
     # Compute corpus centroid from existing source embeddings.
     # Used to down-weight chunks that are close to the corpus mean (boilerplate).
@@ -127,6 +170,25 @@ def reembed_sources(db):
     sources = db.execute("SELECT source_id FROM _raw_sources").fetchall()
     updated = 0
     skipped = 0
+    # Hold the write lock for the WRITES, not for the reads and numpy between them.
+    # One transaction across the whole pooling loop held it ~13s (measured against a
+    # consistent snapshot with a concurrent writer); enrichment shares the daemon's
+    # single connection today, so nothing contended and nothing complained.
+    #
+    # Source embeddings are enrichment — recomputed every cycle — so a partial flush
+    # is not a torn write, just a mix of this cycle's and last cycle's vectors, which
+    # is already true between any two cycles.
+    _pending: list = []
+    _FLUSH_EVERY = 256
+
+    def _flush():
+        nonlocal _pending
+        if not _pending:
+            return
+        db.executemany(
+            "UPDATE _raw_sources SET embedding = ? WHERE source_id = ?", _pending)
+        db.commit()
+        _pending = []
 
     for (source_id,) in sources:
         rows = db.execute("""
@@ -160,11 +222,12 @@ def reembed_sources(db):
         if norm > 0:
             new_emb = new_emb / norm
 
-        db.execute("UPDATE _raw_sources SET embedding = ? WHERE source_id = ?",
-                   (new_emb.tobytes(), source_id))
+        _pending.append((new_emb.tobytes(), source_id))
         updated += 1
+        if len(_pending) >= _FLUSH_EVERY:
+            _flush()
 
-    db.commit()
+    _flush()
     elapsed = time.time() - t0
     print(f"  Re-embedded {updated} sources ({skipped} skipped, no prompt/response chunks)")
     print(f"  Done in {elapsed:.1f}s\n")
@@ -594,12 +657,11 @@ def main():
     rebuild_repo_project(db)
     rebuild_community_labels(db)
 
-    # Install curated views + presets before regenerating auto-generated views.
-    # Ensures schema changes in .sql source files are always applied — whether
-    # this script is run directly or via `flex sync --full`.
+    # Install curated views and seed any missing database-backed query programs
+    # before regenerating auto-generated views.
     from pathlib import Path
     from flex.views import install_views
-    from flex.manage.install_presets import install_cell as install_presets_cell
+    from flex.manage.install_presets import ensure_cell_presets
 
     # User library takes precedence; stock library ships with module
     view_dir = Path.home() / '.flex' / 'views' / 'claude_code'
@@ -609,8 +671,8 @@ def main():
         print("Installing curated views...")
         install_views(db, view_dir)
 
-    print("Installing presets...")
-    install_presets_cell('claude_code')
+    print("Checking query catalog...")
+    ensure_cell_presets(db, 'claude-code')
 
     print("Regenerating auto-generated views...")
     regenerate_views(db, views={'messages': 'chunk', 'sessions': 'source'})

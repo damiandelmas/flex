@@ -430,18 +430,11 @@ def build_cell(
     from flex.views import regenerate_views
     regenerate_views(db)
 
-    # Presets
-    from flex.retrieve.presets import install_presets
-    preset_dir = Path(__file__).resolve().parent.parent.parent.parent / "retrieve" / "presets" / "general"
-    if preset_dir.exists():
-        install_presets(db, preset_dir)
-    platform_preset_dir = Path(__file__).parent.parent / "stock" / "presets"
-    if platform_preset_dir.exists():
-        install_presets(db, platform_preset_dir)
-
     # Metadata
     cell_desc = description or DEFAULT_DESCRIPTION
     set_meta(db, "cell_type", "arxiv")
+    from flex.manage.install_presets import ensure_cell_presets
+    ensure_cell_presets(db, "arxiv")
     set_meta(db, "description", cell_desc)
     set_meta(db, "created_at", datetime.now(timezone.utc).isoformat())
     set_meta(db, "retrieval:primary_view", "papers")

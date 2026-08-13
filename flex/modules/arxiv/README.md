@@ -61,6 +61,6 @@ python -m flex.refresh --cells arxiv --dry-run
 Start with:
 
 ```bash
-flex core search --cell arxiv "@orient"
-flex core search --cell arxiv "@landscape"
+flex search --cell arxiv "@orient"
+flex search --cell arxiv "@landscape"
 ```

@@ -634,8 +634,11 @@ def heal_file_refs():
 
     def _get_xattr(self, path: str) -> Optional[str]:
         """Read UUID from file's extended attributes."""
+        getxattr = getattr(os, "getxattr", None)
+        if getxattr is None:
+            return None
         try:
-            return os.getxattr(path, XATTR_NAME).decode()
+            return getxattr(path, XATTR_NAME).decode()
         except (OSError, FileNotFoundError):
             return None
 
@@ -647,8 +650,11 @@ def heal_file_refs():
         filesystem xattr and takes NO DB write lock — use on hot read paths
         (assign_batch DB-hits) so lookups never contend for the shared DB.
         """
+        setxattr = getattr(os, "setxattr", None)
+        if setxattr is None:
+            return False
         try:
-            os.setxattr(path, XATTR_NAME, file_uuid.encode())
+            setxattr(path, XATTR_NAME, file_uuid.encode())
             if record:
                 self.db.execute(
                     "UPDATE files SET xattr_verified = ? WHERE uuid = ?",

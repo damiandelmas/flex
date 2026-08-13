@@ -29,6 +29,8 @@ MODULE = {
     "source_meta_key": "codex_source_path",
     "refresh_module": "flex.modules.codex.refresh",
     "watch_pattern": "**/rollout-*.jsonl",
+    "detector": "active_append",
+    "detector_config": '{"interval_seconds":2,"reconcile":"bounded"}',
     "substrate": "claude_code",
     "soma_level": "L3",
     "views_from": ("claude_code",),

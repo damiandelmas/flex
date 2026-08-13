@@ -53,6 +53,7 @@ from __future__ import annotations
 import json
 import os
 import sqlite3
+import threading
 import sys
 import time
 from datetime import datetime
@@ -302,6 +303,227 @@ def _shell_cmd_str(cmd) -> str | None:
     return None
 
 
+def _read_js_string_literal(source: str, offset: int) -> tuple[int, str | None] | None:
+    """Decode one static JS string literal.
+
+    This is deliberately a tiny literal reader, not a JavaScript evaluator.
+    Single/double quoted strings and interpolation-free template literals are
+    accepted. Template interpolation and malformed escapes abstain.
+    """
+    if offset >= len(source) or source[offset] not in "'\"`":
+        return None
+    quote = source[offset]
+    out: list[str] = []
+    static = True
+    i = offset + 1
+    escapes = {
+        "b": "\b", "f": "\f", "n": "\n", "r": "\r", "t": "\t",
+        "v": "\v", "0": "\0", "\\": "\\", "'": "'", '"': '"',
+        "`": "`", "$": "$",
+    }
+    while i < len(source):
+        char = source[i]
+        if char == quote:
+            return i + 1, "".join(out) if static else None
+        if quote == "`" and char == "$" and i + 1 < len(source) and source[i + 1] == "{":
+            static = False
+            i += 2
+            continue
+        if char in "\r\n" and quote != "`":
+            return None
+        if char != "\\":
+            out.append(char)
+            i += 1
+            continue
+
+        i += 1
+        if i >= len(source):
+            return None
+        escaped = source[i]
+        if escaped == "\r" or escaped == "\n":
+            if escaped == "\r" and i + 1 < len(source) and source[i + 1] == "\n":
+                i += 1
+            i += 1
+            continue
+        if escaped == "x":
+            digits = source[i + 1:i + 3]
+            if len(digits) != 2 or any(c not in "0123456789abcdefABCDEF" for c in digits):
+                return None
+            out.append(chr(int(digits, 16)))
+            i += 3
+            continue
+        if escaped == "u":
+            if i + 1 < len(source) and source[i + 1] == "{":
+                end = source.find("}", i + 2)
+                digits = source[i + 2:end] if end >= 0 else ""
+                if not digits or len(digits) > 6 or any(c not in "0123456789abcdefABCDEF" for c in digits):
+                    return None
+                codepoint = int(digits, 16)
+                if codepoint > 0x10FFFF:
+                    return None
+                out.append(chr(codepoint))
+                i = end + 1
+                continue
+            digits = source[i + 1:i + 5]
+            if len(digits) != 4 or any(c not in "0123456789abcdefABCDEF" for c in digits):
+                return None
+            out.append(chr(int(digits, 16)))
+            i += 5
+            continue
+        out.append(escapes.get(escaped, escaped))
+        i += 1
+    return None
+
+
+_CODEX_JS_PARSER = None
+_CODEX_JS_PARSER_UNAVAILABLE = False
+
+
+def _codex_js_parser():
+    """Lazily build the required tree-sitter JavaScript parser."""
+    global _CODEX_JS_PARSER, _CODEX_JS_PARSER_UNAVAILABLE
+    if _CODEX_JS_PARSER is not None:
+        return _CODEX_JS_PARSER
+    if _CODEX_JS_PARSER_UNAVAILABLE:
+        return None
+    try:
+        from tree_sitter import Language, Parser
+        import tree_sitter_javascript as tsjs
+
+        _CODEX_JS_PARSER = Parser(Language(tsjs.language()))
+    except Exception:
+        # Static recovery is optional enrichment. If the grammar is somehow
+        # absent, abstain; never fall back to evaluating or regex-parsing JS.
+        _CODEX_JS_PARSER_UNAVAILABLE = True
+        return None
+    return _CODEX_JS_PARSER
+
+
+def _decode_js_literal_node(node) -> str | None:
+    if node.type not in ("string", "template_string"):
+        return None
+    if node.type == "template_string" and any(
+        child.type == "template_substitution" for child in node.named_children
+    ):
+        return None
+    try:
+        text = node.text.decode("utf-8")
+    except (AttributeError, UnicodeDecodeError):
+        return None
+    literal = _read_js_string_literal(text, 0)
+    if literal is None or literal[0] != len(text):
+        return None
+    return literal[1]
+
+
+def _literal_cmd_from_call(node) -> tuple[str, str | None] | None:
+    function = node.child_by_field_name("function")
+    if function is None or function.type != "member_expression":
+        return None
+    receiver = function.child_by_field_name("object")
+    member = function.child_by_field_name("property")
+    if (
+        receiver is None or receiver.type != "identifier"
+        or receiver.text != b"tools"
+        or member is None or member.type != "property_identifier"
+        or member.text != b"exec_command"
+    ):
+        return None
+
+    arguments = node.child_by_field_name("arguments")
+    if arguments is None or len(arguments.named_children) != 1:
+        return None
+    options = arguments.named_children[0]
+    if options.type != "object":
+        return None
+    # Spreads, computed methods, and shorthand properties may override cmd.
+    if any(child.type != "pair" for child in options.named_children):
+        return None
+
+    command: str | None = None
+    workdir: str | None = None
+    saw_workdir = False
+    for pair in options.named_children:
+        key = pair.child_by_field_name("key")
+        value = pair.child_by_field_name("value")
+        if key is None or value is None:
+            return None
+        if key.type in ("property_identifier", "identifier"):
+            key_text = key.text.decode("utf-8", errors="replace")
+        else:
+            key_text = _decode_js_literal_node(key)
+        if key_text is None:
+            # A computed key could override cmd/workdir.
+            return None
+        if key_text not in ("cmd", "workdir"):
+            continue
+        literal_value = _decode_js_literal_node(value)
+        if not literal_value:
+            return None
+        if key_text == "cmd":
+            if command is not None:
+                return None
+            command = literal_value
+        else:
+            if saw_workdir:
+                return None
+            saw_workdir = True
+            workdir = literal_value
+    return (command, workdir) if command is not None else None
+
+
+def _extract_exec_command_literals(source: str) -> list[tuple[str, str | None]]:
+    """Statically recover literal shell commands from Codex ``exec`` JavaScript.
+
+    Tree-sitter identifies exact call/object/string nodes, so comments, quoted
+    source, regex literals, interpolation, concatenation, and malformed programs
+    all abstain without evaluating the persisted JavaScript.
+    """
+    if not isinstance(source, str) or not source:
+        return []
+    parser = _codex_js_parser()
+    if parser is None:
+        return []
+    try:
+        root = parser.parse(source.encode("utf-8")).root_node
+    except Exception:
+        return []
+    if root.has_error:
+        return []
+
+    recovered: list[tuple[int, str, str | None]] = []
+    pending = [root]
+    while pending:
+        node = pending.pop()
+        if node.type == "call_expression":
+            command = _literal_cmd_from_call(node)
+            if command is not None:
+                recovered.append((node.start_byte, command[0], command[1]))
+        pending.extend(reversed(node.named_children))
+    recovered.sort(key=lambda item: item[0])
+    return [(command, workdir) for _, command, workdir in recovered]
+
+
+def _detected_shell_ops(
+    commands: list[tuple[str, str | None]], fallback_cwd: str | None,
+):
+    """Run the shared detector across commands, preserving order and deduping."""
+    confidence_rank = {"high": 3, "medium": 2, "low": 1}
+    seen = {}
+    for command, workdir in commands:
+        command_cwd = workdir or fallback_cwd
+        for op in detect_file_ops(command, command_cwd):
+            key = (op.file_path, op.inferred_op)
+            old = seen.get(key)
+            if old is None or confidence_rank.get(op.confidence, 0) > confidence_rank.get(old.confidence, 0):
+                seen[key] = op
+    return list(seen.values())
+
+
+def _shell_commands_text(commands: list[tuple[str, str | None]]) -> str:
+    return "\n".join(f"inferred nested shell: {command}" for command, _ in commands)
+
+
 def _local_shell_text(payload: dict) -> tuple[str, dict]:
     action = payload.get("action") if isinstance(payload, dict) else None
     if isinstance(action, dict):
@@ -334,6 +556,13 @@ def _sync_session_jsonl(
     session_memories: Optional[dict[str, dict]] = None,
     job_items: Optional[dict[str, dict]] = None,
     source_meta: Optional[Mapping[str, object]] = None,
+    *,
+    read_offset: int = 0,
+    read_limit: int | None = None,
+    line_number_base: int = 0,
+    parser_state: dict | None = None,
+    admit_enrichment: bool = True,
+    deadline: float | None = None,
 ) -> int:
     """Read one codex rollout JSONL and emit CC-canonical chunks. Idempotent.
 
@@ -346,29 +575,49 @@ def _sync_session_jsonl(
     spawn_edges = spawn_edges or {}
     session_memories = session_memories or {}
     job_items = job_items or {}
+    # ``parser_state`` is a durable, provider-native cursor receipt used only
+    # by the active-append path.  A normal reconciliation intentionally starts
+    # from no state and remains the authoritative repair implementation.
+    state = parser_state if parser_state is not None else {}
 
     # Load all lines + extract session_meta, call-id-keyed event lookups,
     # and per-line turn_id mapping (sticky: lines belong to the most recent
     # turn_context they follow until the next one).
     lines: list[dict] = []
-    session_id: Optional[str] = None
-    cwd: Optional[str] = None
-    git_branch: Optional[str] = None
+    session_id: Optional[str] = state.get("session_id") or None
+    cwd: Optional[str] = state.get("cwd") or None
+    git_branch: Optional[str] = state.get("git_branch") or None
     forked_from_id: Optional[str] = None
-    start_ts: Optional[int] = None
+    start_ts: Optional[int] = state.get("start_ts") or None
     patch_ends: dict[str, dict] = {}
     exec_ends: dict[str, dict] = {}
     turn_contexts: dict[str, dict] = {}     # turn_id → full payload
     line_to_turn: dict[int, str] = {}       # 1-indexed line idx → turn_id
-    _current_turn: Optional[str] = None
+    _current_turn: Optional[str] = state.get("current_turn_id") or None
+    remembered_turn = state.get("current_turn")
+    if _current_turn and isinstance(remembered_turn, dict):
+        turn_contexts[_current_turn] = remembered_turn
 
     try:
-        fh = jsonl_path.open("r", encoding="utf-8", errors="replace")
+        if read_offset:
+            # The receipt is a byte offset at a known newline boundary. Decode
+            # only the stable appended prefix; an unterminated writer tail is
+            # deliberately left for the next tick rather than guessed at.
+            with jsonl_path.open("rb") as binary:
+                binary.seek(read_offset)
+                payload = binary.read(-1 if read_limit is None else max(0, read_limit - read_offset))
+            raw_lines = payload.decode("utf-8", errors="replace").splitlines()
+            fh = None
+        else:
+            fh = jsonl_path.open("r", encoding="utf-8", errors="replace")
+            raw_lines = fh
     except OSError:
         return 0
 
     try:
-        for raw in fh:
+        for raw in raw_lines:
+            if deadline is not None and time.time() >= deadline:
+                raise TimeoutError("codex append admission deadline reached")
             raw = raw.strip()
             if not raw:
                 continue
@@ -407,7 +656,7 @@ def _sync_session_jsonl(
             elif t in ("response_item", "compacted"):
                 # Lines belong to the most recent turn_context (sticky)
                 if _current_turn:
-                    line_to_turn[len(lines)] = _current_turn
+                    line_to_turn[line_number_base + len(lines)] = _current_turn
             elif t == "event_msg":
                 ev = p.get("type")
                 cid = p.get("call_id")
@@ -418,7 +667,8 @@ def _sync_session_jsonl(
                 elif ev == "exec_command_end":
                     exec_ends[cid] = p
     finally:
-        fh.close()
+        if fh is not None:
+            fh.close()
 
     if not session_id:
         return 0
@@ -468,14 +718,31 @@ def _sync_session_jsonl(
     codex_spawn_items: list[tuple] = []       # (chunk_id, agent_type, fork_context, message_preview)
 
     # Track call_id → emitted chunk metadata across response_items in this session
-    call_to_chunk: dict[str, str] = {}
-    call_to_tool: dict[str, str] = {}     # canonical (Bash, Edit, ...)
-    call_to_raw: dict[str, str] = {}      # codex raw name (exec_command, apply_patch, ...)
-    call_to_target: dict[str, str] = {}
+    persisted_calls = state.get("open_calls") if isinstance(state.get("open_calls"), dict) else {}
+    call_to_chunk: dict[str, str] = {
+        str(call_id): str(details.get("chunk_id"))
+        for call_id, details in persisted_calls.items()
+        if isinstance(details, dict) and details.get("chunk_id")
+    }
+    call_to_tool: dict[str, str] = {
+        str(call_id): str(details.get("tool") or "unknown")
+        for call_id, details in persisted_calls.items() if isinstance(details, dict)
+    }
+    call_to_raw: dict[str, str] = {
+        str(call_id): str(details.get("raw_name") or details.get("tool") or "unknown")
+        for call_id, details in persisted_calls.items() if isinstance(details, dict)
+    }
+    call_to_target: dict[str, str] = {
+        str(call_id): str(details.get("target"))
+        for call_id, details in persisted_calls.items()
+        if isinstance(details, dict) and details.get("target")
+    }
     call_to_tool_op_idx: dict[str, int] = {}  # call_id → index into tool_ops_items (for success backfill)
 
-    for chunk_number, d in enumerate(lines, start=1):
-        if chunk_number <= last_num:
+    for chunk_number, d in enumerate(lines, start=1 + line_number_base):
+        if deadline is not None and time.time() >= deadline:
+            raise TimeoutError("codex append admission deadline reached")
+        if read_offset == 0 and chunk_number <= last_num:
             continue
 
         t = d.get("type", "")
@@ -579,8 +846,19 @@ def _sync_session_jsonl(
             elif isinstance(args_raw, dict):
                 arguments = args_raw
 
-            canonical = _map_tool_name(raw_name)
             raw_input_str = args_raw if isinstance(args_raw, str) else None
+            nested_shell_commands = (
+                _extract_exec_command_literals(raw_input_str)
+                if ptype == "custom_tool_call" and raw_name == "exec" and raw_input_str
+                else []
+            )
+            # ``exec`` is the provider-direct orchestration event. Static
+            # recovery can reveal probable nested shell/file operations, but it
+            # cannot prove that a syntactic call executed (dead branches,
+            # shadowed receivers, and uncalled functions all remain possible).
+            # Preserve the direct outer identity and put recovered paths only
+            # in the explicitly inferred soft-op surface.
+            canonical = _map_tool_name(raw_name)
             tfile = _target_file(
                 canonical, arguments, raw_name, call_id, patch_ends, raw_input_str,
             )
@@ -594,6 +872,13 @@ def _sync_session_jsonl(
                 # Index the upcoming tool_ops_items entry so we can backfill
                 # `success` from event_msg/exec_command_end after the loop.
                 call_to_tool_op_idx[call_id] = len(tool_ops_items)
+                if parser_state is not None:
+                    persisted_calls[call_id] = {
+                        "chunk_id": chunk_id,
+                        "tool": canonical,
+                        "raw_name": raw_name,
+                        "target": tfile,
+                    }
 
             if raw_name == "spawn_agent":
                 spawn_agent_chunks.append(chunk_id)
@@ -634,8 +919,12 @@ def _sync_session_jsonl(
                     # never fires — accumulate here and batch-insert below.
                     cmd_str = _shell_cmd_str(cmd)
                     if cmd_str:
-                        for op in detect_file_ops(cmd_str, effective_cwd):
+                        for op in _detected_shell_ops([(cmd_str, None)], effective_cwd):
                             soft_ops_items.append((chunk_id, op))
+            elif raw_name == "exec" and nested_shell_commands:
+                text_content = _shell_commands_text(nested_shell_commands)
+                for op in _detected_shell_ops(nested_shell_commands, effective_cwd):
+                    soft_ops_items.append((chunk_id, op))
             elif raw_name == "write_stdin":
                 ch = arguments.get("chars")
                 if ch:
@@ -715,7 +1004,7 @@ def _sync_session_jsonl(
             text_content, args = _local_shell_text(p)
             cmd_str = _shell_cmd_str(args.get("cmd")) if isinstance(args, dict) else None
             if cmd_str:
-                for op in detect_file_ops(cmd_str, effective_cwd):
+                for op in _detected_shell_ops([(cmd_str, None)], effective_cwd):
                     soft_ops_items.append((chunk_id, op))
             if line_tc:
                 codex_turn_items.append((chunk_id, line_tc))
@@ -763,6 +1052,8 @@ def _sync_session_jsonl(
                 tfile = call_to_target.get(call_id)
                 if tfile and len(output_text) > 50:
                     fb_items.append((parent_chunk, tfile, output_text, ts_int))
+            if parser_state is not None and call_id:
+                persisted_calls.pop(call_id, None)
 
         elif ptype in ("compaction", "ghost_snapshot"):
             raw = _compact_json(p)
@@ -791,7 +1082,7 @@ def _sync_session_jsonl(
     for chunk in new_chunks:
         chunk["embedding"] = None
         try:
-            if insert_chunk_atom(conn, chunk):
+            if insert_chunk_atom(conn, chunk, enrich_identity=admit_enrichment):
                 update_source_stats(conn, session_id, chunk)
                 inserted += 1
                 if first_chunk_id is None:
@@ -841,6 +1132,32 @@ def _sync_session_jsonl(
         except Exception:
             pass
 
+    # An exec completion may arrive in a later active-append interval. Its
+    # originating call is retained in the receipt, not re-read from the
+    # rollout; update the already-published operation directly.
+    for cid, ev in exec_ends.items():
+        if cid in call_to_tool_op_idx or cid not in call_to_chunk:
+            continue
+        exit_code = ev.get("exit_code")
+        if exit_code is None:
+            continue
+        parent_chunk = call_to_chunk[cid]
+        try:
+            conn.execute(
+                "UPDATE _edges_tool_ops SET success=? WHERE chunk_id=?",
+                (exit_code == 0, parent_chunk),
+            )
+            payload = {
+                "exit_code": exit_code, "duration": ev.get("duration"),
+                "command": ev.get("command"), "status": ev.get("status"),
+            }
+            _store_content_raw(
+                conn, parent_chunk, json.dumps(payload, ensure_ascii=False),
+                "exec_command_end", start_ts or int(time.time()),
+            )
+        except Exception as e:
+            print(f"[codex] deferred exec completion error: {e}", file=sys.stderr)
+
     for chunk_id, tn, tf, cwd_v, gb, ok in tool_ops_items:
         try:
             conn.execute(
@@ -849,7 +1166,7 @@ def _sync_session_jsonl(
                 "VALUES (?, ?, ?, ?, ?, ?)",
                 (chunk_id, tn, tf, ok, cwd_v, gb),
             )
-            if soma_enrich_operation:
+            if admit_enrichment and soma_enrich_operation:
                 soma_enrich_operation(
                     conn,
                     {
@@ -1058,6 +1375,16 @@ def _sync_session_jsonl(
             (session_id,),
         )
 
+    if parser_state is not None:
+        state.update({
+            "session_id": session_id,
+            "cwd": cwd,
+            "git_branch": git_branch,
+            "start_ts": start_ts,
+            "current_turn_id": _current_turn,
+            "current_turn": turn_contexts.get(_current_turn) if _current_turn else None,
+            "open_calls": persisted_calls,
+        })
     return inserted
 
 
@@ -1263,17 +1590,369 @@ CODEX_OPTIONAL_TABLES_DDL: tuple[str, ...] = (
     CREATE TABLE IF NOT EXISTS _codex_source_state (
         source_path TEXT PRIMARY KEY,
         size_bytes INTEGER NOT NULL,
-        mtime_ns INTEGER NOT NULL
+        mtime_ns INTEGER NOT NULL,
+        -- The committed prefix is the only prefix the active-append detector
+        -- may skip.  NULL fields identify legacy/full-reconcile state.
+        committed_offset INTEGER,
+        committed_lines INTEGER,
+        source_generation TEXT,
+        session_id TEXT,
+        parser_state TEXT
     )
     """,
 )
+
+_EXEC_WRAPPER_BACKFILL_KEY = "codex_exec_wrapper_backfill_version"
+_EXEC_WRAPPER_BACKFILL_VERSION = "2"
+_EXEC_WRAPPER_BACKFILL_CURSOR_KEY = "codex_exec_wrapper_backfill_v2_cursor"
+_EXEC_WRAPPER_LEGACY_CURSOR_KEY = "codex_exec_wrapper_backfill_v1_cursor"
+_EXEC_WRAPPER_BACKFILL_BATCH = 500
+_EXEC_WRAPPER_CANDIDATE_SQL = """
+rc.tool_name='exec'
+AND t.tool_name IN ('exec','Bash')
+AND rc.content LIKE '{"_raw":%'
+AND instr(rc.content, 'tools.exec_command') > 0
+"""
 
 
 def ensure_codex_tables(conn: sqlite3.Connection) -> None:
     """Create codex-specific optional tables. Idempotent. Called from install."""
     for ddl in CODEX_OPTIONAL_TABLES_DDL:
         conn.execute(ddl)
+    # Existing cells predate append receipts.  Keep their rows deliberately
+    # incomplete so the first post-migration sync takes the authoritative full
+    # path and only subsequent stable appends may use the fast path.
+    columns = {row[1] for row in conn.execute("PRAGMA table_info(_codex_source_state)")}
+    for name, declaration in (
+        ("committed_offset", "INTEGER"),
+        ("committed_lines", "INTEGER"),
+        ("source_generation", "TEXT"),
+        ("session_id", "TEXT"),
+        ("parser_state", "TEXT"),
+    ):
+        if name not in columns:
+            conn.execute(f"ALTER TABLE _codex_source_state ADD COLUMN {name} {declaration}")
     conn.commit()
+
+
+def _stored_exec_source(raw_content: str) -> str | None:
+    """Unwrap the legacy JSON envelope used for custom-tool ``input`` text."""
+    try:
+        parsed = json.loads(raw_content)
+    except (TypeError, json.JSONDecodeError):
+        return None
+    if (
+        isinstance(parsed, dict)
+        and set(parsed) == {"_raw"}
+        and isinstance(parsed.get("_raw"), str)
+    ):
+        return parsed["_raw"]
+    return None
+
+
+def backfill_exec_command_wrappers(
+    conn: sqlite3.Connection,
+    *,
+    limit: int | None = None,
+    deadline: float | None = None,
+) -> int:
+    """Repair historical literal shell calls hidden inside raw Codex ``exec``.
+
+    Version receipt lives in ``_meta`` so watched cells pay for the raw-content
+    scan once. Inserts remain independently idempotent in case an interrupted
+    run is retried before the receipt is committed.
+    """
+    required = {
+        "_meta", "_raw_chunks", "_raw_content", "_edges_raw_content",
+        "_edges_tool_ops", "_edges_soft_ops", "_enrich_observations",
+    }
+    available = {
+        row[0]
+        for row in conn.execute(
+            "SELECT name FROM sqlite_master WHERE type='table'"
+        ).fetchall()
+    }
+    if not required <= available:
+        return 0
+    prior = conn.execute(
+        "SELECT value FROM _meta WHERE key=?", (_EXEC_WRAPPER_BACKFILL_KEY,)
+    ).fetchone()
+    if prior and str(prior[0]) == _EXEC_WRAPPER_BACKFILL_VERSION:
+        return 0
+    if _codex_js_parser() is None:
+        # Do not receipt an unattempted migration when the static parser is
+        # unavailable; a later healthy watch tick must be allowed to retry.
+        return 0
+
+    if deadline is not None and time.time() >= deadline:
+        return 0
+    batch_limit = max(
+        1,
+        int(limit or os.environ.get(
+            "FLEX_CODEX_EXEC_REPAIR_PER_TICK", _EXEC_WRAPPER_BACKFILL_BATCH,
+        )),
+    )
+    cursor_row = conn.execute(
+        "SELECT value FROM _meta WHERE key=?", (_EXEC_WRAPPER_BACKFILL_CURSOR_KEY,)
+    ).fetchone()
+    cursor_rowid, cursor_chunk = 0, ""
+    if cursor_row and cursor_row[0]:
+        try:
+            decoded = json.loads(cursor_row[0])
+            cursor_rowid, cursor_chunk = int(decoded[0]), str(decoded[1])
+        except (TypeError, ValueError, json.JSONDecodeError, IndexError):
+            cursor_rowid, cursor_chunk = 0, ""
+
+    rows = conn.execute(
+        f"""
+        SELECT rc.rowid, erc.chunk_id, rc.content, t.cwd
+        FROM _raw_content rc
+        JOIN _edges_raw_content erc ON erc.content_hash=rc.hash
+        JOIN _edges_tool_ops t ON t.chunk_id=erc.chunk_id
+        WHERE {_EXEC_WRAPPER_CANDIDATE_SQL}
+          AND (rc.rowid > ? OR (rc.rowid = ? AND erc.chunk_id > ?))
+        ORDER BY rc.rowid, erc.chunk_id
+        LIMIT ?
+        """,
+        (cursor_rowid, cursor_rowid, cursor_chunk, batch_limit),
+    ).fetchall()
+
+    repaired = 0
+    last_cursor = (cursor_rowid, cursor_chunk)
+    conn.execute("SAVEPOINT codex_exec_wrapper_backfill")
+    try:
+        from flex.modules.claude_code.manage.observations import upsert_observation
+
+        for raw_rowid, chunk_id, raw_content, cwd in rows:
+            source = _stored_exec_source(raw_content)
+            commands = _extract_exec_command_literals(source) if source else []
+            last_cursor = (int(raw_rowid), str(chunk_id))
+            if not commands:
+                if deadline is not None and time.time() >= deadline:
+                    break
+                continue
+
+            # Identical calls within one wrapper do not need duplicate edges.
+            commands = list(dict.fromkeys(commands))
+            # A short-lived pre-release implementation rewrote these outer
+            # provider events to Bash. Repair that fidelity laundering while
+            # preserving the raw `exec` identity as the direct event.
+            conn.execute(
+                "UPDATE _edges_tool_ops SET tool_name='exec' "
+                "WHERE chunk_id=? AND tool_name='Bash'",
+                (chunk_id,),
+            )
+            for op in _detected_shell_ops(commands, cwd):
+                conn.execute(
+                    """
+                    INSERT INTO _edges_soft_ops
+                      (chunk_id,file_path,file_uuid,inferred_op,confidence)
+                    SELECT ?,?,NULL,?,?
+                    WHERE NOT EXISTS (
+                        SELECT 1 FROM _edges_soft_ops
+                        WHERE chunk_id=? AND file_path=? AND inferred_op=?
+                    )
+                    """,
+                    (
+                        chunk_id, op.file_path, op.inferred_op, op.confidence,
+                        chunk_id, op.file_path, op.inferred_op,
+                    ),
+                )
+            upsert_observation(conn, chunk_id)
+            repaired += 1
+            if deadline is not None and time.time() >= deadline:
+                break
+
+        conn.execute(
+            "INSERT OR REPLACE INTO _meta (key,value) VALUES (?,?)",
+            (_EXEC_WRAPPER_BACKFILL_CURSOR_KEY, json.dumps(last_cursor)),
+        )
+        more = conn.execute(
+            f"""
+            SELECT 1
+            FROM _raw_content rc
+            JOIN _edges_raw_content erc ON erc.content_hash=rc.hash
+            JOIN _edges_tool_ops t ON t.chunk_id=erc.chunk_id
+            WHERE {_EXEC_WRAPPER_CANDIDATE_SQL}
+              AND (rc.rowid > ? OR (rc.rowid = ? AND erc.chunk_id > ?))
+            LIMIT 1
+            """,
+            (last_cursor[0], last_cursor[0], last_cursor[1]),
+        ).fetchone()
+        if more is None:
+            conn.execute(
+                "INSERT OR REPLACE INTO _meta (key,value) VALUES (?,?)",
+                (_EXEC_WRAPPER_BACKFILL_KEY, _EXEC_WRAPPER_BACKFILL_VERSION),
+            )
+            conn.execute(
+                "DELETE FROM _meta WHERE key IN (?,?)",
+                (_EXEC_WRAPPER_BACKFILL_CURSOR_KEY, _EXEC_WRAPPER_LEGACY_CURSOR_KEY),
+            )
+        conn.execute("RELEASE SAVEPOINT codex_exec_wrapper_backfill")
+    except Exception:
+        conn.execute("ROLLBACK TO SAVEPOINT codex_exec_wrapper_backfill")
+        conn.execute("RELEASE SAVEPOINT codex_exec_wrapper_backfill")
+        raise
+    conn.commit()
+    return repaired
+
+
+def _rollout_generation(stat: os.stat_result) -> str:
+    """Stable local identity used to reject a replaced rollout at one path."""
+    return f"{stat.st_dev}:{stat.st_ino}"
+
+
+def _stable_jsonl_end(path: Path, offset: int, *, max_bytes: int | None = None) -> int:
+    """Return the byte after the last complete newline in a bounded suffix."""
+    try:
+        with path.open("rb") as handle:
+            handle.seek(offset)
+            suffix = handle.read(-1 if max_bytes is None else max(0, max_bytes))
+    except OSError:
+        return offset
+    newline = suffix.rfind(b"\n")
+    return offset if newline < 0 else offset + newline + 1
+
+
+def _append_byte_budget() -> int:
+    """Maximum stable JSONL bytes one active-append admission may materialize."""
+    try:
+        # This lane has a two-second latency contract; large backlogs drain
+        # over successive receipts rather than consuming a core for seconds.
+        return max(1024, int(os.environ.get("FLEX_CODEX_APPEND_MAX_BYTES", str(64 * 1024))))
+    except ValueError:
+        return 64 * 1024
+
+
+def _count_jsonl_lines(path: Path, start: int, end: int) -> int:
+    """Count physical records in an already bounded byte interval."""
+    if end <= start:
+        return 0
+    try:
+        with path.open("rb") as handle:
+            handle.seek(start)
+            return handle.read(end - start).count(b"\n")
+    except OSError:
+        return 0
+
+
+def _load_targeted_thread_meta(state_db: Path, session_id: str) -> dict[str, dict]:
+    """Fetch only the state_5 row needed by a stable active append."""
+    if not state_db.exists() or not session_id:
+        return {}
+    try:
+        uri = f"file:{state_db}?mode=ro"
+        state = sqlite3.connect(uri, uri=True, timeout=2.0)
+        try:
+            row = state.execute(
+                """SELECT id,title,git_branch,git_sha,git_origin_url,model,
+                          agent_role,agent_nickname,source,cli_version
+                   FROM threads WHERE id=?""",
+                (session_id,),
+            ).fetchone()
+        finally:
+            state.close()
+    except sqlite3.Error:
+        return {}
+    if not row:
+        return {}
+    return {str(row[0]): {
+        "title": row[1] or None, "git_branch": row[2] or None,
+        "git_sha": row[3] or None, "git_origin_url": row[4] or None,
+        "model": row[5] or None, "agent_role": row[6] or None,
+        "agent_nickname": row[7] or None, "source": row[8] or None,
+        "cli_version": row[9] or None,
+    }}
+
+
+def _load_targeted_rollout_state(
+    state_db: Path, session_id: str,
+) -> tuple[dict[str, dict], dict[str, list[tuple[str, str]]], dict[str, dict], dict[str, dict]]:
+    """Read only state_5 facts owned by one append receipt's session.
+
+    Full reconciliation still reads the provider's complete lineage tables.
+    The active path must not reload them per two-second append: title/context,
+    child edges, memory, and batch-job facts are keyed by this one session.
+    """
+    meta = _load_targeted_thread_meta(state_db, session_id)
+    if not state_db.exists() or not session_id:
+        return meta, {}, {}, {}
+    try:
+        state = sqlite3.connect(f"file:{state_db}?mode=ro", uri=True, timeout=2.0)
+        try:
+            children = {
+                session_id: [
+                    (str(row[0]), str(row[1] or ""))
+                    for row in state.execute(
+                        "SELECT child_thread_id,status FROM thread_spawn_edges WHERE parent_thread_id=?",
+                        (session_id,),
+                    )
+                    if row[0]
+                ]
+            }
+            memory_row = state.execute(
+                """SELECT raw_memory,rollout_summary,generated_at,rollout_slug,usage_count,last_usage
+                   FROM stage1_outputs WHERE thread_id=?""",
+                (session_id,),
+            ).fetchone()
+            job_row = state.execute(
+                """SELECT i.job_id,j.name,j.instruction,i.item_id,i.row_index,i.row_json
+                   FROM agent_job_items i LEFT JOIN agent_jobs j ON j.id=i.job_id
+                   WHERE i.assigned_thread_id=? LIMIT 1""",
+                (session_id,),
+            ).fetchone()
+        finally:
+            state.close()
+    except sqlite3.Error:
+        return meta, {}, {}, {}
+    memories = ({session_id: {
+        "raw_memory": memory_row[0] or "", "rollout_summary": memory_row[1] or "",
+        "generated_at": memory_row[2], "rollout_slug": memory_row[3],
+        "usage_count": memory_row[4], "last_usage": memory_row[5],
+    }} if memory_row else {})
+    jobs = ({session_id: {
+        "job_id": job_row[0], "job_name": job_row[1], "job_instruction": job_row[2],
+        "item_id": job_row[3], "row_index": job_row[4], "row_json": job_row[5],
+    }} if job_row else {})
+    return meta, children, memories, jobs
+
+
+def _clear_codex_session(conn: sqlite3.Connection, session_id: str) -> None:
+    """Remove one replaced rollout's derived rows before authoritative replay.
+
+    A rollout path is a provider locator, not enduring identity.  When its
+    inode/generation changes we must not retain a higher historical line
+    number and silently skip the replacement's early records.
+    """
+    chunk_ids = [
+        row[0] for row in conn.execute(
+            "SELECT chunk_id FROM _edges_source WHERE source_id=?", (session_id,),
+        )
+    ]
+    for start in range(0, len(chunk_ids), 400):
+        batch = chunk_ids[start:start + 400]
+        marks = ",".join("?" for _ in batch)
+        for table in (
+            "_types_message", "_edges_tool_ops", "_edges_soft_ops",
+            "_types_file_body", "_types_codex_turn", "_types_codex_spawn",
+            "_edges_raw_content", "_enrich_observations", "_enrich_chunk_rollup",
+        ):
+            try:
+                conn.execute(f"DELETE FROM {table} WHERE chunk_id IN ({marks})", batch)
+            except sqlite3.OperationalError:
+                # Optional profiles differ across old cells; canonical chunks
+                # and source edges below remain the authoritative boundary.
+                pass
+        conn.execute(f"DELETE FROM _raw_chunks WHERE id IN ({marks})", batch)
+        conn.execute(f"DELETE FROM _edges_source WHERE chunk_id IN ({marks})", batch)
+    try:
+        conn.execute("DELETE FROM _file_body_index WHERE parent_chunk_id LIKE ?", (f"{session_id}_%",))
+        conn.execute("DELETE FROM _raw_codex_memory WHERE source_id=?", (session_id,))
+        conn.execute("DELETE FROM _types_codex_job WHERE source_id=?", (session_id,))
+        conn.execute("DELETE FROM _types_codex_source WHERE session_id=?", (session_id,))
+    except sqlite3.OperationalError:
+        pass
+    conn.execute("DELETE FROM _raw_sources WHERE source_id=?", (session_id,))
 
 
 def sync_rollout_path(
@@ -1282,81 +1961,333 @@ def sync_rollout_path(
     *,
     state_db: Path | None = None,
     source_meta: Mapping[str, object] | None = None,
+    deadline: float | None = None,
+    allow_reconcile: bool = True,
+    ensure_schema: bool = True,
 ) -> int:
-    """Incrementally sync one rollout and durably receipt its stat state."""
+    """Synchronize one rollout through a generation-qualified append receipt.
+
+    The first visit, legacy receipt, rotated/truncated file, or incomplete
+    writer tail takes the full parser path.  Only a stable growth suffix whose
+    prior cursor ended on a newline may use the bounded append parser.
+    """
     rollout_path = Path(rollout_path).resolve()
+    if deadline is not None and time.time() >= deadline:
+        return 0
     try:
         stat = rollout_path.stat()
     except OSError:
         return 0
-    ensure_codex_tables(conn)
+    if ensure_schema:
+        ensure_codex_tables(conn)
     prior = conn.execute(
-        "SELECT size_bytes,mtime_ns FROM _codex_source_state WHERE source_path=?",
+        """SELECT size_bytes,mtime_ns,committed_offset,committed_lines,
+                  source_generation,session_id,parser_state
+           FROM _codex_source_state WHERE source_path=?""",
         (str(rollout_path),),
     ).fetchone()
-    if prior == (stat.st_size, stat.st_mtime_ns):
-        return 0
+    if prior and prior[0:2] == (stat.st_size, stat.st_mtime_ns):
+        # Pre-receipt installations are common. Do not turn their whole
+        # historical archive into work merely because this code was upgraded;
+        # promote one rollout to the authoritative baseline only on its next
+        # source change.
+        if prior[2] is None or prior[2] == stat.st_size:
+            return 0
 
     state_path = Path(state_db) if state_db is not None else DEFAULT_CODEX_STATE_DB
-    added = _sync_session_jsonl(
-        rollout_path,
-        conn,
-        _load_thread_meta(state_path),
-        _load_spawn_edges(state_path),
-        _load_session_memories(state_path),
-        _load_job_items(state_path),
-        source_meta=source_meta,
-    )
-    conn.execute(
-        "INSERT OR REPLACE INTO _codex_source_state VALUES (?,?,?)",
-        (str(rollout_path), stat.st_size, stat.st_mtime_ns),
-    )
+    generation = _rollout_generation(stat)
+    append_state: dict | None = None
+    append_offset = 0
+    append_limit: int | None = None
+    append_lines = 0
+    if prior:
+        try:
+            append_offset = int(prior[2]) if prior[2] is not None else 0
+            append_lines = int(prior[3]) if prior[3] is not None else 0
+            decoded = json.loads(prior[6]) if prior[6] else None
+            if isinstance(decoded, dict):
+                append_state = decoded
+        except (TypeError, ValueError, json.JSONDecodeError):
+            append_state = None
+        if (
+            append_state is not None
+            and prior[4] == generation
+            and prior[5] == append_state.get("session_id")
+            and 0 <= append_offset <= stat.st_size
+        ):
+            append_limit = _stable_jsonl_end(
+                rollout_path, append_offset, max_bytes=_append_byte_budget(),
+            )
+            # No newline-complete records is not an error and must not advance
+            # the receipt beyond the known good prefix.
+            if append_limit == append_offset:
+                return 0
+        else:
+            append_state = None
+
+    if append_state is not None and append_limit is not None:
+        thread_meta, spawn_edges, session_memories, job_items = _load_targeted_rollout_state(
+            state_path, append_state["session_id"],
+        )
+        conn.execute("SAVEPOINT codex_append_publication")
+        try:
+            added = _sync_session_jsonl(
+                rollout_path, conn, thread_meta, spawn_edges, session_memories, job_items,
+                source_meta=source_meta,
+                read_offset=append_offset, read_limit=append_limit,
+                line_number_base=append_lines, parser_state=append_state,
+                admit_enrichment=False,
+                deadline=deadline,
+            )
+        except Exception:
+            conn.execute("ROLLBACK TO SAVEPOINT codex_append_publication")
+            conn.execute("RELEASE SAVEPOINT codex_append_publication")
+            raise
+        committed_offset = append_limit
+        committed_lines = append_lines + _count_jsonl_lines(rollout_path, append_offset, append_limit)
+    else:
+        if not allow_reconcile:
+            # The two-second active lane must never turn a cursor failure into
+            # a full archive parse. Its caller records reconciliation debt;
+            # the ordinary bounded reconciliation owner repairs it later.
+            return 0
+        # Authoritative reconciliation. Full parsing is intentionally retained
+        # for first capture and any source-generation/cursor failure.
+        if (
+            prior and prior[5]
+            and (prior[4] != generation or (prior[2] is not None and stat.st_size < prior[2]))
+        ):
+            _clear_codex_session(conn, str(prior[5]))
+        append_state = {}
+        added = _sync_session_jsonl(
+            rollout_path, conn, _load_thread_meta(state_path),
+            _load_spawn_edges(state_path), _load_session_memories(state_path),
+            _load_job_items(state_path), source_meta=source_meta,
+            parser_state=append_state,
+        )
+        committed_offset = _stable_jsonl_end(rollout_path, 0)
+        committed_lines = _count_jsonl_lines(rollout_path, 0, committed_offset)
+
+    try:
+        conn.execute(
+            """INSERT INTO _codex_source_state(source_path,size_bytes,mtime_ns,
+                   committed_offset,committed_lines,source_generation,session_id,parser_state)
+               VALUES (?,?,?,?,?,?,?,?)
+               ON CONFLICT(source_path) DO UPDATE SET
+                 size_bytes=excluded.size_bytes,
+                 mtime_ns=excluded.mtime_ns,
+                 committed_offset=excluded.committed_offset,
+                 committed_lines=excluded.committed_lines,
+                 source_generation=excluded.source_generation,
+                 session_id=excluded.session_id,
+                 parser_state=excluded.parser_state""",
+            (str(rollout_path), stat.st_size, stat.st_mtime_ns,
+             committed_offset, committed_lines, generation,
+             append_state.get("session_id"), json.dumps(append_state, separators=(",", ":"))),
+        )
+        if append_limit is not None and append_state is not None:
+            conn.execute("RELEASE SAVEPOINT codex_append_publication")
+    except Exception:
+        if append_limit is not None and append_state is not None:
+            conn.execute("ROLLBACK TO SAVEPOINT codex_append_publication")
+            conn.execute("RELEASE SAVEPOINT codex_append_publication")
+        raise
     conn.commit()
     return added
 
 
-def scan_codex_cells() -> dict:
-    """Bounded fair reconciliation and NULL-vector repair for local Codex cells."""
-    from flex.registry import list_cells, update_refresh_status
-    from flex.modules.codex.sources import resolve_sources
-    from flex.watch import fair_batch
+_CODEX_DRAIN_CURSOR_KEY = "drain_cursor:codex"
 
-    stats = {'indexed': 0, 'skipped': 0, 'embedded': 0}
+
+def _select_codex_rollout_batch(
+    conn: sqlite3.Connection,
+    candidates: list[tuple[str, str]],
+    limit: int,
+) -> list[tuple[str, str]]:
+    """Return a fair rollout slice without advancing its durable cursor.
+
+    A rollout can take materially longer than the shared drain window.  Its
+    cursor is therefore a completion receipt, unlike generic selection cursors:
+    it advances only after the rollout's own source-state transaction commits.
+    """
+    ordered = sorted(candidates, key=lambda item: item[0])
+    if not ordered or limit <= 0:
+        return []
+    row = conn.execute(
+        "SELECT value FROM _meta WHERE key=?", (_CODEX_DRAIN_CURSOR_KEY,),
+    ).fetchone()
+    cursor = str(row[0]) if row and row[0] else ""
+    start = next(
+        (index for index, (key, _) in enumerate(ordered) if key > cursor),
+        len(ordered),
+    )
+    return (ordered[start:] + ordered[:start])[:limit]
+
+
+def _record_codex_rollout_completion(
+    conn: sqlite3.Connection,
+    rollout_key: str,
+) -> None:
+    """Durably advance the Codex fair cursor after a committed rollout sync."""
+    conn.execute(
+        "INSERT OR REPLACE INTO _meta (key,value) VALUES (?,?)",
+        (_CODEX_DRAIN_CURSOR_KEY, rollout_key),
+    )
+    conn.commit()
+
+
+_CODEX_SCAN_LOCK = threading.Lock()
+
+
+def scan_codex_cells(
+    deadline: float | None = None,
+    *,
+    embed: bool = True,
+    discover: bool = True,
+    cell_names: set[str] | None = None,
+) -> dict:
+    """Serialize provider scans while allowing separate structural scheduling."""
+    with _CODEX_SCAN_LOCK:
+        return _scan_codex_cells(
+            deadline=deadline,
+            embed=embed,
+            discover=discover,
+            cell_names=cell_names,
+        )
+
+
+def _scan_codex_cells(
+    deadline: float | None = None,
+    *,
+    embed: bool = True,
+    discover: bool = True,
+    cell_names: set[str] | None = None,
+) -> dict:
+    """Bounded fair reconciliation for local Codex cells.
+
+    Structural rows always commit independently. ``embed=False`` leaves their
+    embeddings as explicit NULL debt so a busy semantic lane cannot delay
+    text, metadata, relationships, or FTS visibility. When embedding is admitted,
+    ``deadline`` bounds both phases by one absolute clock.
+    """
+    from flex.registry import list_cells, mark_refresh_started, update_refresh_status
+    from flex.modules.codex.sources import resolve_sources
+
+    stats = {'indexed': 0, 'skipped': 0, 'embedded': 0, 'repaired': 0,
+             'reconciliation_deferred': 0}
     cells = [c for c in list_cells() if c.get('cell_type') == 'codex'
-             and c.get('lifecycle') == 'watch' and c.get('active', 1)]
+             and c.get('lifecycle') == 'watch' and c.get('active', 1)
+             and (cell_names is None or c.get('name') in cell_names)]
     limit = max(1, int(os.environ.get('FLEX_DRAIN_FILES_PER_CELL', '200')))
     embed_limit = max(1, int(os.environ.get('FLEX_CODEX_EMBED_PER_TICK', '128')))
     for cell in cells:
+        if deadline is not None and time.time() >= deadline:
+            stats['deadline_hit'] = stats.get('deadline_hit', 0) + 1
+            break
         conn = sqlite3.connect(cell['path'], timeout=30)
         conn.execute("PRAGMA journal_mode=WAL")
         conn.execute("PRAGMA busy_timeout=30000")
-        ensure_codex_tables(conn)
+        # Schema repair is reconciliation work. Re-running CREATE/PRAGMA/COMMIT
+        # in every active append tick was a fixed multi-second cost on a large
+        # cell even when no rollout had changed.
+        if discover:
+            ensure_codex_tables(conn)
+        # Historical wrapper repair is reconciliation/enrichment work, never
+        # part of the two-second active append admission.
+        repaired = (
+            backfill_exec_command_wrappers(conn, deadline=deadline)
+            if discover else 0
+        )
         candidates = []
         source_by_path = {}
-        for source in resolve_sources(conn):
-            if not source.usable:
+        sources = [source for source in resolve_sources(conn) if source.usable]
+
+        # Stat recently synchronized rollouts first. An active long-running
+        # session already has a durable source-state row, so this detects its
+        # growth without first walking the entire Codex archive. The bounded
+        # discovery pass below remains responsible for never-before-seen files.
+        known_rows = conn.execute(
+            """SELECT source_path,size_bytes,mtime_ns,committed_offset,
+                      source_generation,session_id,parser_state
+               FROM _codex_source_state """
+            "ORDER BY mtime_ns DESC LIMIT ?",
+            (max(limit * 4, 256),),
+        ).fetchall()
+        known_paths = {str(row[0]) for row in known_rows}
+        deferred_reconciles = 0
+        for source_path, prior_size, prior_mtime, committed_offset, prior_generation, prior_session, parser_state in known_rows:
+            if deadline is not None and time.time() >= deadline:
+                break
+            resolved_path = Path(source_path)
+            source = next(
+                (
+                    candidate for candidate in sources
+                    if resolved_path.is_relative_to(candidate.sessions_dir)
+                ),
+                None,
+            )
+            if source is None:
                 continue
-            for path in source.sessions_dir.rglob('rollout-*.jsonl'):
-                resolved = str(path.resolve())
-                source_by_path[resolved] = source
-                try:
-                    stat = path.stat()
-                except OSError:
+            try:
+                stat = resolved_path.stat()
+            except OSError:
+                continue
+            resolved = str(resolved_path)
+            source_by_path[resolved] = source
+            if (prior_size, prior_mtime) != (stat.st_size, stat.st_mtime_ns):
+                # A two-second active tick is allowed only to advance a
+                # generation-qualified append receipt. Anything else is
+                # explicit reconciliation debt for the ordinary owner.
+                if not discover and (
+                    committed_offset is None or not prior_session or not parser_state
+                    or prior_generation != _rollout_generation(stat)
+                ):
+                    deferred_reconciles += 1
                     continue
-                prior = conn.execute(
-                    "SELECT size_bytes,mtime_ns FROM _codex_source_state WHERE source_path=?",
-                    (resolved,),
-                ).fetchone()
-                if prior != (stat.st_size, stat.st_mtime_ns):
+                candidates.append((resolved, resolved))
+
+        if deferred_reconciles:
+            mark_refresh_started(
+                cell['name'], pending=deferred_reconciles,
+                reconciliation_required=True,
+            )
+            stats['reconciliation_deferred'] += deferred_reconciles
+
+        # Discover new rollouts within the same absolute budget. Check the
+        # clock on every yielded path so a large historical tree cannot turn a
+        # two-second structural pass into a minute-long query blackout.
+        if discover and not candidates:
+            for source in sources:
+                if deadline is not None and time.time() >= deadline:
+                    break
+                for path in source.sessions_dir.rglob('rollout-*.jsonl'):
+                    if deadline is not None and time.time() >= deadline:
+                        break
+                    resolved = str(path.resolve())
+                    if resolved in known_paths:
+                        continue
+                    source_by_path[resolved] = source
+                    try:
+                        path.stat()
+                    except OSError:
+                        continue
                     candidates.append((resolved, resolved))
-        batch = fair_batch(conn, 'codex', candidates, limit)
-        if batch:
-            conn.commit()
+        batch = _select_codex_rollout_batch(conn, candidates, limit)
         changed = 0
-        for _, resolved in batch:
+        completed = 0
+        deadline_hit = False
+        for rollout_key, resolved in batch:
+            # Do not begin a potentially long structural transaction after its
+            # caller's absolute drain window has closed.
+            if deadline is not None and time.time() >= deadline:
+                deadline_hit = True
+                break
             source = source_by_path[resolved]
             changed += sync_rollout_path(
                 conn, Path(resolved), state_db=source.state_db,
+                deadline=deadline,
+                allow_reconcile=discover,
+                ensure_schema=discover,
                 source_meta={
                     'source_kind': source.source_kind,
                     'codex_home': str(source.codex_home),
@@ -1365,15 +2296,32 @@ def scan_codex_cells() -> dict:
                     'rollout_path': resolved,
                 },
             )
-        embedded = _batch_embed_chunks(
-            conn, batch_size=64, quiet=True, max_chunks=embed_limit,
-        )
+            completed += 1
+            # sync_rollout_path commits the corpus plus its source-state
+            # receipt as one rollout transaction. Only then may fair resume
+            # advance past it; an expired tick leaves untouched rollouts next.
+            _record_codex_rollout_completion(conn, rollout_key)
+
+        if not embed:
+            embedded = 0
+        elif deadline is not None and time.time() >= deadline:
+            deadline_hit = True
+            embedded = 0
+        else:
+            embedded = _batch_embed_chunks(
+                conn, batch_size=64, quiet=True, max_chunks=embed_limit,
+                deadline=deadline,
+            )
         stats['indexed'] += changed
         stats['embedded'] += embedded
-        stats['skipped'] += max(0, len(batch) - changed)
-        if changed or embedded:
+        stats['repaired'] += repaired
+        stats['skipped'] += max(0, completed - changed)
+        if changed or embedded or repaired:
             update_refresh_status(cell['name'], 'ok')
         conn.close()
+        if deadline_hit:
+            stats['deadline_hit'] = stats.get('deadline_hit', 0) + 1
+            break
     return stats
 
 

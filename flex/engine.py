@@ -350,8 +350,14 @@ def register_vec_udf(db: sqlite3.Connection, state: dict):
 # Query execution
 # ============================================================
 
-def execute_preset(db: sqlite3.Connection, query: str) -> str:
-    """Execute a @preset query from the cell's _presets table. Returns JSON string."""
+def execute_preset(
+    db: sqlite3.Connection,
+    query: str,
+    *,
+    materializer=None,
+    cell_name: str | None = None,
+) -> str:
+    """Execute a SQL program from the selected cell. Returns JSON."""
     from flex.retrieve.presets import PresetLoader
 
     parts = query[1:].split()
@@ -372,9 +378,15 @@ def execute_preset(db: sqlite3.Connection, query: str) -> str:
         else:
             positional.append(p)
 
-    loader = PresetLoader(db)
-    if preset_name not in loader.list_presets():
-        available = loader.list_presets()
+    loader = PresetLoader(db, cell_name=cell_name)
+    available_presets = loader.list_presets()
+    if preset_name == "orient" and materializer is not None:
+        if positional and str(positional[0]).lower() == "global":
+            positional.pop(0)
+        elif "self-orient" in available_presets:
+            preset_name = "self-orient"
+    if preset_name not in available_presets:
+        available = available_presets
         return json.dumps({"error": f"Preset not found: {preset_name}",
                             "available": available})
 
@@ -391,29 +403,61 @@ def execute_preset(db: sqlite3.Connection, query: str) -> str:
                     except ValueError:
                         params[name] = value
 
-    results = loader.execute(db, preset_name, params)
+    results = loader.execute(
+        db,
+        preset_name,
+        params,
+        materializer=materializer,
+    )
     return json.dumps(results, indent=2, default=str)
 
 
-def materialize(db: sqlite3.Connection, sql: str) -> str:
+def materialize(db: sqlite3.Connection, sql: str, *, context=None) -> str:
     """Run materializers. Returns transformed SQL or error JSON."""
+    from flex.mcp_core import materialize_authorizer
+    from flex.meta import attach_registered_cells
     from flex.retrieve.doc_mounts import materialize_docs
     from flex.retrieve.vec_ops import materialize_vec_ops
     from flex.retrieve.keyword import materialize_keyword
+    from flex.self import MaterializationContext, materialize_self
 
-    sql = materialize_docs(db, sql)
+    context = context or MaterializationContext()
+
+    # Meta is the same materializer primitive at database grain. Attachment is
+    # trusted core work; restore the narrow staging authorizer before any
+    # ordinary or plugin materializer runs.
+    try:
+        db.set_authorizer(None)
+        sql, error = attach_registered_cells(
+            db,
+            sql,
+            explicit_cells=context.explicit_cells,
+            available_cells=context.available_cells,
+        )
+    finally:
+        db.set_authorizer(materialize_authorizer)
+    if error:
+        return json.dumps({"error": error})
+
+    sql = materialize_self(
+        db,
+        sql,
+        context=context,
+        restore_authorizer=materialize_authorizer,
+    )
     if sql.startswith('{"error"'):
         return sql
-    sql = materialize_vec_ops(db, sql)
-    if sql.startswith('{"error"'):
-        return sql
-    sql = materialize_keyword(db, sql)
-    if sql.startswith('{"error"'):
-        return sql
+
+    for fn in (materialize_docs, materialize_vec_ops, materialize_keyword):
+        db.set_authorizer(materialize_authorizer)
+        sql = fn(db, sql)
+        if sql.startswith('{"error"'):
+            return sql
 
     try:
         from flex.modules.query import get_materializers
         for fn in get_materializers():
+            db.set_authorizer(materialize_authorizer)
             sql = fn(db, sql)
             if sql.startswith('{"error"'):
                 return sql

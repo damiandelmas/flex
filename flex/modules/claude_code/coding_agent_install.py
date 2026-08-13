@@ -42,7 +42,10 @@ def _record_signature(conn: sqlite3.Connection, spec: dict[str, Any], source: Pa
 def _registration_lifecycle_kwargs(spec: dict[str, Any], source: Path) -> dict[str, Any]:
     """Return registry lifecycle fields for coding-agent source tracking."""
     lifecycle = spec.get("lifecycle", "watch")
-    return {
+    watch_path = spec.get("watch_path") or source
+    if lifecycle == "watch" and Path(watch_path).is_file():
+        watch_path = Path(watch_path).parent
+    fields = {
         "lifecycle": lifecycle,
         "refresh_interval": (
             int(spec["refresh_interval"])
@@ -50,9 +53,14 @@ def _registration_lifecycle_kwargs(spec: dict[str, Any], source: Path) -> dict[s
             else None
         ),
         "refresh_module": spec.get("refresh_module"),
-        "watch_path": spec.get("watch_path") or source,
+        "watch_path": watch_path,
         "watch_pattern": spec.get("watch_pattern"),
     }
+    if spec.get("detector") is not None:
+        fields["detector"] = spec["detector"]
+    if spec.get("detector_config") is not None:
+        fields["detector_config"] = spec["detector_config"]
+    return fields
 
 
 def register_common_args(parser, *, source_flag: str, source_help: str, default_name: str) -> None:
@@ -208,7 +216,7 @@ def run_from_spec(args, console, spec: dict[str, Any]) -> None:
     panel.append(f"{cell_type} cell ready.\n\n", style="cyan")
     panel.append("Query examples:\n", style="bold")
     for example in spec.get("query_examples") or ("@orient", "@digest", "@file path='src/foo.py'"):
-        panel.append(f'  flex core search --cell {name} "{example}"\n', style="dim")
+        panel.append(f'  flex search --cell {name} "{example}"\n', style="dim")
     console.print(Panel(panel, padding=(1, 2), highlight=False))
     console.print()
 

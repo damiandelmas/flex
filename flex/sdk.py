@@ -29,6 +29,7 @@ from typing import Optional
 
 from flex.core import open_cell, set_meta, get_meta, log_op, validate_cell
 from flex.registry import CELLS_DIR, register_cell as _register_cell, resolve_cell
+from flex.envelope import ensure_tree, install_envelope, regenerate_envelope_views
 from flex.views import regenerate_views, install_views
 
 # Track cell metadata outside the connection (sqlite3.Connection doesn't allow
@@ -71,47 +72,7 @@ def _coerce_timestamp(value: Optional[object], *, default_now: bool = True) -> i
 
 # ─── Schema ───────────────────────────────────────────────────────────────────
 
-_BASE_SCHEMA = """\
-CREATE TABLE IF NOT EXISTS _raw_chunks (
-    id          TEXT PRIMARY KEY,
-    content     TEXT NOT NULL,
-    embedding   BLOB,
-    timestamp   INTEGER,
-    created_at  INTEGER DEFAULT (strftime('%s','now'))
-);
-
-CREATE TABLE IF NOT EXISTS _raw_sources (
-    source_id   TEXT PRIMARY KEY,
-    title       TEXT,
-    embedding   BLOB,
-    timestamp   INTEGER,
-    created_at  INTEGER DEFAULT (strftime('%s','now'))
-);
-
--- Deliberately NOT the flex.compile.edges_schema shared DDL: this table
--- predates it, already carries a real key (PRIMARY KEY(chunk_id) — stricter
--- than the module tables' UNIQUE(chunk_id, source_id), since the generic
--- SDK contract is one source per chunk), and lacks the source_type/position
--- columns those modules use. Swapping in the shared shape would weaken
--- this constraint, not fix a bug, so it's left as-is.
-CREATE TABLE IF NOT EXISTS _edges_source (
-    chunk_id    TEXT NOT NULL,
-    source_id   TEXT NOT NULL,
-    PRIMARY KEY (chunk_id)
-);
-CREATE INDEX IF NOT EXISTS idx_es_source ON _edges_source(source_id);
-
-CREATE TABLE IF NOT EXISTS _edges_tree (
-    id          TEXT NOT NULL,
-    parent_id   TEXT,
-    branch_at   TEXT,
-    relation    TEXT NOT NULL,
-    depth       INTEGER DEFAULT 0,
-    PRIMARY KEY (id, parent_id)
-);
-CREATE INDEX IF NOT EXISTS idx_tree_parent   ON _edges_tree(parent_id);
-CREATE INDEX IF NOT EXISTS idx_tree_relation ON _edges_tree(relation);
-
+_SDK_EXTENSION_SCHEMA = """\
 CREATE TABLE IF NOT EXISTS _enrich_source_graph (
     source_id       TEXT PRIMARY KEY,
     centrality      REAL DEFAULT 0,
@@ -120,37 +81,6 @@ CREATE TABLE IF NOT EXISTS _enrich_source_graph (
     is_hub          INTEGER DEFAULT 0,
     is_bridge       INTEGER DEFAULT 0
 );
-
-CREATE TABLE IF NOT EXISTS _meta (
-    key   TEXT PRIMARY KEY,
-    value TEXT
-);
-
-CREATE TABLE IF NOT EXISTS _presets (
-    name        TEXT PRIMARY KEY,
-    description TEXT,
-    params      TEXT DEFAULT '',
-    sql         TEXT,
-    source      TEXT              -- provenance: 'stock' | 'cell' (.flexpresets.json); NULL→'stock' via @orient COALESCE
-);
-
-CREATE VIRTUAL TABLE IF NOT EXISTS chunks_fts USING fts5(
-    content,
-    content='_raw_chunks',
-    content_rowid='rowid'
-);
-
--- FTS sync triggers (match production cells)
-CREATE TRIGGER IF NOT EXISTS raw_chunks_ai AFTER INSERT ON _raw_chunks BEGIN
-    INSERT INTO chunks_fts(rowid, content) VALUES (NEW.rowid, NEW.content);
-END;
-CREATE TRIGGER IF NOT EXISTS raw_chunks_ad AFTER DELETE ON _raw_chunks BEGIN
-    INSERT INTO chunks_fts(chunks_fts, rowid, content) VALUES('delete', OLD.rowid, OLD.content);
-END;
-CREATE TRIGGER IF NOT EXISTS raw_chunks_au AFTER UPDATE ON _raw_chunks BEGIN
-    INSERT INTO chunks_fts(chunks_fts, rowid, content) VALUES('delete', OLD.rowid, OLD.content);
-    INSERT INTO chunks_fts(rowid, content) VALUES (NEW.rowid, NEW.content);
-END;
 """
 
 
@@ -285,10 +215,13 @@ def create(
             db_path = CELLS_DIR / f"{uuid.uuid4()}.db"
 
     db = open_cell(str(db_path))
-    db.executescript(_BASE_SCHEMA)
+    install_envelope(db)
+    db.executescript(_SDK_EXTENSION_SCHEMA)
 
     if schema:
         db.executescript(schema)
+
+    regenerate_envelope_views(db)
 
     set_meta(db, 'description', description)
     set_meta(db, 'cell_type', cell_type or name)
@@ -395,24 +328,56 @@ def ingest(
 def link(
     db: sqlite3.Connection,
     child_id: str,
-    parent_id: str,
+    parent_id: Optional[str],
     relation: str = 'reply',
     depth: int = 0,
     branch_at: Optional[str] = None,
+    position: Optional[int] = None,
 ) -> None:
-    """Link a child to a parent in _edges_tree.
+    """Place one navigational occurrence in an ``_edges_tree`` projection.
+
+    Each emitted occurrence has at most one parent row, even when a provider
+    uses several structural relation kinds in one tree. A thing that appears
+    more than once must therefore use distinct occurrence/alias IDs; referent
+    identity belongs outside this structural edge table.
 
     Args:
         child_id: The child chunk or source ID.
-        parent_id: The parent chunk or source ID.
+        parent_id: The parent occurrence ID, or ``None`` for an explicit root.
         relation: Relationship type ('reply', 'spawn', 'fork', 'subsection').
-        depth: Distance from root.
+        depth: Cached distance from root.
         branch_at: Chunk where branching occurred (optional).
+        position: Stable sibling order when the provider has one (optional).
     """
+    ensure_tree(db)
+    if not child_id or not child_id.strip():
+        raise ValueError("tree occurrence id must not be blank")
+    if not relation or not relation.strip():
+        raise ValueError("tree relation must not be blank")
+    if parent_id == child_id:
+        raise ValueError(f"tree occurrence cannot parent itself: {child_id}")
+    if type(depth) is not int or depth < 0:
+        raise ValueError(f"tree depth must be a non-negative integer: {depth!r}")
+    if position is not None and (type(position) is not int or position < 0):
+        raise ValueError(
+            f"tree position must be a non-negative integer or None: {position!r}"
+        )
+
+    existing = db.execute(
+        "SELECT parent_id,relation FROM _edges_tree WHERE id=?",
+        (child_id,),
+    ).fetchall()
+    if any(row[0] != parent_id or row[1] != relation for row in existing):
+        raise ValueError(
+            f"tree occurrence already has a structural edge: {child_id}"
+        )
+    if existing:
+        return
     db.execute(
-        "INSERT OR IGNORE INTO _edges_tree (id, parent_id, branch_at, relation, depth) "
-        "VALUES (?, ?, ?, ?, ?)",
-        (child_id, parent_id, branch_at, relation, depth)
+        "INSERT INTO _edges_tree "
+        "(id, parent_id, branch_at, relation, depth, position) "
+        "VALUES (?, ?, ?, ?, ?, ?)",
+        (child_id, parent_id, branch_at, relation, depth, position)
     )
 
 
@@ -496,7 +461,7 @@ def register(
     """Register cell: validate, generate views, install presets, activate for MCP.
 
     This is the last call. After register(), the cell is queryable via MCP
-    and flex core search.
+    and flex search.
 
     Args:
         db: Cell connection from create().
@@ -535,20 +500,17 @@ def register(
         install_views(db, views_dir)
     regenerate_views(db)
 
-    # Presets
+    # Compile default SQL programs into the cell. The resulting relation is
+    # the runtime authority and can subsequently be edited with ordinary SQL.
     _GENERAL_PRESETS = Path(__file__).resolve().parent / "retrieve" / "presets" / "general"
     all_preset_dirs = [_GENERAL_PRESETS]
     if presets_dirs:
         all_preset_dirs.extend(presets_dirs)
 
     from flex.retrieve.presets import install_presets
-    db.execute("""CREATE TABLE IF NOT EXISTS _presets (
-        name TEXT PRIMARY KEY, description TEXT,
-        params TEXT DEFAULT '', sql TEXT, source TEXT
-    )""")
-    for pd in all_preset_dirs:
-        if pd.exists():
-            install_presets(db, pd)
+    for directory in all_preset_dirs:
+        if Path(directory).exists():
+            install_presets(db, Path(directory), commit=False, record_operation=False)
 
     # Meta
     if description:
@@ -594,14 +556,22 @@ def _make_chunk_id(source_id: str, position: int, content: str) -> str:
 
 def _register_extra_commands(sub):
     import sys
-    idx_p = sub.add_parser("index", help="Index a folder into a cell")
-    idx_p.add_argument("path", help="Path to folder")
-    idx_p.add_argument("--name", default=None)
-    idx_p.add_argument("--description", default=None)
-    idx_p.add_argument("--exclude", action="append", default=[],
-                       help="Exclude patterns (repeatable)")
+    compile_p = sub.add_parser(
+        "compile",
+        help="Compile a folder into a Flex cell",
+        description=(
+            "Compile source material into a searchable Flex cell. "
+            "This creates the cell substrate; @index is the separate "
+            "navigational surface exposed by cells that provide one."
+        ),
+    )
+    compile_p.add_argument("path", help="Path to folder")
+    compile_p.add_argument("--name", default=None)
+    compile_p.add_argument("--description", default=None)
+    compile_p.add_argument("--exclude", action="append", default=[],
+                           help="Exclude patterns (repeatable)")
 
-    def cmd_index(args):
+    def cmd_compile(args):
         from pathlib import Path
         path = Path(args.path).resolve()
         if not path.exists():
@@ -628,9 +598,9 @@ def _register_extra_commands(sub):
         sources = db.execute("SELECT COUNT(*) FROM _raw_sources").fetchone()[0]
         db.close()
         print(f"  {chunks} chunks from {sources} sources")
-        print(f"  Query: flex core search --cell {name} \"@orient\"")
+        print(f"  Query: flex search --cell {name} \"@orient\"")
 
-    idx_p.set_defaults(func=cmd_index)
+    compile_p.set_defaults(func=cmd_compile)
 
 
 try:

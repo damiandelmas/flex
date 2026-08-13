@@ -83,6 +83,12 @@ def _ensure_codex_tables(conn: sqlite3.Connection) -> None:
     ensure_codex_tables(conn)
 
 
+def _backfill_exec_wrappers(conn: sqlite3.Connection) -> int:
+    from flex.modules.codex.compile.worker import backfill_exec_command_wrappers
+
+    return backfill_exec_command_wrappers(conn)
+
+
 def _transpile_source(source: CodexSource, conn: sqlite3.Connection, meta: dict) -> dict:
     from flex.modules.codex.compile.worker import transpile
 
@@ -115,11 +121,21 @@ def refresh(cell_path: str, graph: bool = False, dry_run: bool = False) -> dict:
     if not dry_run:
         conn.execute("PRAGMA journal_mode=WAL")
     try:
+        repaired = 0
+        if not dry_run:
+            # Run before the source-signature short circuit: this is a
+            # versioned cell migration, not source drift.
+            _ensure_codex_tables(conn)
+            repaired = _backfill_exec_wrappers(conn)
+
         primary_source = _source_from_meta(conn)
         sources = resolve_sources(conn)
 
         if not sources:
-            return {"chunks": 0, "sources": 0, "skipped": "source missing"}
+            result = {"chunks": 0, "sources": 0, "skipped": "source missing"}
+            if repaired:
+                result["repaired"] = repaired
+            return result
 
         signature = combined_signature(sources)
         last_signature = _last_signature(conn)
@@ -134,9 +150,11 @@ def refresh(cell_path: str, graph: bool = False, dry_run: bool = False) -> dict:
             }
 
         if not needs_resync and not graph:
-            return {"chunks": 0, "sources": 0, "skipped": "signature unchanged"}
+            result = {"chunks": 0, "sources": 0, "skipped": "signature unchanged"}
+            if repaired:
+                result["repaired"] = repaired
+            return result
 
-        _ensure_codex_tables(conn)
         ok_sources = [source for source in sources if source.usable]
         conn.execute("DELETE FROM _types_codex_source")
 
@@ -159,12 +177,15 @@ def refresh(cell_path: str, graph: bool = False, dry_run: bool = False) -> dict:
         if total_chunks > 0 or graph:
             _embed_and_enrich(conn)
 
-        return {
+        result = {
             "sources": len(ok_sources),
             "sessions": total_sessions,
             "chunks": total_chunks,
             "source_candidates": len(sources),
             "skipped_sources": len(sources) - len(ok_sources),
         }
+        if repaired:
+            result["repaired"] = repaired
+        return result
     finally:
         conn.close()

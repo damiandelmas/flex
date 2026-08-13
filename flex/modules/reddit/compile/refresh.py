@@ -37,9 +37,119 @@ from flex.modules.reddit.compile.worker import (
 GRAPH_REFRESH_THRESHOLD = 20  # rebuild graph if >= N new sources
 
 
+class RedditRefreshError(RuntimeError):
+    """A refresh unit was incomplete and must be replayed on its next turn."""
+
+
+def _json_object(value: str | None) -> dict:
+    """Read legacy metadata defensively (old cells may contain NULL/invalid JSON)."""
+    try:
+        parsed = json.loads(value or '{}')
+    except (TypeError, ValueError, json.JSONDecodeError):
+        return {}
+    return parsed if isinstance(parsed, dict) else {}
+
+
+def _json_list(value: str | None) -> list[str]:
+    try:
+        parsed = json.loads(value or '[]')
+    except (TypeError, ValueError, json.JSONDecodeError):
+        return []
+    return [str(item) for item in parsed if item]
+
+
+
+def _as_timestamp(value: object) -> int:
+    try:
+        return max(0, int(value or 0))
+    except (TypeError, ValueError):
+        return 0
+
+
+def _cursor_for(current: dict, legacy: dict, unit: str, fallback: int) -> int:
+    """Prefer the split feed cursor; seed old cells without a global leap."""
+    if unit in current:
+        return _as_timestamp(current[unit])
+    if unit in legacy:
+        return _as_timestamp(legacy[unit])
+    return fallback
+
+
+def _configured_units(subreddits: list[str], authors: list[str]) -> list[tuple[str, str]]:
+    """Return stable, de-duplicated configured work units in round-robin order."""
+    units: list[tuple[str, str]] = []
+    seen: set[tuple[str, str]] = set()
+    for kind, names in (('subreddit', subreddits), ('author', authors)):
+        for name in names:
+            unit = (kind, name)
+            if name and unit not in seen:
+                seen.add(unit)
+                units.append(unit)
+    return units
+
+
+def _unit_token(unit: tuple[str, str]) -> str:
+    return f'{unit[0]}:{unit[1]}'
+
+
+def _select_scheduled_unit(db, units: list[tuple[str, str]]) -> tuple[tuple[str, str], int]:
+    """Select exactly one durable round-robin unit, recovering NULL/stale state."""
+    wanted = get_meta(db, 'reddit_refresh_next_unit')
+    tokens = [_unit_token(unit) for unit in units]
+    index = tokens.index(wanted) if wanted in tokens else 0
+    return units[index], index
+
+
+def _parent_ids(comments: list[dict], posts: list[dict]) -> set[str]:
+    post_ids = {str(post.get('id') or '') for post in posts}
+    needed = set()
+    for comment in comments:
+        link_id = str(comment.get('link_id') or '')
+        parent_id = link_id[3:] if link_id.startswith('t3_') else link_id
+        if not parent_id:
+            raise RedditRefreshError(
+                f"comment {comment.get('id', '<unknown>')} has no link_id"
+            )
+        if parent_id not in post_ids:
+            needed.add(parent_id)
+    return needed
+
+
+def _backfill_parent_posts(posts: list[dict], comments: list[dict]) -> list[dict]:
+    """Fetch every missing comment parent before a comment feed can advance."""
+    needed = _parent_ids(comments, posts)
+    if not needed:
+        return posts
+    parent_posts = pull_posts_by_ids(sorted(needed))
+    found = {str(post.get('id') or '') for post in parent_posts}
+    missing = needed - found
+    if missing:
+        raise RedditRefreshError(
+            "comment parent backfill incomplete: " + ', '.join(sorted(missing))
+        )
+    return posts + parent_posts
+
+
+def _ingest(db, posts: list[dict], comments: list[dict], subreddit: str) -> tuple[int, int]:
+    """Ingest a complete thread delta; comments are never grouped without parents."""
+    if not posts and not comments:
+        return 0, 0
+    complete_posts = _backfill_parent_posts(posts, comments) if comments else posts
+    return ingest(group_into_threads(complete_posts, comments), db, subreddit)
+
+
+def _set_meta_many(db, values: dict[str, str]) -> None:
+    """Persist all cursor/round-robin metadata in one final transaction."""
+    for key, value in values.items():
+        db.execute(
+            "INSERT OR REPLACE INTO _meta (key, value) VALUES (?, ?)",
+            (key, value),
+        )
+
+
 def refresh(cell_path: str, subreddits: list[str] | None = None,
             graph: bool = False, dry_run: bool = False,
-            since_days: int | None = None) -> dict:
+            since_days: int | None = None, scheduled: bool = False) -> dict:
     """Pull new data and ingest into existing reddit cell.
 
     Args:
@@ -57,191 +167,128 @@ def refresh(cell_path: str, subreddits: list[str] | None = None,
     ensure_scope_defaults(db)
     db.commit()
 
-    # Per-sub cursors: each subreddit tracks its own high-water mark
-    # so a failure on one doesn't re-pull or block others.
-    sub_cursors = json.loads(get_meta(db, 'sub_cursors') or '{}')
+    # `sub_cursors` / `author_cursors` are the safe legacy seed only.  The
+    # split maps below become authoritative per posts/comments feed and never
+    # borrow a MAX timestamp from another configured unit.
+    legacy_sub_cursors = _json_object(get_meta(db, 'sub_cursors'))
+    legacy_author_cursors = _json_object(get_meta(db, 'author_cursors'))
+    sub_post_cursors = _json_object(get_meta(db, 'sub_post_cursors'))
+    sub_comment_cursors = _json_object(get_meta(db, 'sub_comment_cursors'))
+    author_post_cursors = _json_object(get_meta(db, 'author_post_cursors'))
+    author_comment_cursors = _json_object(get_meta(db, 'author_comment_cursors'))
 
-    # Read cursor (--since overrides stored cursor)
-    if since_days is not None:
-        last_pull_ts = int(time.time()) - (since_days * 86400)
-    else:
-        last_pull_ts = int(get_meta(db, 'last_pull_ts') or '0')
-    stored_subs = json.loads(get_meta(db, 'subreddits') or '[]')
+    fallback_cursor = (
+        int(time.time()) - (since_days * 86400)
+        if since_days is not None else _as_timestamp(get_meta(db, 'last_pull_ts'))
+    )
+    stored_subs = _json_list(get_meta(db, 'subreddits'))
+    authors = _json_list(get_meta(db, 'authors'))
+    requested_subs = [str(sub) for sub in (subreddits or stored_subs) if sub]
+    # Scheduled refreshes are deliberately constrained to configured scope,
+    # rather than an ad-hoc call argument or previously ingested rows.
+    configured_subs = stored_subs if scheduled else requested_subs
+    units = _configured_units(configured_subs, authors)
 
-    if not subreddits:
-        subreddits = stored_subs
-
-    if not subreddits:
-        print("No subreddits configured. Pass --subreddits or ingest first.")
+    if not units:
+        print("No Reddit work units configured. Pass --subreddits or configure the cell.")
         db.close()
-        return {'error': 'no_subreddits'}
+        return {'error': 'no_work_units', 'refresh_pending': 0}
 
-    after_dt = datetime.fromtimestamp(last_pull_ts, tz=timezone.utc) if last_pull_ts else None
+    selected_index = None
+    if scheduled:
+        selected_unit, selected_index = _select_scheduled_unit(db, units)
+        units_to_run = [selected_unit]
+    else:
+        units_to_run = units
+
     print(f"Cell: {cell_path}")
-    print(f"Subreddits: {', '.join(f'r/{s}' for s in subreddits)}")
-    print(f"Last pull: {after_dt.isoformat() if after_dt else 'never'}")
-    print(f"Pulling posts/comments after timestamp {last_pull_ts}")
+    print(f"Work units: {', '.join(_unit_token(unit) for unit in units_to_run)}")
+    print(f"Legacy cursor seed: {fallback_cursor or 'never'}")
     print()
 
     if dry_run:
-        # Quick count check per subreddit
         from flex.modules.reddit.compile.arctic_shift import api_fetch
-        for sub in subreddits:
-            params = {"subreddit": sub, "limit": 1, "sort": "desc"}
-            if last_pull_ts:
-                params["after"] = last_pull_ts
+        for kind, name in units_to_run:
+            params = {kind: name, "limit": 1, "sort": "desc"}
+            if kind == 'subreddit':
+                after = _cursor_for(sub_post_cursors, legacy_sub_cursors, name, fallback_cursor)
+            else:
+                after = _cursor_for(author_post_cursors, legacy_author_cursors, name, fallback_cursor)
+            if after:
+                params["after"] = after
             data = api_fetch("posts/search", params)
             results = data.get("data", [])
             latest = results[0].get("created_utc", 0) if results else 0
             if latest:
                 latest_dt = datetime.fromtimestamp(latest, tz=timezone.utc)
-                print(f"  r/{sub}: has new data up to {latest_dt.date()}")
+                print(f"  {kind}:{name}: has new data up to {latest_dt.date()}")
             else:
-                print(f"  r/{sub}: no new data")
+                print(f"  {kind}:{name}: no new data")
         db.close()
-        return {'dry_run': True}
+        return {'dry_run': True, 'refresh_pending': max(0, len(units) - 1) if scheduled else 0}
 
     total_posts = 0
     total_comments = 0
     total_sources = 0
     total_chunks = 0
 
-    for sub in subreddits:
-        print(f"{'=' * 50}")
-        print(f"r/{sub}")
-        print(f"{'=' * 50}")
-
-        # Per-sub cursor: use sub-specific cursor if available,
-        # fall back to global last_pull_ts
-        if since_days is not None:
-            sub_after = last_pull_ts  # explicit --since always wins
-        else:
-            sub_after = sub_cursors.get(sub, last_pull_ts)
-
-        # Pull new posts
-        print(f"Pulling posts (after={sub_after})...")
-        posts = pull_posts(sub, after=sub_after)
-        total_posts += len(posts)
-
-        # Pull new comments
-        print(f"Pulling comments (after={sub_after})...")
-        comments = pull_comments(sub, after=sub_after)
-        total_comments += len(comments)
-
-        if not posts and not comments:
-            print("  No new data.")
-            continue
-
-        # Group and ingest
-        threads = group_into_threads(posts, comments)
-        sources, chunks = ingest(threads, db, sub)
-        total_sources += sources
-        total_chunks += chunks
-        print(f"  Ingested: {sources} sources, {chunks} chunks")
-
-        # Update per-sub cursor to max timestamp seen
-        all_items = posts + comments
-        if all_items:
-            max_item_ts = max(
-                item.get('created_utc', 0) for item in all_items)
-            sub_cursors[sub] = max(
-                sub_cursors.get(sub, 0), max_item_ts)
-            set_meta(db, 'sub_cursors', json.dumps(sub_cursors))
-            db.commit()
-
-    # ═════════════════════════════════════════════════════
-    # Author self-pull — our own authored output across subs
-    # ═════════════════════════════════════════════════════
-    authors = json.loads(get_meta(db, 'authors') or '[]')
-    author_cursors = json.loads(get_meta(db, 'author_cursors') or '{}')
     total_author_posts = 0
     total_author_comments = 0
-    total_author_sources = 0
-    total_author_chunks = 0
-
-    for author in authors:
-        print(f"{'=' * 50}")
-        print(f"author: u/{author}")
-        print(f"{'=' * 50}")
-
-        if since_days is not None:
-            author_after = last_pull_ts
+    for kind, name in units_to_run:
+        print(f"{'=' * 50}\n{kind}: {name}\n{'=' * 50}")
+        if kind == 'subreddit':
+            post_after = fallback_cursor if since_days is not None else _cursor_for(
+                sub_post_cursors, legacy_sub_cursors, name, fallback_cursor)
+            comment_after = fallback_cursor if since_days is not None else _cursor_for(
+                sub_comment_cursors, legacy_sub_cursors, name, fallback_cursor)
+            posts = pull_posts(name, after=post_after)
+            comments = pull_comments(name, after=comment_after)
+            total_posts += len(posts)
+            total_comments += len(comments)
+            sources, chunks = _ingest(db, posts, comments, name)
+            total_sources += sources
+            total_chunks += chunks
+            if posts:
+                sub_post_cursors[name] = max(post_after, max(_as_timestamp(p.get('created_utc')) for p in posts))
+            if comments:
+                sub_comment_cursors[name] = max(comment_after, max(_as_timestamp(c.get('created_utc')) for c in comments))
         else:
-            author_after = author_cursors.get(author, last_pull_ts)
-
-        print(f"Pulling posts by u/{author} (after={author_after})...")
-        a_posts = pull_posts_by_author(author, after=author_after)
-        total_author_posts += len(a_posts)
-
-        print(f"Pulling comments by u/{author} (after={author_after})...")
-        a_comments = pull_comments_by_author(author, after=author_after)
-        total_author_comments += len(a_comments)
-
-        if not a_posts and not a_comments:
-            print("  No new author data.")
-            continue
-
-        # Backfill parent posts for orphan comments (comments whose link_id
-        # isn't in the author's own posts). Without this, group_into_threads
-        # drops orphan comments on the floor.
-        have_post_ids = {p.get('id') for p in a_posts}
-        orphan_parent_ids = set()
-        for c in a_comments:
-            link_id = c.get('link_id', '')
-            pid = link_id[3:] if link_id.startswith('t3_') else link_id
-            if pid and pid not in have_post_ids:
-                orphan_parent_ids.add(pid)
-
-        if orphan_parent_ids:
-            print(f"  Backfilling {len(orphan_parent_ids)} parent posts...")
-            parent_posts = pull_posts_by_ids(list(orphan_parent_ids))
-            a_posts = a_posts + parent_posts
-
-        # Group author content by subreddit — ingest() is per-sub
-        by_sub: dict[str, tuple[list, list]] = defaultdict(lambda: ([], []))
-        for p in a_posts:
-            by_sub[p.get('subreddit', '')][0].append(p)
-        for c in a_comments:
-            by_sub[c.get('subreddit', '')][1].append(c)
-
-        for sub, (ps, cs) in by_sub.items():
-            if not sub:
-                continue
-            threads = group_into_threads(ps, cs)
-            sources, chunks = ingest(threads, db, sub)
-            total_author_sources += sources
-            total_author_chunks += chunks
-            print(f"  r/{sub}: {sources} sources, {chunks} chunks")
-
-        # Advance author cursor to max ts seen
-        all_items = a_posts + a_comments
-        if all_items:
-            max_item_ts = max(i.get('created_utc', 0) for i in all_items)
-            author_cursors[author] = max(
-                author_cursors.get(author, 0), max_item_ts)
-            set_meta(db, 'author_cursors', json.dumps(author_cursors))
-            db.commit()
-
-    total_sources += total_author_sources
-    total_chunks += total_author_chunks
-
-    if total_chunks == 0:
-        print("\nNo new data to embed.")
-        db.close()
-        return {'posts': total_posts, 'comments': total_comments,
-                'author_posts': total_author_posts,
-                'author_comments': total_author_comments,
-                'sources': 0, 'chunks': 0}
+            post_after = fallback_cursor if since_days is not None else _cursor_for(
+                author_post_cursors, legacy_author_cursors, name, fallback_cursor)
+            comment_after = fallback_cursor if since_days is not None else _cursor_for(
+                author_comment_cursors, legacy_author_cursors, name, fallback_cursor)
+            posts = pull_posts_by_author(name, after=post_after)
+            comments = pull_comments_by_author(name, after=comment_after)
+            total_author_posts += len(posts)
+            total_author_comments += len(comments)
+            complete_posts = _backfill_parent_posts(posts, comments) if comments else posts
+            by_sub: dict[str, tuple[list, list]] = defaultdict(lambda: ([], []))
+            for post in complete_posts:
+                by_sub[str(post.get('subreddit') or '')][0].append(post)
+            for comment in comments:
+                by_sub[str(comment.get('subreddit') or '')][1].append(comment)
+            for sub, (sub_posts, sub_comments) in by_sub.items():
+                if not sub:
+                    raise RedditRefreshError(f"author unit {name} returned content without subreddit")
+                sources, chunks = ingest(group_into_threads(sub_posts, sub_comments), db, sub)
+                total_sources += sources
+                total_chunks += chunks
+            if posts:
+                author_post_cursors[name] = max(post_after, max(_as_timestamp(p.get('created_utc')) for p in posts))
+            if comments:
+                author_comment_cursors[name] = max(comment_after, max(_as_timestamp(c.get('created_utc')) for c in comments))
 
     # Embed new chunks
-    print(f"\nEmbedding {total_chunks} new chunks...")
-    embedded = embed_new(db)
-    print(f"Embedded: {embedded}")
+    embedded = 0
+    if total_chunks:
+        print(f"\nEmbedding {total_chunks} new chunks...")
+        embedded = embed_new(db)
+        print(f"Embedded: {embedded}")
 
     # Graph refresh (subprocess to avoid engine import coupling).
     # Honors scope.graph.* from _meta so the graph ignores low-signal sources
     # without dropping them from _raw_sources. Lever stays tunable.
-    if graph or total_sources >= GRAPH_REFRESH_THRESHOLD:
+    if graph or (not scheduled and total_sources >= GRAPH_REFRESH_THRESHOLD):
         import subprocess
         graph_where = build_graph_where(db)
         print(f"Rebuilding similarity graph (where: {graph_where or 'none'})...")
@@ -249,18 +296,6 @@ def refresh(cell_path: str, subreddits: list[str] | None = None,
         if graph_where:
             cmd += ['--where', graph_where]
         subprocess.run(cmd, check=True)
-
-    # Update cursor
-    max_ts = db.execute("SELECT MAX(timestamp) FROM _raw_chunks").fetchone()[0] or 0
-    set_meta(db, 'last_pull_ts', str(max_ts))
-    set_meta(db, 'last_pull_at', datetime.now(timezone.utc).isoformat())
-
-    # Update subreddits list
-    existing = db.execute(
-        "SELECT DISTINCT subreddit FROM _raw_sources"
-    ).fetchall()
-    all_subs = sorted({r[0] for r in existing if r[0]})
-    set_meta(db, 'subreddits', json.dumps(all_subs))
 
     # Regenerate views
     from flex.views import regenerate_views, install_views
@@ -271,14 +306,27 @@ def refresh(cell_path: str, subreddits: list[str] | None = None,
 
     # Log
     log_op(db, 'reddit_refresh', '_raw_chunks',
-           params={'subreddits': subreddits, 'authors': authors,
+           params={'subreddits': requested_subs, 'authors': authors,
                    'sources': total_sources,
                    'chunks': total_chunks, 'embedded': embedded,
                    'author_posts': total_author_posts,
                    'author_comments': total_author_comments,
-                   'after_ts': last_pull_ts},
+                   'scheduled': scheduled},
            rows_affected=total_chunks,
            source='reddit/compile/refresh.py')
+    pending = max(0, len(units) - 1) if scheduled else 0
+    metadata = {
+        'sub_post_cursors': json.dumps(sub_post_cursors, sort_keys=True),
+        'sub_comment_cursors': json.dumps(sub_comment_cursors, sort_keys=True),
+        'author_post_cursors': json.dumps(author_post_cursors, sort_keys=True),
+        'author_comment_cursors': json.dumps(author_comment_cursors, sort_keys=True),
+        'last_pull_at': datetime.now(timezone.utc).isoformat(),
+    }
+    if scheduled and selected_index is not None:
+        metadata['reddit_refresh_next_unit'] = _unit_token(
+            units[(selected_index + 1) % len(units)]
+        )
+    _set_meta_many(db, metadata)
     db.commit()
 
     stats = {
@@ -289,6 +337,7 @@ def refresh(cell_path: str, subreddits: list[str] | None = None,
         'sources': total_sources,
         'chunks': total_chunks,
         'embedded': embedded,
+        'refresh_pending': pending,
     }
 
     print(f"\nRefresh complete: {total_sources} sources, {total_chunks} chunks, "

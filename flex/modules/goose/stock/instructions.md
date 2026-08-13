@@ -192,9 +192,14 @@ Useful presets:
 
 ## Refresh Model
 
-Goose is a `watch` lifecycle cell. Refresh compares the current source
-database byte size against the last recorded size and skips unchanged
-databases. Use a copied database or fixture when validating public installs.
+Goose is a `watch` lifecycle cell. Source events from `sessions.db` and its WAL
+sidecar trigger structural sync. The missed-event floor compares a WAL-aware
+signature of main-database and WAL size/mtime state against the last published
+signature; main database byte size alone is only compatibility metadata.
+Structural rows and FTS commit before embeddings, and NULL embeddings converge
+as separately observable semantic debt. This ordering avoids model work on the
+capture path but does not promise literal zero latency. Use a copied database
+or fixture when validating public installs.
 
 ## Methodology
 

@@ -72,7 +72,7 @@ def _detect_vault() -> list[Path]:
 def run(args, console) -> None:
     """Install obsidian module: detect vault → compile → services → MCP."""
     from flex.cli import _install_claude_assets
-    _install_claude_assets(("flex:markdown",))
+    _install_claude_assets(("flex",))
     from rich.panel import Panel
     from rich.text import Text
 
@@ -150,13 +150,13 @@ def run(args, console) -> None:
     panel_content.append(f"{cell_name}\n", style="green")
     panel_content.append("MCP Server            ", style="")
     panel_content.append("http://localhost:7134/mcp\n\n", style="green")
-    panel_content.append("  flex core search --cell ", style="bold")
+    panel_content.append("  flex search --cell ", style="bold")
     panel_content.append(f"{cell_name} ", style="bold green")
     panel_content.append('"@orient"\n', style="bold")
-    panel_content.append("  flex core search --cell ", style="bold")
+    panel_content.append("  flex search --cell ", style="bold")
     panel_content.append(f"{cell_name} ", style="bold green")
     panel_content.append('"@hubs"\n', style="bold")
-    panel_content.append("  flex core search --cell ", style="bold")
+    panel_content.append("  flex search --cell ", style="bold")
     panel_content.append(f"{cell_name} ", style="bold green")
     panel_content.append('"@ghost-notes"\n', style="bold")
     console.print(Panel(panel_content, padding=(1, 2), highlight=False))

@@ -56,6 +56,6 @@ ORDER BY root;
 
 -- @query: method
 -- Pointer, not pedagogy: the query METHOD lives in the skill; this orient is the live contract.
-SELECT 'flex:instant' AS skill, 'scopes (:teams/:runway/path), the file_uuid session hinge, recipes, limits' AS owns
+SELECT 'flex:instant' AS skill, 'scopes, the file_uuid session hinge, recipes, limits' AS owns
 UNION ALL
 SELECT 'flex:code', 'code cells only (--code): @callers/@callees/@impact/@subtree, call/import graph';

@@ -12,6 +12,7 @@ Auto graph refresh when staleness threshold (20 sources) exceeded.
 """
 
 import hashlib
+import json
 import os
 import sqlite3
 import sys
@@ -68,6 +69,238 @@ def _walk_md(root: Path, exclude_dirs=None):
         for fn in filenames:
             if fn.endswith('.md'):
                 yield Path(dirpath) / fn
+
+
+_DISCOVERY_CANDIDATES = '_docpac_discovery_candidates'
+_DISCOVERY_SEEN = '_docpac_discovery_seen'
+
+
+def _ensure_discovery_store(conn: sqlite3.Connection) -> None:
+    """Cell-local durable handoff between a bounded walk and the file drain.
+
+    Discovery is deliberately separate from reconciliation.  A deadline can
+    interrupt the former at any directory entry, in which case the rows here
+    are the work already found and ``_meta`` carries the next directory entry.
+    We must never treat that prefix as a complete filesystem view.
+    """
+    conn.execute(
+        f"CREATE TABLE IF NOT EXISTS {_DISCOVERY_CANDIDATES} ("
+        "lane TEXT NOT NULL, candidate_key TEXT NOT NULL, payload TEXT NOT NULL, "
+        "PRIMARY KEY (lane, candidate_key))"
+    )
+    conn.execute(
+        f"CREATE TABLE IF NOT EXISTS {_DISCOVERY_SEEN} ("
+        "lane TEXT NOT NULL, source_id TEXT NOT NULL, "
+        "PRIMARY KEY (lane, source_id))"
+    )
+
+
+def _discovery_meta_key(lane: str) -> str:
+    return f'discovery_dirs:{lane}'
+
+
+def _resolved_under(path, root: Path) -> Path | None:
+    """Resolve ``path`` and return it only when it remains in ``root``."""
+    try:
+        resolved = Path(path).resolve()
+        resolved.relative_to(root)
+        return resolved
+    except (OSError, TypeError, ValueError):
+        return None
+
+
+def _reset_discovery_lane(conn: sqlite3.Connection, lane: str) -> None:
+    """Atomically discard a stale/corrupt lane before a fresh discovery."""
+    conn.execute("DELETE FROM _meta WHERE key=?", (_discovery_meta_key(lane),))
+    conn.execute(f"DELETE FROM {_DISCOVERY_CANDIDATES} WHERE lane=?", (lane,))
+    conn.execute(f"DELETE FROM {_DISCOVERY_SEEN} WHERE lane=?", (lane,))
+    conn.commit()
+
+
+def _valid_docpac_task(task, root: Path) -> bool:
+    return (
+        isinstance(task, dict)
+        and set(task) == {'path', 'after'}
+        and isinstance(task['after'], str)
+        and _resolved_under(task.get('path'), root) is not None
+    )
+
+
+def _load_discovery_dirs(conn: sqlite3.Connection, lane: str, root: Path,
+                         exclude_dirs: set | None = None,
+                         task_validator=_valid_docpac_task) -> tuple[list[dict], bool]:
+    """Load a trusted continuation or reset the lane to a fresh root task.
+
+    ``_meta`` is user-editable persisted state, not an authority.  The root and
+    exclusion fingerprint bind a continuation to exactly the corpus contract
+    that created it; malformed or outside-root tasks are discarded as a unit.
+    """
+    root = Path(root).resolve()
+    excludes = sorted(str(name) for name in (exclude_dirs or ()))
+    row = conn.execute(
+        "SELECT value FROM _meta WHERE key=?", (_discovery_meta_key(lane),)
+    ).fetchone()
+    if row:
+        try:
+            state = json.loads(row[0])
+            dirs = state.get('dirs') if isinstance(state, dict) else None
+            if (
+                state.get('root') == str(root)
+                and state.get('exclude_dirs') == excludes
+                and isinstance(dirs, list)
+                and all(task_validator(task, root) for task in dirs)
+            ):
+                return dirs, True
+        except (TypeError, ValueError, json.JSONDecodeError):
+            pass
+        _reset_discovery_lane(conn, lane)
+    return [{'path': str(root), 'after': ''}], False
+
+
+def _save_discovery_dirs(conn: sqlite3.Connection, lane: str, root: Path,
+                         dirs: list[dict], exclude_dirs: set | None = None) -> None:
+    key = _discovery_meta_key(lane)
+    if not dirs:
+        conn.execute("DELETE FROM _meta WHERE key=?", (key,))
+        return
+    conn.execute(
+        "INSERT OR REPLACE INTO _meta (key,value) VALUES (?,?)",
+        (key, json.dumps({
+            'root': str(Path(root).resolve()),
+            'exclude_dirs': sorted(str(name) for name in (exclude_dirs or ())),
+            'dirs': dirs,
+        }, separators=(',', ':'))),
+    )
+
+
+def _discover_docpac_candidates(conn: sqlite3.Connection, lane: str, root: Path,
+                                cell_name: str, size_cache: dict,
+                                exclude_dirs: set, deadline: float | None):
+    """Discover changed Markdown incrementally, returning (complete, seen_ids).
+
+    The queue is breadth-first and durable.  Retrying an interrupted directory
+    resumes after its last processed entry, so a short deadline cannot keep
+    selecting an alphabetic prefix forever.  Candidate payloads live in the
+    cell rather than a process-local list, which makes a daemon restart safe.
+    """
+    _ensure_discovery_store(conn)
+    root = Path(root).resolve()
+    dirs, resumed = _load_discovery_dirs(conn, lane, root, exclude_dirs)
+    if not resumed:
+        # This is a new full-pass snapshot.  A prior completed snapshot is no
+        # longer relevant; an interrupted one always has its queue meta row.
+        conn.execute(f"DELETE FROM {_DISCOVERY_SEEN} WHERE lane=?", (lane,))
+    seen_ids = set()
+    interrupted = False
+    prune = WALK_PRUNE_DIRS | set(exclude_dirs or ())
+
+    while dirs:
+        if deadline is not None and time.time() >= deadline:
+            interrupted = True
+            break
+        task = dirs.pop(0)
+        directory = Path(task['path'])
+        after = task.get('after', '')
+        try:
+            entries = sorted(os.scandir(directory), key=lambda entry: entry.name)
+        except OSError:
+            # A partial/unreadable view has no deletion authority.  Restarting
+            # this directory next tick is preferable to silently losing it.
+            dirs.insert(0, task)
+            interrupted = True
+            break
+
+        last_name = after
+        for entry in entries:
+            if entry.name <= after:
+                continue
+            if deadline is not None and time.time() >= deadline:
+                dirs.insert(0, {'path': str(directory), 'after': last_name})
+                interrupted = True
+                break
+            last_name = entry.name
+            try:
+                if entry.is_dir(follow_symlinks=False):
+                    if entry.name not in prune:
+                        dirs.append({'path': entry.path, 'after': ''})
+                    continue
+            except OSError:
+                interrupted = True
+                continue
+            if not entry.name.endswith('.md'):
+                continue
+            path_key = entry.path
+            source_id = make_source_id(path_key)
+            seen_ids.add(source_id)  # record before stat; a live stat failure is not deletion
+            conn.execute(
+                f"INSERT OR IGNORE INTO {_DISCOVERY_SEEN} (lane,source_id) VALUES (?,?)",
+                (lane, source_id),
+            )
+            try:
+                stat = entry.stat(follow_symlinks=False)
+            except OSError:
+                continue
+            signature = f"{stat.st_size}:{stat.st_mtime_ns}"
+            cache_key = f"docpac:{cell_name}:{path_key}"
+            cached = size_cache.get(cache_key, size_cache.get(path_key))
+            if cached in (signature, stat.st_size):
+                continue
+            conn.execute(
+                f"INSERT OR REPLACE INTO {_DISCOVERY_CANDIDATES} "
+                "(lane,candidate_key,payload) VALUES (?,?,?)",
+                (lane, path_key, json.dumps({
+                    'path': path_key, 'signature': signature, 'cache_key': cache_key,
+                }, separators=(',', ':'))),
+            )
+        if interrupted:
+            break
+
+    _save_discovery_dirs(conn, lane, root, dirs, exclude_dirs)
+    complete = not interrupted and not dirs
+    if complete:
+        seen_ids = {row[0] for row in conn.execute(
+            f"SELECT source_id FROM {_DISCOVERY_SEEN} WHERE lane=?", (lane,)
+        )}
+    return complete, seen_ids
+
+
+def _valid_docpac_candidate(candidate_key, payload, root: Path) -> bool:
+    return (
+        isinstance(payload, dict)
+        and set(payload) == {'path', 'signature', 'cache_key'}
+        and candidate_key == payload.get('path')
+        and isinstance(payload.get('signature'), str)
+        and isinstance(payload.get('cache_key'), str)
+        and _resolved_under(payload.get('path'), root) is not None
+    )
+
+
+def _pending_discovery_candidates(conn: sqlite3.Connection, lane: str,
+                                  root: Path, candidate_validator=_valid_docpac_candidate):
+    """Return only valid in-root persisted candidates, dropping the rest."""
+    rows = conn.execute(
+        f"SELECT candidate_key,payload FROM {_DISCOVERY_CANDIDATES} WHERE lane=?",
+        (lane,),
+    ).fetchall()
+    candidates = []
+    discarded = False
+    root = Path(root).resolve()
+    for key, serialized in rows:
+        try:
+            payload = json.loads(serialized)
+        except (TypeError, ValueError, json.JSONDecodeError):
+            payload = None
+        if not candidate_validator(key, payload, root):
+            conn.execute(
+                f"DELETE FROM {_DISCOVERY_CANDIDATES} WHERE lane=? AND candidate_key=?",
+                (lane, key),
+            )
+            discarded = True
+            continue
+        candidates.append((key, payload))
+    if discarded:
+        conn.commit()
+    return candidates
 
 
 def _cell_exclude_dirs(conn) -> set:
@@ -305,7 +538,7 @@ def cell_is_no_embed(conn: sqlite3.Connection) -> bool:
         return False
 
 
-# internal alias — existing call sites (index_file, _refresh_graph) keep the private name
+# Compatibility alias retained for existing call sites.
 _cell_is_no_embed = cell_is_no_embed
 
 
@@ -564,8 +797,7 @@ def register_context_dir(context_dir, name: str = None) -> str | None:
     from flex.registry import register_cell, list_cells, FLEX_HOME as _FH
     from flex.core import open_cell
     from flex.views import install_views, regenerate_views
-    from flex.retrieve.presets import install_presets
-    from flex.modules.docpac.compile.init import SCHEMA_DDL, FLEX_ROOT
+    from flex.modules.docpac.compile.init import SCHEMA_DDL
     import uuid as _uuid
 
     cdir = Path(context_dir).resolve()
@@ -587,12 +819,12 @@ def register_context_dir(context_dir, name: str = None) -> str | None:
     if prof.views_dir:
         install_views(db, prof.views_dir)
     regenerate_views(db, views={'sections': 'chunk', 'documents': 'source'})
-    install_presets(db, FLEX_ROOT / 'flex' / 'retrieve' / 'presets' / 'general')
-    for pd in prof.presets_dirs:
-        install_presets(db, pd)
-    # Phase B: cell-shipped presets survive regen — install AFTER stock (see init.py).
+    # Cell-authored .flexpresets.json remains a compatibility exception. Stock
+    # SQL resolves from files at query time.
     from flex.compile.flexpresets import install_flexpresets
     install_flexpresets(db, str(cdir), warn=lambda m: print(m, file=sys.stderr))
+    from flex.manage.install_presets import ensure_cell_presets
+    ensure_cell_presets(db, 'docpac', corpus_root=str(cdir))
     db.commit()
     db.close()
 
@@ -699,7 +931,7 @@ def _ensure_docpac_views(conn) -> bool:
     return True
 
 
-def scan_docpac_cells(embed_fn, size_cache: dict) -> dict:
+def scan_docpac_cells(embed_fn, size_cache: dict, deadline: float | None = None) -> dict:
     """Scan registered docpac corpora by stat signature, fairly bounded per tick.
 
     Mirror of claude_code scan_sessions() — Filebeat pattern.
@@ -708,11 +940,20 @@ def scan_docpac_cells(embed_fn, size_cache: dict) -> dict:
         embed_fn: ONNX encode callable (shared embedder).
         size_cache: Mutable dict {cache_key: ``size:mtime_ns``}. Persisted in memory
                     across ticks. Empty dict triggers full initial scan.
+        deadline: Wall-clock (time.time()) after which the per-file loop stops and
+                  returns. None = unbounded (the pre-0.52 behavior; still used by
+                  one-shot callers). The per-cell `limit` bounds file COUNT, which
+                  does not bound TIME because index_file embeds inline and per-file
+                  cost varies by orders of magnitude. The drain is serial within a
+                  tick, so an unbounded scan starves every phase behind it.
 
     Returns:
         dict with 'indexed' and 'skipped' counts.
     """
-    from flex.registry import list_cells, update_refresh_status
+    from flex.registry import (
+        list_cells, mark_refresh_committed, mark_refresh_failed,
+        mark_refresh_started,
+    )
 
     stats = {'indexed': 0, 'skipped': 0}
 
@@ -762,36 +1003,65 @@ def scan_docpac_cells(embed_fn, size_cache: dict) -> dict:
         # sections/documents views, and @orient then advertises view-backed queries
         # that error. Ensure them here, guarded on absence so the drain doesn't take
         # the write lock every ~2s tick (same discipline as the _edges_tree guard).
-        _ensure_docpac_views(conn)
+        try:
+            _ensure_docpac_views(conn)
+            from flex.manage.install_presets import ensure_cell_presets
+            contract_healed = ensure_cell_presets(
+                conn, "docpac", corpus_root=corpus,
+            )
+        except Exception as error:
+            conn.rollback()
+            mark_refresh_failed(cell_name, f"query contract: {error}", pending=1)
+            print(
+                f"[docpac] query contract failed on {cell_name}: {error}",
+                file=sys.stderr,
+            )
+            conn.close()
+            continue
 
         cell_indexed = 0
-        on_disk_sids = set()
-        candidates = []
         _exclude = _cell_exclude_dirs(conn)   # per-cell subtree exclusions from _meta
-        for md in _walk_md(corpus, exclude_dirs=_exclude):
-            path_key = str(md)
-            # Record the source_id BEFORE stat() so a transient stat failure on a
-            # live file can never make the reconcile-delete drop it.
-            on_disk_sids.add(make_source_id(path_key))
-            try:
-                stat = md.stat()
-            except (FileNotFoundError, OSError):
-                continue
-            signature = f"{stat.st_size}:{stat.st_mtime_ns}"
-            cache_key = f"docpac:{cell_name}:{path_key}"
-            cached = size_cache.get(cache_key, size_cache.get(path_key))
-            # Accept the legacy integer cache for one release so a rolling daemon
-            # upgrade does not needlessly re-index every document.
-            if cached in (signature, stat.st_size):
-                continue
-            candidates.append((path_key, (md, signature, cache_key)))
+        discovery_complete, on_disk_sids = _discover_docpac_candidates(
+            conn, 'docpac', corpus, cell_name, size_cache, _exclude, deadline,
+        )
+        if not discovery_complete:
+            stats['deadline_hit'] = stats.get('deadline_hit', 0) + 1
+        candidates = _pending_discovery_candidates(conn, 'docpac', corpus)
 
         from flex.watch import fair_batch
         limit = max(1, int(os.environ.get('FLEX_DRAIN_FILES_PER_CELL', '200')))
+        _cursor_row = conn.execute(
+            "SELECT value FROM _meta WHERE key='drain_cursor:docpac'"
+        ).fetchone()
         batch = fair_batch(conn, 'docpac', candidates, limit)
-        if batch:
-            conn.commit()  # cursor is a durable fairness receipt, even on failure
-        for path_key, (md, signature, cache_key) in batch:
+        # fair_batch's end cursor is only a proposal: a deadline can stop the
+        # batch before it is consumed.  Persist the last actually attempted key.
+        if _cursor_row:
+            conn.execute(
+                "INSERT OR REPLACE INTO _meta (key,value) VALUES (?,?)",
+                ('drain_cursor:docpac', _cursor_row[0]),
+            )
+        else:
+            conn.execute("DELETE FROM _meta WHERE key='drain_cursor:docpac'")
+        cursor_advanced = False
+        attempted = 0
+        cell_complete = discovery_complete and len(batch) >= len(candidates)
+        for path_key, payload in batch:
+            # A COUNT bound is not a TIME bound. `limit` caps files-per-cell, but
+            # index_file embeds inline and per-file cost varies ~100x (a 10-line
+            # note vs a 5000-line doc), so 200 files can be seconds or many minutes.
+            # This drain is serial inside a single tick, so an unbounded-in-time
+            # scan starves every phase after it — that is how a blocked tick froze
+            # every cell on this box for three days. Stop at the deadline; the
+            # fair_batch cursor is durable, so the remainder resumes next tick with
+            # no lost work and no starved cell.
+            if deadline is not None and time.time() >= deadline:
+                stats['deadline_hit'] = stats.get('deadline_hit', 0) + 1
+                cell_complete = False
+                break
+            md = Path(payload['path'])
+            signature = payload['signature']
+            cache_key = payload['cache_key']
             try:
                 if index_file(conn, path_key, embed_fn, corpus_root=corpus):
                     stats['indexed'] += 1
@@ -801,28 +1071,47 @@ def scan_docpac_cells(embed_fn, size_cache: dict) -> dict:
             except Exception as e:
                 print(f"[docpac] error on {md.name}: {e}", file=sys.stderr)
                 stats['skipped'] += 1
+                cell_complete = False
             else:
                 # A failed write remains a candidate on the next tick.
                 size_cache[cache_key] = signature
+                conn.execute(
+                    f"DELETE FROM {_DISCOVERY_CANDIDATES} WHERE lane=? AND candidate_key=?",
+                    ('docpac', path_key),
+                )
+                conn.execute(
+                    "INSERT OR REPLACE INTO _meta (key,value) VALUES (?,?)",
+                    ('drain_cursor:docpac', path_key),
+                )
+                cursor_advanced = True
+                attempted += 1
 
         # Reconciliation-delete: drop rows for files that vanished since a prior
         # pass (the walk only sees existing files, so deletes need this diff).
-        deleted = _reconcile_deleted_sources(conn, on_disk_sids)
+        # A deadline-truncated discovery is only a prefix, not deletion authority.
+        deleted = _reconcile_deleted_sources(conn, on_disk_sids) if cell_complete else 0
         stats['deleted'] = stats.get('deleted', 0) + deleted
 
-        if cell_indexed > 0 or deleted:
+        if (cell_indexed > 0 or deleted or contract_healed or cursor_advanced
+                or not cell_complete):
             conn.commit()
             log_op(conn, 'docpac_scan_index', '_raw_chunks',
                    params={'cell': cell_name, 'files': cell_indexed},
                    rows_affected=cell_indexed,
                    source='docpac/compile/worker.py')
-            # G3 observability: the incremental index_file drain path never
-            # stamped registry.last_refresh_at (only the refresh scheduler did),
-            # so continuously-fresh watch cells read `last_refresh=never`. Stamp
-            # it here so freshness is visible. Telemetry only — no cell content
-            # change. Best-effort: update_refresh_status swallows its own errors.
-            update_refresh_status(cell_name, 'ok')
-            conn.commit()
+        if cell_complete:
+            # A committed receipt means both the full filesystem discovery and
+            # every discovered candidate completed in this transaction.
+            mark_refresh_committed(cell_name)
+        else:
+            remaining = conn.execute(
+                f"SELECT COUNT(*) FROM {_DISCOVERY_CANDIDATES} WHERE lane=?",
+                ('docpac',),
+            ).fetchone()[0]
+            mark_refresh_started(
+                cell_name, pending=max(1, remaining),
+                reconciliation_required=True,
+            )
 
         conn.close()
 

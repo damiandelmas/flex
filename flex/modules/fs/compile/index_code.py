@@ -150,22 +150,50 @@ _CALLEES_SQL = (
     "AND (:file='*' OR cs.source_id=:file)"
 )
 
-# @impact symbol=X: transitive callers. Recursive CTE walks callee_name →
-# _symbols.def_id each hop (NOT a stored callee_id): from a symbol name, find its
-# def_ids, then any caller whose callee_name resolves to one of those defs, repeat.
+# @impact symbol=X: transitive callers. The first hop is always useful: it is the
+# conservative set of definitions that syntactically call X. A later hop is safe
+# only when the root and previous definition names both resolve uniquely. Stop at
+# an ambiguous root or boundary rather than laundering a candidate set into a
+# transitive edge.
+# UNION deduplicates the same node at the same depth before the next wave. The
+# explicit depth bound prevents cycles from regenerating states indefinitely;
+# `truncated` says whether any unseen caller remains beyond that bound.
 _IMPACT_SQL = (
     "WITH RECURSIVE resolution(name, candidate_count) AS ("
     "  SELECT name, COUNT(*) FROM _symbols GROUP BY name"
-    "), up(id) AS ("
-    "  SELECT e.caller_id FROM _edges_call e WHERE e.callee_name = :symbol "
+    "), roots(id) AS ("
+    "  SELECT def_id FROM _symbols WHERE name=:symbol"
+    "), up(id, depth) AS ("
+    "  SELECT DISTINCT e.caller_id, 1 "
+    "  FROM _edges_call e WHERE e.callee_name=:symbol "
+    "  AND CAST(:depth AS INTEGER)>0 "
+    "  AND e.caller_id NOT IN (SELECT id FROM roots) "
     "  UNION "
-    "  SELECT e.caller_id FROM _edges_call e "
-    "  JOIN _symbols s ON s.name = e.callee_name "
-    "  JOIN _types_instant t ON t.chunk_id = s.def_id "
-    "  JOIN up ON up.id = s.def_id"
+    "  SELECT e.caller_id, up.depth+1 "
+    "  FROM up "
+    "  JOIN resolution root ON root.name=:symbol AND root.candidate_count=1 "
+    "  JOIN _types_instant current ON current.chunk_id=up.id "
+    "  JOIN resolution safe ON safe.name=current.section_title "
+    "                           AND safe.candidate_count=1 "
+    "  JOIN _edges_call e ON e.callee_name=current.section_title "
+    "  WHERE up.depth < CAST(:depth AS INTEGER) "
+    "  AND e.caller_id NOT IN (SELECT id FROM roots)"
+    "), more(truncated) AS ("
+    "  SELECT EXISTS("
+    "    SELECT 1 FROM up frontier "
+    "    JOIN resolution root ON root.name=:symbol AND root.candidate_count=1 "
+    "    JOIN _types_instant current ON current.chunk_id=frontier.id "
+    "    JOIN resolution safe ON safe.name=current.section_title "
+    "                             AND safe.candidate_count=1 "
+    "    JOIN _edges_call e ON e.callee_name=current.section_title "
+    "    WHERE frontier.depth=CAST(:depth AS INTEGER) "
+    "    AND e.caller_id NOT IN (SELECT id FROM roots) "
+    "    AND NOT EXISTS (SELECT 1 FROM up seen WHERE seen.id=e.caller_id)"
+    "  )"
     ") "
     "SELECT DISTINCT t.section_title AS affected, up.id AS affected_id, "
-    "es.source_id AS affected_file, "
+    "es.source_id AS affected_file, MIN(up.depth) AS depth, "
+    "CAST(:depth AS INTEGER) AS depth_limit, (SELECT truncated FROM more) AS truncated, "
     "CASE WHEN COALESCE(ar.candidate_count,0)=0 THEN 'unresolved' "
     "     WHEN ar.candidate_count=1 THEN 'unique' ELSE 'ambiguous' END "
     "AS resolution_state, COALESCE(ar.candidate_count,0) AS candidate_count, "
@@ -175,7 +203,10 @@ _IMPACT_SQL = (
     "FROM up JOIN _types_instant t ON up.id = t.chunk_id "
     "JOIN _edges_source es ON es.chunk_id=up.id "
     "LEFT JOIN resolution ar ON ar.name=t.section_title "
-    "LEFT JOIN resolution rr ON rr.name=:symbol"
+    "LEFT JOIN resolution rr ON rr.name=:symbol "
+    "GROUP BY t.section_title, up.id, es.source_id, ar.candidate_count, "
+    "rr.candidate_count "
+    "ORDER BY depth, affected_file, affected_id"
 )
 
 _SUBTREE_PRESET_SQL = (
@@ -199,8 +230,10 @@ _CODE_PRESETS = (
     ("callees", "What a symbol definition calls; ambiguity is explicit. "
      "Qualify with def_id or file. @callees symbol=NAME",
      "symbol, def_id (default: *), file (default: *)", _CALLEES_SQL),
-    ("impact", "Multi-hop callers — blast radius of a symbol. @impact symbol=NAME",
-     "symbol", _IMPACT_SQL),
+    ("impact", "Bounded callers with minimum depth; ambiguity stops traversal and "
+     "truncated reports unseen hops. "
+     "@impact symbol=NAME",
+     "symbol, depth (default: 8)", _IMPACT_SQL),
 )
 
 
@@ -210,6 +243,7 @@ _CODE_PRESETS = (
 # FIXED fact (code is always no-embed), and is honest about call-graph coverage. NOT
 # the fs orient (which only discovers columns). Colocated with this module's build.
 _CODE_STOCK_PRESETS = Path(__file__).resolve().parent / "stock" / "presets"
+_CODE_SURFACE_VERSION = "code@4"
 
 
 def install_code_presets(conn: sqlite3.Connection) -> None:
@@ -218,18 +252,19 @@ def install_code_presets(conn: sqlite3.Connection) -> None:
     call-graph nav (subtree/callers/callees/impact via _symbols). The nav goes LAST so
     its late-bind SQL INSERT-OR-REPLACE-wins over any same-named stock preset.
     Idempotent."""
-    try:
-        from flex.retrieve.presets import install_presets
-        if _CODE_STOCK_PRESETS.is_dir():
-            install_presets(conn, _CODE_STOCK_PRESETS)      # @orient (code-cell contract)
-    except Exception:
-        pass  # stock absent (interface .sql not yet landed) — nav presets below still install
+    from flex.retrieve.presets import install_presets
+    if not _CODE_STOCK_PRESETS.is_dir():
+        raise RuntimeError(f"code stock presets absent: {_CODE_STOCK_PRESETS}")
+    install_presets(conn, _CODE_STOCK_PRESETS)      # @orient (code-cell contract)
     for name, desc, params, sql in _CODE_PRESETS:
         conn.execute(
             "INSERT OR REPLACE INTO _presets (name, description, params, sql) "
             "VALUES (?, ?, ?, ?)",
             (name, desc, params, sql),
         )
+    conn.execute(
+        "INSERT OR REPLACE INTO _meta (key,value) VALUES "
+        "('code_surface_version', ?)", (_CODE_SURFACE_VERSION,))
 
 
 def _ensure_code_surface(conn: sqlite3.Connection) -> bool:
@@ -254,7 +289,14 @@ def _ensure_code_surface(conn: sqlite3.Connection) -> bool:
     orient_sql = next((r[0] for r in conn.execute(
         "SELECT sql FROM _presets WHERE name='orient'")), "") if 'orient' in presets else ""
     orient_is_code = any(m in orient_sql for m in ('graph_surface', '_symbols', '_edges_call'))
-    if 'chunks' in views and orient_is_code and \
+    version_row = conn.execute(
+        "SELECT value FROM _meta WHERE key='code_surface_version'").fetchone()
+    version = version_row[0] if version_row else None
+    tree_columns = {
+        row[1] for row in conn.execute("PRAGMA table_info(_edges_tree)")
+    }
+    if 'chunks' in views and orient_is_code and version == _CODE_SURFACE_VERSION and \
+            'position' in tree_columns and \
             {'subtree', 'callers', 'callees', 'impact'} <= presets:
         return False
     from flex.views import regenerate_views
@@ -283,14 +325,19 @@ def _ensure_schema(conn: sqlite3.Connection) -> None:
             f"index_file_code requires an already-created cell — base table(s) "
             f"{missing} absent. Create the cell first (flex.sdk.create(..., "
             f"schema=CODE_SCHEMA_DDL)); index_file_code only adds the code tables.")
-    conn.executescript(CODE_SCHEMA_DDL)
-    conn.executescript(
+    tree_ddl = (
         "CREATE TABLE IF NOT EXISTS _edges_tree ("
         " id TEXT NOT NULL, parent_id TEXT, branch_at TEXT,"
         " relation TEXT NOT NULL, depth INTEGER DEFAULT 0,"
         " PRIMARY KEY (id, parent_id));"
         "CREATE INDEX IF NOT EXISTS idx_tree_parent ON _edges_tree(parent_id);"
     )
+    # sqlite3.executescript() commits an existing caller transaction. Execute our
+    # fixed DDL statements individually so schema healing remains transaction-neutral.
+    for ddl in (CODE_SCHEMA_DDL, tree_ddl):
+        for statement in ddl.split(';'):
+            if statement.strip():
+                conn.execute(statement)
 
 
 def _stored_content_hash(conn: sqlite3.Connection, source_id: str) -> str | None:
@@ -400,12 +447,80 @@ def _extract_imports(abs_path: str, ext: str, text: str | None = None) -> list[t
     return rows
 
 
+def _replace_code_file(conn: sqlite3.Connection, *, abs_path: str, file_path: str,
+                       file_id: str, title: str, content_hash: str,
+                       size_bytes: int, mtime_ns: int, nodes: list[dict],
+                       import_rows: list[tuple]) -> None:
+    """Atomically replace one file's complete code projection."""
+    call_rows = [(n["id"], nm) for n in nodes for nm in n.get("_calls", ())]
+    sym_rows = [
+        (st, n["id"], file_id, None)
+        for n in nodes
+        if (st := n.get("section_title")) and not st.startswith("(")
+    ]
+
+    savepoint = "code_file_replace"
+    conn.execute(f"SAVEPOINT {savepoint}")
+    try:
+        _delete_file_rows(conn, abs_path, file_id)
+        conn.execute(
+            "INSERT INTO _raw_sources (source_id, title, content_hash) VALUES (?, ?, ?) "
+            "ON CONFLICT(source_id) DO UPDATE SET title=excluded.title, "
+            "content_hash=excluded.content_hash",
+            (abs_path, title, content_hash))
+        _mint_file_identity(conn, abs_path, file_path)
+
+        for n in nodes:
+            cid = n["id"]
+            node_hash = hashlib.sha256(
+                (n.get("content") or "").encode("utf-8")).hexdigest()
+            conn.execute(
+                "INSERT OR IGNORE INTO _raw_chunks (id, content, timestamp) VALUES (?, ?, ?)",
+                (cid, n.get("content", ""), None))
+            conn.execute(
+                "INSERT OR IGNORE INTO _edges_source (chunk_id, source_id) VALUES (?, ?)",
+                (cid, abs_path))
+            conn.execute(
+                "INSERT OR IGNORE INTO _types_instant "
+                "(chunk_id, section_title, position, depth, container_id, content_hash) "
+                "VALUES (?, ?, ?, ?, ?, ?)",
+                (cid, n.get("section_title"), n.get("position"), n.get("depth"),
+                 n.get("container_id"), node_hash))
+            conn.execute(
+                "INSERT OR IGNORE INTO _edges_tree "
+                "(id, parent_id, branch_at, relation, depth) VALUES (?, ?, ?, ?, ?)",
+                (cid, n.get("container_id"), None, "subsection", n.get("depth", 0)))
+
+        if call_rows:
+            conn.executemany(
+                "INSERT OR IGNORE INTO _edges_call (caller_id, callee_name) VALUES (?, ?)",
+                call_rows)
+        if sym_rows:
+            conn.executemany(
+                "INSERT OR IGNORE INTO _symbols (name, def_id, file_id, kind) "
+                "VALUES (?, ?, ?, ?)", sym_rows)
+        if import_rows:
+            conn.executemany(
+                "INSERT OR IGNORE INTO _edges_import (source_id, module, name) "
+                "VALUES (?, ?, ?)", import_rows)
+        conn.execute(
+            "INSERT OR REPLACE INTO _code_source_state "
+            "(source_id,content_hash,size_bytes,mtime_ns) VALUES (?,?,?,?)",
+            (abs_path, content_hash, size_bytes, mtime_ns))
+        conn.execute(f"RELEASE {savepoint}")
+    except Exception:
+        conn.execute(f"ROLLBACK TO {savepoint}")
+        conn.execute(f"RELEASE {savepoint}")
+        raise
+
+
 def index_file_code(conn: sqlite3.Connection, file_path: str, *,
                     file_id: str, corpus_root: str | Path | None = None) -> bool:
     """Index a single code file's node tree + call/import graph into a code cell.
 
     Per-file upsert, scoped entirely to this one file. No embeddings. Returns True
-    iff the cell was written (False on a content-hash skip or a non-code/empty file).
+    iff the cell was written (False on a content-hash skip or missing/non-code file).
+    An empty file is a real replacement that removes its stale symbols.
 
     Args:
         conn: open code-cell connection (CODE_SCHEMA_DDL applied — ensured here too).
@@ -428,9 +543,7 @@ def index_file_code(conn: sqlite3.Connection, file_path: str, *,
     try:
         text = p.read_text(encoding="utf-8", errors="ignore")
         stat = p.stat()
-    except Exception:
-        return False
-    if not text.strip():
+    except FileNotFoundError:
         return False
 
     _ensure_schema(conn)
@@ -443,81 +556,17 @@ def index_file_code(conn: sqlite3.Connection, file_path: str, *,
             "(source_id,content_hash,size_bytes,mtime_ns) VALUES (?,?,?,?)",
             (abs_path, content_hash, stat.st_size, stat.st_mtime_ns),
         )
-        conn.commit()
         return False
 
     # 2) node tree for this file.
     nodes = _build_code_tree(abs_path, text) if ext == "py" \
         else _build_code_tree_ts(abs_path, text, ext)
-    if not nodes:
-        return False
-
-    # 3) delete this file's existing rows across every code table, then re-insert.
-    _delete_file_rows(conn, abs_path, file_id)
-
-    # _raw_sources upsert (carries the content-hash skip key; source_id = abs_path).
-    conn.execute(
-        "INSERT INTO _raw_sources (source_id, title, content_hash) VALUES (?, ?, ?) "
-        "ON CONFLICT(source_id) DO UPDATE SET title=excluded.title, "
-        "content_hash=excluded.content_hash",
-        (abs_path, p.name, content_hash))
-
-    # 8) SOMA identity mint (same txn; best-effort).
-    _mint_file_identity(conn, abs_path, file_path)
-
-    # 4) _raw_chunks + _edges_source + _types_instant + _edges_tree.
-    for n in nodes:
-        cid = n["id"]
-        node_hash = hashlib.sha256((n.get("content") or "").encode("utf-8")).hexdigest()
-        conn.execute(
-            "INSERT OR IGNORE INTO _raw_chunks (id, content, timestamp) VALUES (?, ?, ?)",
-            (cid, n.get("content", ""), None))
-        conn.execute(
-            "INSERT OR IGNORE INTO _edges_source (chunk_id, source_id) VALUES (?, ?)",
-            (cid, abs_path))
-        conn.execute(
-            "INSERT OR IGNORE INTO _types_instant "
-            "(chunk_id, section_title, position, depth, container_id, content_hash) "
-            "VALUES (?, ?, ?, ?, ?, ?)",
-            (cid, n.get("section_title"), n.get("position"), n.get("depth"),
-             n.get("container_id"), node_hash))
-        conn.execute(
-            "INSERT OR IGNORE INTO _edges_tree (id, parent_id, branch_at, relation, depth) "
-            "VALUES (?, ?, ?, ?, ?)",
-            (cid, n.get("container_id"), None, "subsection", n.get("depth", 0)))
-
-    # 5) _edges_call — LATE-BIND: store only (caller_id, callee_name), NO callee_id.
-    call_rows = [(n["id"], nm) for n in nodes for nm in n.get("_calls", ())]
-    if call_rows:
-        conn.executemany(
-            "INSERT OR IGNORE INTO _edges_call (caller_id, callee_name) VALUES (?, ?)",
-            call_rows)
-
-    # 6) _symbols — one row per def node in this file (skip the "(module)" preamble).
-    sym_rows = [
-        (st, n["id"], file_id, None)
-        for n in nodes
-        if (st := n.get("section_title")) and not st.startswith("(")
-    ]
-    if sym_rows:
-        conn.executemany(
-            "INSERT OR IGNORE INTO _symbols (name, def_id, file_id, kind) VALUES (?, ?, ?, ?)",
-            sym_rows)
-
-    # 7) _edges_import — file → imported module/symbol.
-    import_rows = _extract_imports(abs_path, ext)
-    if import_rows:
-        conn.executemany(
-            "INSERT OR IGNORE INTO _edges_import (source_id, module, name) VALUES (?, ?, ?)",
-            import_rows)
-
-    conn.execute(
-        "INSERT OR REPLACE INTO _code_source_state "
-        "(source_id,content_hash,size_bytes,mtime_ns) VALUES (?,?,?,?)",
-        (abs_path, content_hash, stat.st_size, stat.st_mtime_ns),
+    import_rows = _extract_imports(abs_path, ext, text)
+    _replace_code_file(
+        conn, abs_path=abs_path, file_path=file_path, file_id=file_id,
+        title=p.name, content_hash=content_hash, size_bytes=stat.st_size,
+        mtime_ns=stat.st_mtime_ns, nodes=nodes, import_rows=import_rows,
     )
-
-    conn.commit()
     return True
 
 
@@ -536,9 +585,31 @@ _CODE_WALK_EXTS = {'.py', '.ts', '.tsx', '.js', '.jsx', '.go', '.rs', '.java',
 # chunks — indexing them enshrines thousands of minified-token pseudo-defs as the
 # code graph (caught at scale: a Next.js `out/_next` dump was 82% of one cell's
 # defs). `target` = Rust/Java build. Pruned at traversal like the rest.
-_CODE_PRUNE = {'.git', 'node_modules', 'venv', '.venv', '__pycache__', 'dist',
+_CODE_PRUNE = {'.git', '.worktrees', 'node_modules', 'venv', '.venv', '__pycache__', 'dist',
                'build', '.next', '.mypy_cache', '.pytest_cache', 'out', '_next',
-               '.output', '.turbo', '.svelte-kit', 'coverage', 'target', '.nuxt'}
+               '.output', '.turbo', '.svelte-kit', '.wrangler', 'coverage',
+               'target', '.nuxt'}
+
+
+def _is_code_source_path(path: Path, roots, exclude_dirs=None) -> bool:
+    """Whether ``path`` belongs to the same source set as ``_walk_code``.
+
+    Event delivery watches the whole repository, so it must apply the walk's
+    source boundary too. Otherwise transient build output can enter through an
+    event even though reconciliation would never discover it.
+    """
+    if path.name.endswith(('.min.js', '.min.css')):
+        return False
+    if path.suffix not in _CODE_WALK_EXTS:
+        return False
+    prune = _CODE_PRUNE | set(exclude_dirs or ())
+    for root in roots:
+        try:
+            relative = path.relative_to(root)
+        except ValueError:
+            continue
+        return not bool(set(relative.parts[:-1]) & prune)
+    return False
 
 
 def _walk_code(root: Path, exclude_dirs=None):
@@ -555,10 +626,14 @@ def _walk_code(root: Path, exclude_dirs=None):
                 yield Path(dirpath) / fn
 
 
-def _reconcile_code_deletes(conn, on_disk_source_ids: set) -> int:
-    """Drop a code file's rows (all code tables) when it vanished. Stat-confirms
-    the stored source_id (an abs path) before pruning — over-prune guard, same as
-    docpac's reconcile. Empty on-disk set ⇒ no-op (transient walk failure)."""
+def _reconcile_code_deletes(conn, on_disk_source_ids: set, *, roots=None,
+                            exclude_dirs=None) -> int:
+    """Drop vanished or explicitly excluded code-file rows.
+
+    A live eligible path remains the over-prune guard. An explicitly excluded
+    path is no longer part of this projection and must be removed even while a
+    build tool keeps it on disk. Empty discovery remains a guarded no-op.
+    """
     if not on_disk_source_ids:
         return 0
     try:
@@ -571,7 +646,11 @@ def _reconcile_code_deletes(conn, on_disk_source_ids: set) -> int:
     for source_id, file_uuid in rows:
         if source_id in on_disk_source_ids:
             continue
-        if os.path.exists(os.path.normpath(source_id)):
+        source_path = Path(os.path.normpath(source_id))
+        explicitly_excluded = bool(roots) and not _is_code_source_path(
+            source_path, roots, exclude_dirs,
+        )
+        if not explicitly_excluded and source_path.exists():
             continue                       # live file, keep
         _delete_file_rows(conn, source_id, file_uuid or source_id, drop_identity=True)
         conn.execute("DELETE FROM _raw_sources WHERE source_id = ?", (source_id,))
@@ -595,13 +674,120 @@ def _cell_selections(conn) -> list:
     return []
 
 
+def _code_state_signature(conn: sqlite3.Connection) -> tuple[str, str | None]:
+    """Deterministic receipt for the code projection currently committed."""
+    digest = hashlib.sha256()
+    high_water = 0
+    for source_id, content_hash, mtime_ns in conn.execute(
+            "SELECT source_id,content_hash,mtime_ns FROM _code_source_state "
+            "ORDER BY source_id"):
+        digest.update(source_id.encode())
+        digest.update(content_hash.encode())
+        high_water = max(high_water, int(mtime_ns or 0))
+    return f"sha256:{digest.hexdigest()}", str(high_water) if high_water else None
+
+
+def _scan_code_cell(cell: dict, size_cache: dict, identity) -> tuple[dict, int, list, str, str | None]:
+    """Reconcile one code cell and return stats, remaining work, errors, receipt."""
+    from flex.modules.docpac.compile.init import _is_identity_excluded
+    from flex.watch import fair_batch
+
+    conn = sqlite3.connect(cell['path'], timeout=30)
+    conn.execute("PRAGMA journal_mode=WAL")
+    conn.execute("PRAGMA busy_timeout=30000")
+    try:
+        tables = {r[0] for r in conn.execute(
+            "SELECT name FROM sqlite_master WHERE type='table'")}
+        if _BASE_CELL_TABLES[0] not in tables:
+            raise RuntimeError("missing code cell base tables")
+        _ensure_schema(conn)
+        _ensure_code_surface(conn)
+        try:
+            from flex.modules.docpac.compile.worker import _cell_exclude_dirs
+            exclude = _cell_exclude_dirs(conn)
+        except Exception:
+            exclude = set()
+
+        selections = _cell_selections(conn) or [cell.get('corpus_path')]
+        sel_dirs = [Path(s) for s in selections if s and Path(s).is_dir()]
+        if not sel_dirs:
+            raise RuntimeError("no live code selections")
+
+        on_disk_sids = set()
+        candidates = []
+        errors = []
+        for corpus in sel_dirs:
+            for file_path in _walk_code(corpus, exclude):
+                abs_path = str(file_path.resolve())
+                on_disk_sids.add(abs_path)
+                try:
+                    stat = file_path.stat()
+                except OSError as exc:
+                    errors.append(f"{file_path.name}: {exc}")
+                    continue
+                signature = f"{stat.st_size}:{stat.st_mtime_ns}"
+                cache_key = f"code:{cell['name']}:{file_path}"
+                if signature == size_cache.get(cache_key):
+                    continue
+                if cache_key not in size_cache:
+                    stored = conn.execute(
+                        "SELECT size_bytes,mtime_ns FROM _code_source_state "
+                        "WHERE source_id=?", (abs_path,),
+                    ).fetchone()
+                    if stored and stored == (stat.st_size, stat.st_mtime_ns):
+                        size_cache[cache_key] = signature
+                        continue
+                candidates.append((abs_path, (
+                    file_path, corpus, signature, cache_key,
+                )))
+
+        limit = max(1, int(os.environ.get("FLEX_DRAIN_FILES_PER_CELL", "200")))
+        batch = fair_batch(conn, "code", candidates, limit)
+        local = {'indexed': 0, 'skipped': 0, 'deleted': 0}
+        for _, (file_path, corpus, signature, cache_key) in batch:
+            abs_path = str(file_path.resolve())
+            try:
+                file_id = abs_path
+                if identity and not _is_identity_excluded(abs_path):
+                    try:
+                        file_id = identity.assign(abs_path)
+                    except Exception:
+                        pass  # identity is optional; code projection still lands
+                if index_file_code(conn, str(file_path), file_id=file_id,
+                                   corpus_root=str(corpus)):
+                    local['indexed'] += 1
+                else:
+                    local['skipped'] += 1
+                size_cache[cache_key] = signature
+            except Exception as exc:
+                print(f"[code] error on {file_path.name}: {exc}", file=sys.stderr)
+                local['skipped'] += 1
+                errors.append(f"{file_path.name}: {exc}")
+                size_cache.pop(cache_key, None)
+
+        local['deleted'] = _reconcile_code_deletes(
+            conn, on_disk_sids, roots=sel_dirs, exclude_dirs=exclude,
+        )
+        conn.commit()
+        source_signature, high_water = _code_state_signature(conn)
+        remaining = max(0, len(candidates) - len(batch))
+        return local, remaining, errors, source_signature, high_water
+    except Exception:
+        conn.rollback()
+        raise
+    finally:
+        conn.close()
+
+
 def scan_code_cells(size_cache: dict) -> dict:
     """Incremental drain for cell_type='code' cells. Mirrors scan_docpac_cells:
     stat-poll walk (pruned + exclude_dirs), content-hash skip inside
-    index_file_code, per-file index_file_code, reconcile-delete, last_refresh
-    stamp. No embeddings. This is what replaces the full-regen for code cells."""
-    from flex.registry import list_cells, update_refresh_status
-    from flex.modules.docpac.compile.init import _is_identity_excluded
+    index_file_code, per-file index_file_code, reconcile-delete, and committed
+    freshness receipts. No embeddings. This replaces full regeneration."""
+    from flex.registry import (
+        list_cells, mark_refresh_committed, mark_refresh_failed,
+        mark_refresh_started,
+    )
     try:
         # get_instance() (the singleton) — same mint entry point as docpac's
         # _mint_file_identity, so a test can airtight-redirect the SOMA DB once.
@@ -620,95 +806,29 @@ def scan_code_cells(size_cache: dict) -> dict:
 
     for cell in cells:
         cell_name = cell['name']
-        conn = sqlite3.connect(cell['path'], timeout=30)
-        conn.execute("PRAGMA journal_mode=WAL")
-        conn.execute("PRAGMA busy_timeout=30000")
-        tables = {r[0] for r in conn.execute(
-            "SELECT name FROM sqlite_master WHERE type='table'")}
-        if not _BASE_CELL_TABLES[0] in tables:   # not a created cell yet — skip
-            conn.close()
-            continue
-        _ensure_schema(conn)  # includes durable per-source state on upgraded cells
-        # Self-heal the query surface (chunks view + @orient + nav presets) so
-        # already-migrated code cells that shipped without it get fixed LIVE on the
-        # next drain, not just fresh builds. Guarded → no-op once complete.
-        _ensure_code_surface(conn)
-        # per-cell exclusions (reuse docpac's _meta.exclude_dirs reader)
+        mark_refresh_started(cell_name)
         try:
-            from flex.modules.docpac.compile.worker import _cell_exclude_dirs
-            exclude = _cell_exclude_dirs(conn)
-        except Exception:
-            exclude = set()
-
-        # A code cell may index MULTIPLE source dirs (instant's _meta.selections),
-        # not just one corpus_path — walk ALL of them, fallback to [corpus_path].
-        # The reconcile-delete spans the UNION of every selection's on-disk set, so a
-        # file deleted from any selection is pruned. Same shape as the docpac
-        # multi-source drain (union over all indexed roots). corpus_root is
-        # per-selection (unused by index_file_code, but kept honest).
-        selections = _cell_selections(conn) or [cell.get('corpus_path')]
-        sel_dirs = [Path(s) for s in selections if s and Path(s).is_dir()]
-        if not sel_dirs:
-            conn.close()
+            local, remaining, errors, signature, high_water = _scan_code_cell(
+                cell, size_cache, fid,
+            )
+        except Exception as exc:
+            mark_refresh_failed(cell_name, str(exc))
+            print(f"[code] cell {cell_name}: {exc}", file=sys.stderr)
             continue
-
-        cell_indexed = 0
-        on_disk_sids = set()
-        candidates = []
-        for corpus in sel_dirs:
-            for f in _walk_code(corpus, exclude):
-                abs_path = str(f.resolve())
-                on_disk_sids.add(abs_path)          # source_id = abs path (index_file_code's key)
-                key = str(f)
-                try:
-                    stat = f.stat()
-                    signature = f"{stat.st_size}:{stat.st_mtime_ns}"
-                except OSError:
-                    continue
-                cache_key = f"code:{cell_name}:{key}"
-                if signature == size_cache.get(cache_key):
-                    continue
-                if cache_key not in size_cache:
-                    stored = conn.execute(
-                        "SELECT size_bytes,mtime_ns FROM _code_source_state "
-                        "WHERE source_id=?", (abs_path,),
-                    ).fetchone()
-                    if stored and stored == (stat.st_size, stat.st_mtime_ns):
-                        size_cache[cache_key] = signature
-                        continue
-                candidates.append((abs_path, (f, corpus, signature, cache_key)))
-
-        from flex.watch import fair_batch
-        batch_limit = max(1, int(os.environ.get("FLEX_DRAIN_FILES_PER_CELL", "200")))
-        batch = fair_batch(conn, "code", candidates, batch_limit)
-        if batch:
-            conn.commit()  # cursor is a crash-safe fairness fact, not process memory
-        for _, (f, corpus, signature, cache_key) in batch:
-                abs_path = str(f.resolve())
-                try:
-                    # Ephemeral corpora (/tmp,/var/tmp,/dev — soma exclude_paths) never mint,
-                    # so fixture/test code cells don't pollute the shared ~/.soma authority.
-                    # Symmetric with index_file's _mint_file_identity + batch init's
-                    # _mint_batch_identity (single-sourced exclusion).
-                    if fid and not _is_identity_excluded(abs_path):
-                        file_id = fid.assign(abs_path)
-                    else:
-                        file_id = abs_path
-                    if index_file_code(conn, str(f), file_id=file_id,
-                                       corpus_root=str(corpus)):
-                        stats['indexed'] += 1
-                        cell_indexed += 1
-                    else:
-                        stats['skipped'] += 1
-                except Exception as e:
-                    print(f"[code] error on {f.name}: {e}", file=sys.stderr)
-                    stats['skipped'] += 1
-                size_cache[cache_key] = signature
-
-        deleted = _reconcile_code_deletes(conn, on_disk_sids)
-        stats['deleted'] += deleted
-        if cell_indexed or deleted:
-            conn.commit()
-            update_refresh_status(cell_name, 'ok')
-        conn.close()
+        for key in stats:
+            stats[key] += local[key]
+        if errors:
+            mark_refresh_failed(
+                cell_name, f"{len(errors)} code file(s) failed; last: {errors[-1]}",
+                pending=remaining + len(errors),
+            )
+        elif remaining:
+            mark_refresh_started(
+                cell_name, pending=remaining, reconciliation_required=True,
+            )
+        else:
+            mark_refresh_committed(
+                cell_name, source_signature=signature,
+                source_high_water=high_water,
+            )
     return stats

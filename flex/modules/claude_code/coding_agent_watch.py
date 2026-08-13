@@ -2,20 +2,28 @@
 
 from __future__ import annotations
 
-import sys
 import time
-from typing import Any
+
+from flex.modules.specs import module_spec_for, normalize_cell_type
 
 
-_running: set[str] = set()
 _last_checked: dict[str, float] = {}
 
 
-def _needs_resync(stats: Any) -> bool:
-    """Interpret module dry-run stats without binding every module to one shape."""
-    if not isinstance(stats, dict):
+def _is_coding_agent_cell(cell_type: str | None) -> bool:
+    """Return whether a cell belongs to the shared coding-agent substrate."""
+    normalized = normalize_cell_type(cell_type)
+    # Codex is already owned by the bounded event + reconciliation lanes in
+    # engines.py. Sending it through the generic refresh module as well performs
+    # a duplicate full transpile/embed/enrichment, defeating those bounds and
+    # racing the live writer. External substrate modules use this lane; Codex
+    # deliberately does not.
+    if normalized == "codex":
         return False
-    return stats.get("needs_resync") is True or stats.get("changed") is True
+    if normalized == "claude_code":
+        return True
+    spec = module_spec_for(normalized)
+    return bool(spec and normalize_cell_type(spec.get("substrate")) == "claude_code")
 
 
 def scan_coding_agent_cells(min_interval_s: float = 0) -> dict[str, int]:
@@ -26,49 +34,39 @@ def scan_coding_agent_cells(min_interval_s: float = 0) -> dict[str, int]:
       refresh_module='flex.modules.<agent>.refresh'
       watch_path=<local source store>
 
-    The refresh modules own the source-specific signature contract. This helper
-    asks for a dry-run decision and triggers real refresh only when drift is
-    reported.
+    The Registry LifecycleCoordinator owns the dry-run and real materialization
+    boundary. This compatibility entry point only scopes that coordinator to
+    coding-agent cells; it never spawns ``flex.refresh --cells`` children.
     """
+    from flex.lifecycle import coordinator
     from flex.registry import discover_watched
     from flex.refresh import refresh_cell
 
     now = time.monotonic()
-    stats = {"checked": 0, "refreshed": 0, "skipped": 0, "errors": 0}
+    stats = {"checked": 0, "started": 0, "skipped": 0, "errors": 0}
 
+    eligible: set[str] = set()
     for cell in discover_watched():
         name = cell.get("name")
         if not name or not cell.get("refresh_module"):
             continue
-        if cell.get("cell_type") in {"markdown", "obsidian"}:
-            continue
-        if name in _running:
-            stats["skipped"] += 1
+        if not _is_coding_agent_cell(cell.get("cell_type")):
             continue
         if min_interval_s > 0 and now - _last_checked.get(name, 0) < min_interval_s:
             stats["skipped"] += 1
             continue
-
         stats["checked"] += 1
         _last_checked[name] = now
-        try:
-            dry = refresh_cell(name, dry_run=True, quiet=True)
-            if not _needs_resync(dry):
-                stats["skipped"] += 1
-                continue
+        eligible.add(name)
 
-            _running.add(name)
-            try:
-                result = refresh_cell(name)
-            finally:
-                _running.discard(name)
-
-            if result is None:
-                stats["errors"] += 1
-            else:
-                stats["refreshed"] += 1
-        except Exception as e:
+    results = coordinator(refresh_cell).local_watch_pass(
+        eligible=lambda cell: cell.get("name") in eligible,
+    )
+    for status in results.values():
+        if status.startswith("error:"):
             stats["errors"] += 1
-            print(f"[coding-agent-watch] {name}: {e}", file=sys.stderr)
+        elif status == "ok":
+            stats["started"] += 1
+    stats["skipped"] += stats["checked"] - stats["started"] - stats["errors"]
 
     return stats

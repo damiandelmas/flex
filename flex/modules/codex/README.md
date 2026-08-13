@@ -7,7 +7,7 @@ substrate, and registers a local `watch` lifecycle cell named `codex`.
 
 ```bash
 flex init --module codex
-flex core search --cell codex "@orient"
+flex search --cell codex "@orient"
 ```
 
 Use `--codex-dir` to point at a copied sessions root or fixture:
@@ -94,3 +94,10 @@ clipped search results to full message bodies.
 The cell registers a `watch` lifecycle on `**/rollout-*.jsonl`. Refresh
 computes a directory signature (total size and file count) over the resolved
 homes and skips work when the source has not changed.
+
+The event path publishes new `_raw_chunks`, message metadata, relationships,
+source receipts, and FTS synchronously. It never embeds inline. New rows may
+therefore carry `embedding IS NULL` while remaining immediately available to
+SQL, `keyword()`, `@message-index`, and Ledger. A separately admitted semantic
+sweep converges vectors later; contention in that lane cannot defer structural
+message visibility. The periodic missed-event scan follows the same split.

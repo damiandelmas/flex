@@ -76,7 +76,6 @@ def run(args, console) -> None:
 
     from flex.core import open_cell, set_meta, validate_cell, log_op
     from flex.registry import CELLS_DIR, register_cell
-    from flex.retrieve.presets import install_presets
     from flex.views import install_views, regenerate_views
 
     from flex.modules.github.compile.github_api import (
@@ -127,6 +126,8 @@ def run(args, console) -> None:
     db = open_cell(str(cell_path))
     try:
         db.executescript(SCHEMA_DDL)
+        set_meta(db, "cell_type", "github")
+        set_meta(db, "description", MODULE["description"])
         sources, chunks = ingest(threads, db)
         validate_cell(db)
 
@@ -138,14 +139,11 @@ def run(args, console) -> None:
         install_views(db, views_dir)
         regenerate_views(db, {"chunks": "chunk", "sources": "source"})
 
-        general_presets = Path(__file__).resolve().parents[2] / "retrieve" / "presets" / "general"
-        install_presets(db, general_presets)
-        install_presets(db, Path(__file__).parent / "stock" / "presets")
+        from flex.manage.install_presets import ensure_cell_presets
+        ensure_cell_presets(db, "github")
 
         now = datetime.now(timezone.utc).isoformat()
         max_ts = db.execute("SELECT MAX(timestamp) FROM _raw_chunks").fetchone()[0] or 0
-        set_meta(db, "cell_type", "github")
-        set_meta(db, "description", MODULE["description"])
         set_meta(db, "created_at", now)
         set_meta(db, "last_pull_ts", str(max_ts))
         set_meta(db, "last_pull_at", now)
@@ -198,10 +196,10 @@ def run(args, console) -> None:
     panel_content.append(f"{len(threads)}\n", style="green")
     panel_content.append("Chunks               ", style="")
     panel_content.append(f"{sum(1 + len(cs) for _, cs in threads)}\n\n", style="green")
-    panel_content.append("  flex core search --cell ", style="bold")
+    panel_content.append("  flex search --cell ", style="bold")
     panel_content.append(f"{cell_name} ", style="bold green")
     panel_content.append('"@orient"\n', style="bold")
-    panel_content.append("  flex core search --cell ", style="bold")
+    panel_content.append("  flex search --cell ", style="bold")
     panel_content.append(f"{cell_name} ", style="bold green")
     panel_content.append('"@open-issues days=30"\n', style="bold")
     console.print(Panel(panel_content, padding=(1, 2), highlight=False))

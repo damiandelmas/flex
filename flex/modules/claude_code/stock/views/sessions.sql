@@ -6,6 +6,8 @@ CREATE VIEW sessions AS
 SELECT
     src.source_id AS session_id,
     src.project,
+    src.primary_cwd,
+    src.git_root,
     src.title,
     src.message_count,
     src.start_time,

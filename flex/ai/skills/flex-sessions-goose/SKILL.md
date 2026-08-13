@@ -1,23 +1,15 @@
 ---
 name: flex:sessions:goose
-description: Search Goose session provenance in the goose cell through the Flex MCP server. Use when the user asks about Goose sessions, recent Goose turns, tool calls, files touched, provider/model/mode metadata, or semantic search over Goose coding-agent work.
+description: Compatibility alias for an installed Goose session corpus. Use only when an older prompt explicitly names flex:sessions:goose; route Goose turns, tool calls, files, provider/model metadata, and semantic history search through the generic flex interface with cell=goose.
 allowed-tools:
-  - mcp__flex__flex_search
-user-invocable: true
-argument-hint: "Goose session/topic/file, e.g. 'latest turns in 019...', 'who touched src/foo.py', 'sessions by provider and mode'"
+  - mcp__flex__flex
 ---
 
-# flex:sessions:goose
+# flex:sessions:goose Compatibility
 
-Flex indexes Goose `sessions.db` history in the `goose` cell. The cell is a
-self-describing SQLite database on the claude_code substrate with chunks,
-messages, sessions, files, a `_types_goose_session` sidecar surfaced through
-the extended `sources` view (provider, model, mode, tokens), embeddings, and
-graph intelligence. Use this skill for Goose prompts, assistant turns, tool
-calls, files touched, provider/model metadata, and session history.
+This is a compatibility alias, not a canonical Flex door.
 
-Use `mcp__flex__flex_search` with `cell="goose"`. First call
-`query="@orient"` unless this cell was already oriented in the current turn,
-then follow the bundled cell instructions, presets, views, source limits, and
-drillback notes. Every query must be SQL or an `@preset`; wrap plain text in
-the cell's documented `keyword()` or `vec_ops()` pattern.
+Continue with `$flex`, selecting `cell="goose"`. Run `@orient` before the first
+query, then follow that cell's bundled session schema and source-recovery
+contract. Do not imply Goose is covered by the Claude Code/Codex-only canonical
+`flex:sessions` surface.

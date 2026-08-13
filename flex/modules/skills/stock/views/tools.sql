@@ -28,6 +28,7 @@ SELECT
     -- tool_class: derived from category (raw awesome-list heading) when tool_type is NULL.
     -- tool_type takes precedence when populated (e.g. from registry enrichment).
     CASE
+        WHEN t.is_mcp = 1 THEN 'mcp'
         WHEN t.tool_type IN ('mcp_server', 'mcp') THEN 'mcp'
         WHEN t.tool_type IN ('skill', 'slash_command', 'skills') THEN 'skill'
         WHEN t.tool_type = 'hook' THEN 'hook'
@@ -47,6 +48,7 @@ SELECT
         WHEN LOWER(t.category) LIKE '%mcp%' THEN 'mcp'
         ELSE 'other'
     END AS tool_class,
+    t.is_mcp,
     e.centrality,
     e.is_hub,
     e.is_bridge,

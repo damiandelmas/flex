@@ -2,7 +2,8 @@
 """
 Flex MCP Server — one tool, SQL endpoint.
 
-The AI writes SQL. The server executes it read-only.
+The AI writes SQL. Cells own their query contracts; Ledger additionally owns
+its annotation write contract.
 vec_ops registered as a function for semantic queries.
 
 Usage:
@@ -12,6 +13,7 @@ Usage:
 """
 
 import asyncio
+import hashlib
 import json
 import os
 import sqlite3
@@ -20,13 +22,21 @@ import threading
 import time
 from contextlib import contextmanager
 from datetime import datetime, timezone
+from functools import partial
 from pathlib import Path
 
 from mcp.server.lowlevel import Server
 import mcp.types as types
 
 from flex.core import get_meta, open_cell_readonly
+from flex.meta import attach_registered_cells
 from flex.mcp_core import execute_query as _execute_mcp_query
+from flex.retrieve.result_window import ResultWindowStore
+from flex.self import MaterializationContext
+from flex.runtime_context import (
+    environment_from_request_metadata,
+    resolve_runtime_seed,
+)
 from flex.registry import (
     resolve_cell as registry_resolve,
     discover_cells as registry_discover,
@@ -225,8 +235,11 @@ def get_warmup_state() -> dict:
 
 
 def discover_cells() -> list[str]:
-    """Discover cells from registry + filesystem fallback."""
-    return registry_discover()
+    """Discover current cells, excluding the retired static skill mirror."""
+    return [
+        name for name in registry_discover()
+        if (registry_cell_metadata(name) or {}).get("cell_type") != "instructions"
+    ]
 
 
 def _db_path(name: str) -> Path:
@@ -264,6 +277,12 @@ def get_cell(name: str, warm_vec: bool = True):
 
     metadata = registry_cell_metadata(name)
     if not metadata or not metadata.get("active", 1):
+        yield None
+        return
+    if metadata.get("cell_type") == "instructions":
+        # Older installations may retain instructions.db on disk.  It is an
+        # obsolete copied skill, not a current query cell; preserve the file
+        # recoverably but never present it as a second authority.
         yield None
         return
 
@@ -495,61 +514,69 @@ def warm_cells(cell_names: list[str]):
         print(f"[flex-mcp] Background warmup complete ({len(_vec_state)} cached)", file=sys.stderr)
 
 
-def execute_preset(db: sqlite3.Connection, query: str) -> str:
+def execute_preset(
+    db: sqlite3.Connection,
+    query: str,
+    *,
+    materializer=None,
+    cell: str | None = None,
+) -> str:
     """Execute a @preset query. Delegates to engine."""
     if not HAS_ENGINE:
         return json.dumps({"error": "Engine not installed. Presets unavailable.",
                            "hint": "Install flex via: curl -sSL https://getflex.dev/install.sh | bash"})
-    return _engine_execute_preset(db, query)
+    return _engine_execute_preset(
+        db,
+        query,
+        materializer=materializer,
+        cell_name=cell,
+    )
 
 
 def _execute_attaches(db: sqlite3.Connection, sql: str) -> tuple[str, str | None]:
-    """Extract ATTACH statements, resolve cell names to registry paths, execute on db.
-
-    Returns (sql_without_attach_stmts, error_or_None).
-    Only registered cells (via resolve_cell) can be attached — no arbitrary paths.
-    """
-    import re
-    from flex.registry import resolve_cell
-
-    pattern = re.compile(
-        r"ATTACH\s+['\"]([^'\"]+)['\"]\s+AS\s+(\w+)\s*;?",
-        re.IGNORECASE
+    """Compatibility wrapper for the Flex Meta read-composition primitive."""
+    return attach_registered_cells(
+        db,
+        sql,
+        explicit_cells=_explicit_cells,
+        available_cells=_known_cells,
     )
-    matches = pattern.findall(sql)
-    if not matches:
-        return sql, None
-
-    for cell_name, alias in matches:
-        if _explicit_cells and cell_name not in _explicit_cells:
-            return sql, f"Cell not allowed by --cell: '{cell_name}'. Allowed: {sorted(_explicit_cells)}"
-        metadata = registry_cell_metadata(cell_name)
-        if not metadata or not metadata.get("active", 1):
-            return sql, f"Unknown or inactive cell: '{cell_name}'. Available: {sorted(_known_cells)}"
-        path = resolve_cell(cell_name)
-        if path is None:
-            return sql, f"Unknown cell: '{cell_name}'. Available: {sorted(_known_cells)}"
-        if not path.exists():
-            return sql, f"Cell path not found on disk: {path}"
-        try:
-            # Parameterize path to prevent SQL injection. Alias is validated
-            # as \w+ by the regex pattern (alphanumeric only).
-            db.execute(f"ATTACH DATABASE ? AS \"{alias}\"", (str(path),))
-        except sqlite3.OperationalError as e:
-            return sql, f"ATTACH failed for '{cell_name}': {e}"
-
-    # Strip ATTACH statements — leave only the SELECT
-    remaining = pattern.sub("", sql).strip().lstrip(";").strip()
-    return remaining, None
 
 
-def execute_query(db: sqlite3.Connection, query: str) -> str:
+def execute_query(
+    db: sqlite3.Connection,
+    query: str,
+    *,
+    cell: str | None = None,
+    runtime_environ: dict[str, str] | None = None,
+) -> str:
     """Execute read-only SQL or @preset on a cell. Returns JSON string."""
     sql = query.strip()
 
-    # Cross-cell ATTACH — resolve cell names to registry paths before blocklist
-    upper = sql.upper()
-    if 'ATTACH' in upper:
+    materializer = None
+    preset_executor = execute_preset
+    if HAS_ENGINE:
+        query_environ = dict(os.environ)
+        query_environ.update(runtime_environ or {})
+        context = MaterializationContext(
+            primary_cell=cell,
+            explicit_cells=tuple(sorted(_explicit_cells)),
+            available_cells=tuple(sorted(_known_cells)),
+            environ=query_environ,
+        )
+
+        def materializer(conn, statement):
+            return _engine_materialize(conn, statement, context=context)
+
+        def preset_executor(conn, statement):
+            return execute_preset(
+                conn,
+                statement,
+                materializer=materializer,
+                cell=cell,
+            )
+    else:
+        # Engine-less compatibility builds retain the Phase 1 Meta prelude.
         sql, err = _execute_attaches(db, sql)
         if err:
             return json.dumps({"error": err})
@@ -557,8 +584,8 @@ def execute_query(db: sqlite3.Connection, query: str) -> str:
     return _execute_mcp_query(
         db,
         sql,
-        preset_executor=execute_preset,
-        materializer=_engine_materialize if HAS_ENGINE else None,
+        preset_executor=preset_executor,
+        materializer=materializer,
     )
 
 
@@ -790,10 +817,10 @@ _RELAY_TOOL = types.Tool(
 
 @server.list_tools()
 async def handle_list_tools() -> list[types.Tool]:
-    """Return the flex_search tool with dynamic description and schema."""
+    """Return the canonical Flex query tool with dynamic description and schema."""
     tools = [
         types.Tool(
-            name="flex_search",
+            name="flex",
             description=_build_tool_description(),
             inputSchema=_build_tool_schema(),
         )
@@ -901,57 +928,223 @@ def _is_ungated_preset(query: str) -> bool:
     return q[1:].split()[0].lower() in _UNGATED_PRESETS if len(q) > 1 else False
 
 
-_PREVIEW_ROWS = 10  # max rows in preview (actual count limited by char budget)
-_PREVIEW_FIELD_LIMIT = 200  # max chars per string field in preview
 _PREVIEW_CHAR_BUDGET = 2000  # max total chars for preview (~500 tokens)
+_CONTINUATION_CHAR_BUDGET = 28_000  # leaves room for structured window metadata
+_RESULT_WINDOWS = ResultWindowStore(
+    ttl_seconds=float(os.environ.get("FLEX_RESULT_WINDOW_TTL", "300")),
+    max_entries=max(1, int(os.environ.get("FLEX_RESULT_WINDOW_COUNT", "32"))),
+    max_result_chars=_GATE_FORCE_CHAR_LIMIT,
+)
 
 
-def _execute_cell_query(cell: str, query: str) -> str:
-    """Synchronous cell query — runs in executor to avoid blocking event loop."""
-    with get_cell(cell) as db:
-        if db is None:
-            from flex.registry import retired_cell_message
-            retired = retired_cell_message(cell)
-            if retired:
-                return json.dumps({"error": retired, "retired": True})
-            available = sorted(_known_cells)
-            on_disk = set(discover_cells()) - set(available)
-            msg = {"error": f"Unknown cell: {cell}", "available": available}
-            if on_disk:
-                msg["also_on_disk"] = sorted(on_disk)
-            return json.dumps(msg)
+def _query_needs_vectors(
+    db: sqlite3.Connection,
+    query: str,
+    *,
+    cell: str | None = None,
+) -> bool:
+    """Return whether a query actually needs the per-cell VectorCache.
 
-        # SQLite progress handler — abort after timeout
-        deadline = time.monotonic() + _QUERY_TIMEOUT_S
-        def _check_timeout():
-            if time.monotonic() > deadline:
-                return 1  # non-zero = abort
-            return 0
-        db.set_progress_handler(_check_timeout, 1000)  # check every 1K opcodes
+    Structural SQL, FTS, and most presets must stay cheap on a cold MCP
+    process.  In particular, source-recovery presets such as ``@full`` should
+    never allocate a multi-gigabyte embedding matrix merely to fetch one row.
+    Preset SQL is inspected before execution so custom semantic presets still
+    warm on demand.
+    """
+    sql = query.strip().lstrip("!").lstrip()
+    if "vec_ops(" in sql.lower():
+        return True
+    if not sql.startswith("@"):
+        return False
 
+    name = sql[1:].split(None, 1)[0].lower() if len(sql) > 1 else ""
+    if not name:
+        return False
+    try:
+        from flex.retrieve.presets import PresetLoader
+
+        preset = PresetLoader(db).load(name)
+    except (KeyError, ValueError, sqlite3.Error):
+        # A few pre-envelope cells retained only ``name, sql``; keep their
+        # vector warmup behavior until those artifacts are rebuilt.
         try:
-            start = time.monotonic()
-            result = execute_query(db, query)
-            elapsed_ms = (time.monotonic() - start) * 1000
-            _log_query(cell, query, result, elapsed_ms)
-            return result
-        except sqlite3.OperationalError as e:
-            if 'interrupt' in str(e).lower():
-                error_msg = json.dumps({"error": f"Query timed out after {_QUERY_TIMEOUT_S}s"})
-            else:
-                msg = str(e)
-                hint = None
-                if "no such column" in msg or "no such table" in msg:
-                    hint = 'Use @orient to see available views, columns, and tables.'
-                elif "not valid SQL" in msg.lower() or "near " in msg:
-                    hint = 'Use @orient to see query examples and syntax.'
-                error_msg = json.dumps({"error": msg, **({"hint": hint} if hint else {})})
-            _log_query(cell, query, error_msg, (time.monotonic() - start) * 1000)
-            return error_msg
-        except Exception as e:
-            error_msg = json.dumps({"error": f"{type(e).__name__}: {e}"})
-            _log_query(cell, query, error_msg, (time.monotonic() - start) * 1000)
-            return error_msg
+            row = db.execute(
+                "SELECT sql FROM _presets WHERE lower(name) = ?", (name,)
+            ).fetchone()
+        except sqlite3.Error:
+            return False
+        return bool(row and row[0] and "vec_ops(" in str(row[0]).lower())
+    return any(
+        "vec_ops(" in str(item.get("sql") or "").lower()
+        for item in preset.get("queries", [])
+    )
+
+
+def _execute_open_cell_query(
+    cell: str,
+    query: str,
+    db: sqlite3.Connection,
+    runtime_environ: dict[str, str] | None = None,
+) -> str:
+    """Execute one query against an already opened cell connection."""
+    # SQLite progress handler — abort after timeout
+    deadline = time.monotonic() + _QUERY_TIMEOUT_S
+
+    def _check_timeout():
+        if time.monotonic() > deadline:
+            return 1  # non-zero = abort
+        return 0
+
+    db.set_progress_handler(_check_timeout, 1000)  # check every 1K opcodes
+
+    start = time.monotonic()
+    try:
+        result = execute_query(
+            db, query, cell=cell, runtime_environ=runtime_environ
+        )
+        elapsed_ms = (time.monotonic() - start) * 1000
+        _log_query(cell, query, result, elapsed_ms)
+        return result
+    except sqlite3.OperationalError as e:
+        if 'interrupt' in str(e).lower():
+            error_msg = json.dumps({"error": f"Query timed out after {_QUERY_TIMEOUT_S}s"})
+        else:
+            msg = str(e)
+            hint = None
+            if "no such column" in msg or "no such table" in msg:
+                hint = 'Use @orient to see available views, columns, and tables.'
+            elif "not valid SQL" in msg.lower() or "near " in msg:
+                hint = 'Use @orient to see query examples and syntax.'
+            error_msg = json.dumps({"error": msg, **({"hint": hint} if hint else {})})
+        _log_query(cell, query, error_msg, (time.monotonic() - start) * 1000)
+        return error_msg
+    except Exception as e:
+        error_msg = json.dumps({"error": f"{type(e).__name__}: {e}"})
+        _log_query(cell, query, error_msg, (time.monotonic() - start) * 1000)
+        return error_msg
+
+
+def _unknown_cell_result(cell: str) -> str:
+    from flex.registry import retired_cell_message
+
+    retired = retired_cell_message(cell)
+    if retired:
+        return json.dumps({"error": retired, "retired": True})
+    available = sorted(_known_cells)
+    on_disk = set(discover_cells()) - set(available)
+    msg = {"error": f"Unknown cell: {cell}", "available": available}
+    if on_disk:
+        msg["also_on_disk"] = sorted(on_disk)
+    return json.dumps(msg)
+
+
+def _ensure_ledger_query_cell() -> bool:
+    """Provision Ledger on its first query without a separate install command.
+
+    Ledger owns its schema and registration lifecycle.  Once its bespoke CLI is
+    removed, ``cell=ledger`` itself must be a sufficient entry point for a new
+    Flex installation.  Existing inactive or retired registrations remain
+    unavailable; only an as-yet unregistered Ledger cell is created here.
+    """
+    metadata = registry_cell_metadata("ledger")
+    if metadata is not None:
+        active = bool(metadata.get("active", 1))
+        if active:
+            _known_cells.add("ledger")
+        return active
+
+    from flex.registry import retired_cell_message
+
+    if retired_cell_message("ledger"):
+        return False
+
+    from flex.modules.extension.ledger.install import open_ledger
+
+    conn = open_ledger()
+    conn.close()
+    metadata = registry_cell_metadata("ledger")
+    if metadata and metadata.get("active", 1):
+        _known_cells.add("ledger")
+        return True
+    return False
+
+
+def _execute_ledger_mutation_query(
+    cell: str,
+    query: str,
+    runtime_environ: dict[str, str] | None = None,
+) -> str:
+    """Execute the writable contract owned by the Ledger cell."""
+    if _explicit_cells and cell not in _explicit_cells:
+        return _unknown_cell_result(cell)
+    if not _ensure_ledger_query_cell():
+        return _unknown_cell_result(cell)
+
+    from flex.modules.extension.ledger.install import open_ledger
+    from flex.modules.extension.ledger.sql import (
+        execute_mutation,
+        register_functions,
+    )
+
+    query_environ = dict(os.environ)
+    query_environ.update(runtime_environ or {})
+    try:
+        author = resolve_runtime_seed(
+            environ=query_environ, require_cell_id=False
+        )
+    except ValueError:
+        author = None
+
+    start = time.monotonic()
+    conn = open_ledger()
+    try:
+        register_functions(
+            conn,
+            author_provider=author.cell if author else None,
+            author_session_id=author.session_id if author else None,
+            author_source=author.source if author else None,
+        )
+        try:
+            result = execute_mutation(conn, query)
+        except sqlite3.DatabaseError as exc:
+            result = json.dumps({"error": str(exc)})
+        _log_query(cell, query, result, (time.monotonic() - start) * 1000)
+        return result
+    finally:
+        conn.close()
+
+
+def _execute_cell_query(
+    cell: str,
+    query: str,
+    runtime_environ: dict[str, str] | None = None,
+) -> str:
+    """Synchronous cell query — warm vectors only for semantic execution."""
+    if cell == "ledger":
+        if _explicit_cells and cell not in _explicit_cells:
+            return _unknown_cell_result(cell)
+        from flex.modules.extension.ledger.sql import mutation_operation
+        if mutation_operation(query) is not None:
+            return _execute_ledger_mutation_query(
+                cell, query, runtime_environ=runtime_environ
+            )
+        if not _ensure_ledger_query_cell():
+            return _unknown_cell_result(cell)
+    with get_cell(cell, warm_vec=False) as db:
+        if db is None:
+            return _unknown_cell_result(cell)
+        if not _query_needs_vectors(db, query, cell=cell):
+            return _execute_open_cell_query(
+                cell, query, db, runtime_environ=runtime_environ
+            )
+
+    # Semantic queries pay the cold-cache cost for their selected cell only.
+    with get_cell(cell, warm_vec=True) as db:
+        if db is None:
+            return _unknown_cell_result(cell)
+        return _execute_open_cell_query(
+            cell, query, db, runtime_environ=runtime_environ
+        )
 
 
 def _token_header(result_json: str) -> tuple[int, int, str]:
@@ -969,6 +1162,8 @@ def _token_header(result_json: str) -> tuple[int, int, str]:
 
     if isinstance(parsed, list):
         row_count = len(parsed)
+    elif isinstance(parsed, dict) and isinstance(parsed.get("results"), list):
+        row_count = len(parsed["results"])
     else:
         row_count = 0
 
@@ -981,49 +1176,25 @@ def _token_header(result_json: str) -> tuple[int, int, str]:
     return row_count, est_tokens, header
 
 
-def _truncate_row(row: dict) -> dict:
-    """Truncate string fields in a row for preview."""
-    out = {}
-    for k, v in row.items():
-        if isinstance(v, str) and len(v) > _PREVIEW_FIELD_LIMIT:
-            out[k] = v[:_PREVIEW_FIELD_LIMIT] + '...'
-        else:
-            out[k] = v
-    return out
-
-
-def _gate_response(result_json: str, header: str, row_count: int, est_tokens: int) -> str:
-    """Build gated preview response for large results.
-
-    Truncates string fields per row and caps total preview size.
-    Shows as many rows as fit within the char budget.
-    """
+def _continuation_owner(runtime_environ: dict[str, str]) -> str:
+    """Return a process-local caller key without exposing runtime identity."""
+    if runtime_environ:
+        encoded = json.dumps(
+            sorted(runtime_environ.items()), separators=(",", ":")
+        ).encode("utf-8")
+        return "runtime:" + hashlib.sha256(encoded).hexdigest()
     try:
-        parsed = json.loads(result_json)
-    except (json.JSONDecodeError, ValueError):
-        return result_json
+        return f"mcp-session:{id(server.request_context.session)}"
+    except (AttributeError, LookupError):
+        return "anonymous"
 
-    if not isinstance(parsed, list) or row_count == 0:
-        return result_json
 
-    # Build preview: truncate fields, accumulate rows up to char budget
-    preview_rows = []
-    total_chars = 0
-    for row in parsed[:_PREVIEW_ROWS]:
-        truncated = _truncate_row(row)
-        row_json = json.dumps(truncated, indent=2, default=str)
-        if total_chars + len(row_json) > _PREVIEW_CHAR_BUDGET and preview_rows:
-            break  # budget exceeded, but always show at least 1 row
-        preview_rows.append(truncated)
-        total_chars += len(row_json)
-
-    preview = json.dumps(preview_rows, indent=2, default=str)
-    shown = len(preview_rows)
+def _window_response(payload: dict, *, continuation: bool = False) -> str:
+    label = "continuation" if continuation else "windowed"
     return (
-        f"[{row_count} rows, ~{est_tokens / 1000:.1f}K tok — gated]\n"
-        f"Preview ({shown} of {row_count} rows, fields truncated to {_PREVIEW_FIELD_LIMIT} chars):\n"
-        f"{preview}\n\n"
-        f"Add LIMIT to your query, or prefix with ! to bypass the gate."
+        f"[{payload.get('row_count', 0)} rows, "
+        f"~{payload.get('estimated_tokens', 0) / 1000:.1f}K tok — {label}]\n"
+        + json.dumps(payload, indent=2, ensure_ascii=False, default=str)
     )
 
 
@@ -1035,7 +1206,10 @@ async def handle_call_tool(
     if name == "flex_relay":
         return await _handle_flex_relay(arguments)
 
-    if name != "flex_search":
+    # ``flex_search`` remains callable for already-installed clients, but is
+    # deliberately not advertised: new clients should receive one universal
+    # tool named ``flex``.
+    if name not in {"flex", "flex_search"}:
         return [types.TextContent(type="text", text=json.dumps({"error": f"Unknown tool: {name}"}))]
 
     if not arguments or "query" not in arguments:
@@ -1045,6 +1219,13 @@ async def handle_call_tool(
     if len(query) > 1_000_000:
         return [types.TextContent(type="text", text=json.dumps({"error": "Query too large (max 1MB)"}))]
     cell = arguments.get("cell", "claude_code")
+    try:
+        request_meta = server.request_context.meta
+        runtime_environ = environment_from_request_metadata(
+            request_meta.model_dump(exclude_none=True) if request_meta else None
+        )
+    except LookupError:
+        runtime_environ = {}
 
     # Merge external params dict into preset query string.
     # execute_preset parses "key=value" tokens from the query string — serializing
@@ -1054,16 +1235,27 @@ async def handle_call_tool(
         param_str = ' '.join(f'{k}={v}' for k, v in params_arg.items())
         query = f'{query} {param_str}'
 
-    # ! prefix = force bypass gate
-    force = False
+    # ``!`` continues the immutable result snapshot created by the same
+    # unprefixed query.  It never executes the SQL a second time.
+    continuation_requested = False
     if query.startswith('!'):
-        force = True
+        continuation_requested = True
         query = query[1:].lstrip()
 
     # orient (+ aliases) is never gated — introspection must return whole.
-    # Still subject to the force hard ceiling below.
-    if _is_ungated_preset(query):
-        force = True
+    ungated = _is_ungated_preset(query)
+    owner = _continuation_owner(runtime_environ)
+
+    if continuation_requested:
+        payload = _RESULT_WINDOWS.continue_result(
+            owner=owner,
+            cell=cell,
+            query=query,
+            page_chars=_CONTINUATION_CHAR_BUDGET,
+        )
+        return [types.TextContent(
+            type="text", text=_window_response(payload, continuation=True)
+        )]
 
     if _QUERY_SEMAPHORE.locked():
         return [types.TextContent(type="text", text=json.dumps({
@@ -1075,25 +1267,45 @@ async def handle_call_tool(
     loop = asyncio.get_running_loop()
     await _QUERY_SEMAPHORE.acquire()
     try:
-        result = await loop.run_in_executor(None, _execute_cell_query, cell, query)
+        result = await loop.run_in_executor(
+            None, partial(_execute_cell_query, cell, query, runtime_environ)
+        )
     finally:
         _QUERY_SEMAPHORE.release()
 
     # Token estimate header + gate
     row_count, est_tokens, header = _token_header(result)
 
-    if not force and est_tokens > _GATE_TOKEN_LIMIT:
-        gated = _gate_response(result, header, row_count, est_tokens)
-        return [types.TextContent(type="text", text=gated)]
-
-    # ! has a hard ceiling — never unbounded
-    if force and est_tokens > _GATE_FORCE_LIMIT:
-        truncated = result[:_GATE_FORCE_CHAR_LIMIT]
-        warning = (
-            f"\n\n[truncated at ~{_GATE_FORCE_LIMIT // 1000}K tokens — "
-            f"add LIMIT to query]"
+    if not ungated and est_tokens > _GATE_TOKEN_LIMIT:
+        payload = _RESULT_WINDOWS.start(
+            owner=owner,
+            cell=cell,
+            query=query,
+            result_json=result,
+            row_count=row_count,
+            estimated_tokens=est_tokens,
+            page_chars=_PREVIEW_CHAR_BUDGET,
         )
-        return [types.TextContent(type="text", text=f"{header}\n{truncated}{warning}")]
+        return [types.TextContent(type="text", text=_window_response(payload))]
+
+    # A fresh unprefixed query always supersedes any older continuation with
+    # the same caller/cell/query address.
+    _RESULT_WINDOWS.discard(owner, cell, query)
+
+    # Orientation is expected to remain small and complete.  If a malformed
+    # contract exceeds the absolute safety ceiling, return valid JSON rather
+    # than slicing through the serialized result.
+    if ungated and est_tokens > _GATE_FORCE_LIMIT:
+        error = {
+            "status": "result_too_large",
+            "row_count": row_count,
+            "estimated_tokens": est_tokens,
+            "limit_tokens": _GATE_FORCE_LIMIT,
+            "hint": "The orientation contract must be made smaller.",
+        }
+        return [types.TextContent(
+            type="text", text=f"{header}\n{json.dumps(error, indent=2)}"
+        )]
 
     return [types.TextContent(type="text", text=f"{header}\n{result}")]
 

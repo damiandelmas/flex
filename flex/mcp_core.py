@@ -16,6 +16,7 @@ from collections.abc import Callable
 # be copied without importing SQLite's private enum names from another package.
 _SQLITE_OK, _SQLITE_DENY = 0, 1
 _SQLITE_PRAGMA = 19
+_SQLITE_DELETE = 9
 _SQLITE_INSERT = 18
 _SQLITE_UPDATE = 23
 _SQLITE_ATTACH = 24
@@ -79,9 +80,7 @@ def materialize_authorizer(action, arg1, arg2, db_name, trigger_name):
     """
     if action == _SQLITE_PRAGMA:
         return _SQLITE_OK if (arg1 or "").lower() in _MATERIALIZE_PRAGMAS else _SQLITE_DENY
-    if action == _SQLITE_INSERT:
-        return _SQLITE_OK if db_name == "temp" else _SQLITE_DENY
-    if action == _SQLITE_UPDATE:
+    if action in {_SQLITE_INSERT, _SQLITE_UPDATE, _SQLITE_DELETE}:
         return _SQLITE_OK if db_name == "temp" else _SQLITE_DENY
     if action == _SQLITE_ATTACH:
         return _SQLITE_DENY

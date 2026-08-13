@@ -4,7 +4,7 @@ This cell indexes Codex CLI session provenance. Each source is a Codex
 session; each row is a prompt, assistant turn, tool call, tool result, file
 capture, or derived high-signal event.
 
-The cell is self-contained. Start here, not in the global `instructions` cell:
+The cell is self-contained. Start with its live contract:
 
 ```text
 cell="codex" query="@orient"

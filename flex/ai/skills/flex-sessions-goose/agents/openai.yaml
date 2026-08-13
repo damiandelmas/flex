@@ -1,0 +1,6 @@
+interface:
+  display_name: "Goose Sessions (Compatibility)"
+  short_description: "Forward Goose history to generic Flex"
+  default_prompt: "Use $flex:sessions:goose as a compatibility alias and continue through $flex with cell=goose."
+policy:
+  allow_implicit_invocation: false

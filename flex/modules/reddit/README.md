@@ -30,5 +30,5 @@ installs the module views, presets, and `@orient` instructions.
 Start with:
 
 ```bash
-flex core search --cell reddit "@orient"
+flex search --cell reddit "@orient"
 ```

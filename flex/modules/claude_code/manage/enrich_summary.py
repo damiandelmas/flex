@@ -7,6 +7,7 @@ uses text entropy. No re-embedding. Total runtime: ~30s.
 Output: _enrich_session_summary table (source_id PK -> auto-JOINs sessions view)
 """
 
+import os
 import sys
 import time
 from pathlib import Path
@@ -40,16 +41,145 @@ CREATE TABLE IF NOT EXISTS _enrich_session_summary (
 
 COMMIT_INTERVAL = 100
 
+# Bound on cumulative eligible-chunk rows resident at once. `run()` used to
+# `fetchall()` every missing session's chunks in one query (~5.05KB/chunk +
+# ~22MB fixed, measured linear in chunk count — see
+# changes/code/2026-07-16_enrich-summary-unbounded-fetchall onboard,
+# extrapolated ~4.8GB at 944,585 live chunks). Paging on the session_id axis
+# — never splitting one session's chunks across a page — bounds peak
+# resident rows to roughly this many (plus the one session that tips a page
+# over, since a single session is never split). Mirrors the rowid-cursor
+# pager shape in flex/gpu/fp16_reembed.py::_iter_chunk_pages (260713-1452),
+# adapted to a grouping boundary the consumer (per-session HDBSCAN) cannot
+# tolerate being split.
+FP_PAGE_ROWS = int(os.environ.get("FLEX_FP_PAGE_ROWS", "5000"))
+
+
+def _session_chunk_counts(db, session_ids):
+    """Eligible (embedding IS NOT NULL) chunk count per session_id in `session_ids`.
+
+    Cheap COUNT query — no content/embedding bytes touched — used only to
+    size batches in `_session_batches` below.
+    """
+    if not session_ids:
+        return {}
+    db.execute("DROP TABLE IF EXISTS _fp_incr")
+    db.execute("CREATE TEMP TABLE _fp_incr (source_id TEXT PRIMARY KEY)")
+    db.executemany("INSERT INTO _fp_incr VALUES (?)",
+                   [(sid,) for sid in session_ids])
+    try:
+        counts = db.execute("""
+            SELECT e.source_id, COUNT(*)
+            FROM _fp_incr el
+            JOIN _edges_source e ON el.source_id = e.source_id
+            JOIN _raw_chunks c ON e.chunk_id = c.id
+            WHERE c.embedding IS NOT NULL
+            GROUP BY e.source_id
+        """).fetchall()
+    finally:
+        db.execute("DROP TABLE IF EXISTS _fp_incr")
+    return {r[0]: r[1] for r in counts}
+
+
+def _session_batches(db, session_ids, page_rows=FP_PAGE_ROWS):
+    """Group `session_ids` into batches whose cumulative eligible-chunk row
+    count is bounded by `page_rows`, without ever splitting one session's
+    chunks across batches (a single session over the threshold gets its own
+    batch — correctness over strict bounding, per session-grouped HDBSCAN).
+
+    Order of `session_ids` is preserved, so every id appears in exactly one
+    yielded batch — nothing is skipped or duplicated across pages.
+    """
+    if not session_ids:
+        return
+    counts = _session_chunk_counts(db, session_ids)
+
+    batch = []
+    batch_rows = 0
+    for sid in session_ids:
+        n = counts.get(sid, 0)
+        if batch and batch_rows + n > page_rows:
+            yield batch
+            batch, batch_rows = [], 0
+        batch.append(sid)
+        batch_rows += n
+    if batch:
+        yield batch
+
+
+def _fetch_session_chunks(db, batch):
+    """Bulk-load (source_id, chunk-dict) rows for one batch of session ids.
+
+    Same query/shape as the original single-shot load — scoped to `batch`
+    instead of every missing session — grouped by source_id. Embedding
+    arrays are copied out of the fetched row tuples (`.copy()`) so the page's
+    row/BLOB objects are fully collectible once this function returns; a
+    bare `np.frombuffer` view keeps its backing bytes object alive via
+    `.base`, which is exactly the "del frees nothing" trap this pager exists
+    to avoid.
+    """
+    db.execute("CREATE TEMP TABLE _fp_incr (source_id TEXT PRIMARY KEY)")
+    db.executemany("INSERT INTO _fp_incr VALUES (?)",
+                   [(sid,) for sid in batch])
+    try:
+        rows = db.execute("""
+            SELECT e.source_id, c.id, c.embedding, c.content,
+                   e.position as message_number,
+                   t.tool_name, t.target_file
+            FROM _fp_incr el
+            JOIN _edges_source e ON el.source_id = e.source_id
+            JOIN _raw_chunks c ON e.chunk_id = c.id
+            LEFT JOIN _edges_tool_ops t ON c.id = t.chunk_id
+            WHERE c.embedding IS NOT NULL
+            ORDER BY e.source_id, e.position
+        """).fetchall()
+    finally:
+        db.execute("DROP TABLE IF EXISTS _fp_incr")
+
+    # Group by source_id (use index-based access — caller may not have row_factory)
+    session_chunks = {}
+    for r in rows:
+        sid = r[0]  # source_id
+        if sid not in session_chunks:
+            session_chunks[sid] = []
+        session_chunks[sid].append({
+            'id': r[1],
+            'embedding': np.frombuffer(r[2], dtype=np.float32).copy(),
+            'content': r[3] or '',
+            'tool_name': r[5],
+            'target_file': r[6],
+            'message_number': r[4] or 0,
+        })
+    del rows
+    return session_chunks
+
 
 # ---------------------------------------------------------------------------
 # Incremental — worker-callable, processes only missing sessions
 # ---------------------------------------------------------------------------
 
-def run(db):
+def run(db, page_rows=None):
     """Incremental fingerprinting — only sessions missing from _enrich_session_summary.
 
     Called by the worker's 30min enrichment cycle. Returns count of new fingerprints.
+
+    Loads chunks in bounded session-grouped pages (see `_session_batches`)
+    instead of one `fetchall()` across every missing session at once — peak
+    resident chunk rows is bounded by `page_rows` (default FP_PAGE_ROWS, plus
+    at most one oversized session), not by the total backlog. Output is
+    identical to the unpaged form: every missing session is still processed
+    exactly once, same fingerprint algorithm, same fence — only the load is
+    chunked.
+
+    Args:
+        page_rows: override for the per-page eligible-chunk row cap. Defaults
+            to FP_PAGE_ROWS (module constant / FLEX_FP_PAGE_ROWS env var).
+            Exposed mainly for tests that need to force multiple pages on a
+            small fixture.
     """
+    if page_rows is None:
+        page_rows = FP_PAGE_ROWS
+
     db.execute(CREATE_TABLE)
 
     # Find eligible sessions not yet fingerprinted
@@ -64,66 +194,39 @@ def run(db):
     if not missing_ids:
         return 0
 
-    # Bulk load chunks for missing sessions only
-    db.execute("CREATE TEMP TABLE _fp_incr (source_id TEXT PRIMARY KEY)")
-    db.executemany("INSERT INTO _fp_incr VALUES (?)",
-                   [(sid,) for sid in missing_ids])
-
-    rows = db.execute("""
-        SELECT e.source_id, c.id, c.embedding, c.content,
-               e.position as message_number,
-               t.tool_name, t.target_file
-        FROM _fp_incr el
-        JOIN _edges_source e ON el.source_id = e.source_id
-        JOIN _raw_chunks c ON e.chunk_id = c.id
-        LEFT JOIN _edges_tool_ops t ON c.id = t.chunk_id
-        WHERE c.embedding IS NOT NULL
-        ORDER BY e.source_id, e.position
-    """).fetchall()
-
-    db.execute("DROP TABLE IF EXISTS _fp_incr")
-
-    # Group by source_id (use index-based access — caller may not have row_factory)
-    session_chunks = {}
-    for r in rows:
-        sid = r[0]  # source_id
-        if sid not in session_chunks:
-            session_chunks[sid] = []
-        session_chunks[sid].append({
-            'id': r[1],
-            'embedding': np.frombuffer(r[2], dtype=np.float32),
-            'content': r[3] or '',
-            'tool_name': r[5],
-            'target_file': r[6],
-            'message_number': r[4] or 0,
-        })
-
-    del rows
-
     processed = 0
     hdbscan_count = 0
     short_count = 0
 
-    for sid, chunks in session_chunks.items():
-        n_content = sum(1 for ch in chunks
-                        if _is_content_chunk(ch) and ch.get('content', '').strip()
-                        and ch.get('embedding') is not None)
+    for batch in _session_batches(db, missing_ids, page_rows=page_rows):
+        session_chunks = _fetch_session_chunks(db, batch)
 
-        if n_content >= HDBSCAN_MIN_CHUNKS:
-            fingerprint = build_fingerprint(chunks)
-            hdbscan_count += 1
-        else:
-            fingerprint = build_short_fingerprint(chunks)
-            short_count += 1
+        for sid, chunks in session_chunks.items():
+            n_content = sum(1 for ch in chunks
+                            if _is_content_chunk(ch) and ch.get('content', '').strip()
+                            and ch.get('embedding') is not None)
 
-        db.execute("""
-            INSERT OR REPLACE INTO _enrich_session_summary
-            (source_id, fingerprint_index) VALUES (?, ?)
-        """, (sid, fingerprint))
-        processed += 1
+            if n_content >= HDBSCAN_MIN_CHUNKS:
+                fingerprint = build_fingerprint(chunks)
+                hdbscan_count += 1
+            else:
+                fingerprint = build_short_fingerprint(chunks)
+                short_count += 1
 
-        if processed % COMMIT_INTERVAL == 0:
-            db.commit()
+            db.execute("""
+                INSERT OR REPLACE INTO _enrich_session_summary
+                (source_id, fingerprint_index) VALUES (?, ?)
+            """, (sid, fingerprint))
+            processed += 1
+
+            if processed % COMMIT_INTERVAL == 0:
+                db.commit()
+
+        # Release this batch's chunk data (embedding arrays + content strings)
+        # before the next batch is fetched — this is the actual bound: at
+        # most one batch's worth of chunk data is resident at a time, not
+        # the whole missing-session backlog.
+        del session_chunks
 
     db.commit()
 

@@ -3,6 +3,8 @@
 from __future__ import annotations
 
 import json
+import os
+import sys
 import time
 from collections import Counter
 from pathlib import Path
@@ -92,7 +94,7 @@ def refresh_problems(
 
     problems = []
     for cell in selected:
-        if cell.get("lifecycle") != "refresh":
+        if cell.get("lifecycle") not in {"refresh", "watch"}:
             continue
         problem = refresh_problem(cell)
         if problem:
@@ -115,7 +117,7 @@ def refresh_summary(
 
     states = []
     for cell in selected:
-        if cell.get("lifecycle") == "refresh":
+        if cell.get("lifecycle") in {"refresh", "watch"}:
             states.append((cell, classify_refresh_state(cell)))
 
     problems = [
@@ -145,6 +147,29 @@ def refresh_summary(
 
 def local_worker_state() -> dict:
     """Best-effort local worker service state for watch-cell diagnostics."""
+    if sys.platform == "darwin":
+        target = f"gui/{os.getuid()}/dev.getflex.worker"
+        try:
+            result = subprocess.run(
+                ["launchctl", "print", target], capture_output=True, text=True, timeout=2,
+            )
+            return {
+                "known": True,
+                "active": result.returncode == 0,
+                "state": "active" if result.returncode == 0 else "inactive",
+                "manager": "launchd",
+                "service": "dev.getflex.worker",
+                "next": f"launchctl kickstart -k {target}",
+            }
+        except Exception:
+            return {
+                "known": False,
+                "active": None,
+                "state": "unknown",
+                "manager": "launchd",
+                "service": "dev.getflex.worker",
+                "next": f"launchctl print {target}",
+            }
     try:
         result = subprocess.run(
             ["systemctl", "--user", "is-active", "flex-worker.service"],
@@ -350,6 +375,43 @@ def watcher_summary(
     age = (now - last_reconcile) if last_reconcile else None
     queue = state.get("queue") or {}
     pending = queue.get("pending") if isinstance(queue, dict) else None
+    debt_cells = (
+        queue.get("reconciliation_required_cells", [])
+        if isinstance(queue, dict) else []
+    )
+
+    # This flag is persisted by the worker whenever an event batch could not
+    # be fully acknowledged. A live backend and a recent *previous* scan do
+    # not make that active correctness debt healthy.
+    if state.get("reconciliation_required"):
+        return {
+            "status": "degraded",
+            "reason": "reconciliation required after event processing debt",
+            "enabled": True,
+            "healthy": True,
+            "backend": state.get("backend"),
+            "pending": pending,
+            "reconciliation_cells": debt_cells,
+            "reconcile_age_s": age,
+        }
+
+    # Never reconciled is NOT healthy — it is unproven. `age` is None here, and the
+    # staleness check below is guarded on `age is not None`, so a watcher that has
+    # never completed a single reconciliation fell straight through to "ok". That is
+    # not a hypothetical: a live worker reported {healthy: true, last_reconcile_ts:
+    # null} for three days while every corpus cell went stale behind a blocked tick.
+    # The backstop that would have named it was itself reporting green, because a
+    # degraded input (None) produced a valid-looking output (not-stale).
+    if last_reconcile is None:
+        return {
+            "status": "degraded",
+            "reason": "watcher has never completed a reconciliation",
+            "enabled": True,
+            "healthy": False,
+            "backend": state.get("backend"),
+            "pending": pending,
+            "reconcile_age_s": None,
+        }
 
     if age is not None and age > stale_after:
         return {

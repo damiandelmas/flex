@@ -19,7 +19,6 @@ import os
 import signal
 import sys
 import threading
-import time
 
 
 def _start_daemon_thread(target, *args, name: str):
@@ -36,67 +35,6 @@ def _start_daemon_thread(target, *args, name: str):
 
 
 # ============================================================
-# Background Indexer (defense-in-depth for platforms without daemon)
-# ============================================================
-
-async def _background_indexer():
-    """Background task: scans for changed sessions and runs enrichment.
-
-    Defense-in-depth. On platforms with a daemon (systemd/launchd), this
-    finds nothing new. On platforms without a daemon (Windows, broken
-    installs), this is the only thing keeping the cell fresh.
-    """
-    try:
-        from flex.engine import drain_primary_cell, drain_local_cells, run_enrichment
-    except ImportError:
-        return
-
-    from flex.registry import resolve_cell
-
-    ENRICH_INTERVAL = 30 * 60  # 30 minutes
-    POLL_INTERVAL = 2
-
-    # Wait for cell to exist
-    cell_path = None
-    while cell_path is None:
-        try:
-            cell_path = resolve_cell("claude_code")
-        except Exception:
-            pass
-        if cell_path is None or not cell_path.exists():
-            cell_path = None
-            await asyncio.sleep(5)
-
-    print("[flex-mcp] Background indexer started", file=sys.stderr)
-
-    loop = asyncio.get_running_loop()
-    last_enrich = 0
-    last_chat_scan = 0
-    CHAT_SCAN_INTERVAL = 30
-
-    while True:
-        try:
-            await loop.run_in_executor(None, drain_primary_cell, cell_path)
-
-            now = time.monotonic()
-
-            if now - last_chat_scan >= CHAT_SCAN_INTERVAL:
-                await loop.run_in_executor(None, drain_local_cells)
-                last_chat_scan = now
-
-            if now - last_enrich >= ENRICH_INTERVAL:
-                await loop.run_in_executor(None, run_enrichment, cell_path)
-                last_enrich = now
-
-            await asyncio.sleep(POLL_INTERVAL)
-        except asyncio.CancelledError:
-            break
-        except Exception as e:
-            print(f"[flex-mcp] bg indexer error: {e}", file=sys.stderr)
-            await asyncio.sleep(POLL_INTERVAL)
-
-
-# ============================================================
 # Stdio Transport
 # ============================================================
 
@@ -106,27 +44,12 @@ async def _run_stdio(active_names: list[str] | None = None, no_embed: bool = Fal
     from flex.mcp_server import get_server, warm_cells
 
     server = get_server()
-    bg_task = None
-    warm_thread = None
-    try:
-        async with stdio_server() as (read_stream, write_stream):
-            if active_names and not no_embed:
-                warm_thread = _start_daemon_thread(
-                    warm_cells, active_names, name="flex-vector-warmup"
-                )
-            if os.environ.get("FLEX_MCP_ENABLE_STDIO_INDEXER") == "1":
-                bg_task = asyncio.create_task(_background_indexer())
-            await server.run(
-                read_stream, write_stream, server.create_initialization_options()
-            )
-    finally:
-        for task in (bg_task,):
-            if task:
-                task.cancel()
-                try:
-                    await task
-                except asyncio.CancelledError:
-                    pass
+    async with stdio_server() as (read_stream, write_stream):
+        if active_names and not no_embed:
+            _start_daemon_thread(warm_cells, active_names, name="flex-vector-warmup")
+        await server.run(
+            read_stream, write_stream, server.create_initialization_options()
+        )
 
 
 # ============================================================
@@ -273,6 +196,8 @@ def main():
                         help="Cell names to load (repeatable)")
     parser.add_argument("--no-embed", action="store_true",
                         help="Skip loading embeddings/VectorCache")
+    parser.add_argument("--prewarm", action="store_true",
+                        help="Prewarm all active cell VectorCaches at startup")
     parser.add_argument("--http", action="store_true",
                         help="Run as streamable HTTP server")
     parser.add_argument("--port", type=int, default=7134,
@@ -280,9 +205,6 @@ def main():
     args = parser.parse_args()
 
     from flex.mcp_server import init
-    from flex.instructions import ensure_instructions_cell
-
-    ensure_instructions_cell()
 
     # Discover cells: --cell flags override, otherwise scan filesystem
     if args.cell:
@@ -291,15 +213,20 @@ def main():
         restrict_to_cells = True
     else:
         from flex.mcp_server import discover_cells
-        from flex.registry import discover_active_cells
         cell_names = discover_cells()
-        active_names = discover_active_cells()
+        active_names = cell_names
         restrict_to_cells = False
         print(f"[flex-mcp] Discovered {len(cell_names)} cells: {cell_names}", file=sys.stderr)
 
+    # An unrestricted server may expose dozens of cells. Warming every matrix
+    # eagerly defeats the LRU budget because allocator/RSS pressure survives
+    # individual evictions. Keep broad servers lazy; explicit --cell servers
+    # remain warm by default, and --prewarm is the opt-in for bulk warming.
+    warm_names = active_names if (args.cell or args.prewarm) else []
+
     init(
         cell_names,
-        active_names=active_names,
+        active_names=warm_names,
         no_embed=args.no_embed,
         warm=False,
         restrict_to_cells=restrict_to_cells,
@@ -308,9 +235,9 @@ def main():
     print(f"[flex-mcp] Ready", file=sys.stderr)
 
     if args.http:
-        run_http_server(args.port, active_names=active_names, no_embed=args.no_embed)
+        run_http_server(args.port, active_names=warm_names, no_embed=args.no_embed)
     else:
-        asyncio.run(_run_stdio(active_names=active_names, no_embed=args.no_embed))
+        asyncio.run(_run_stdio(active_names=warm_names, no_embed=args.no_embed))
 
 
 if __name__ == "__main__":

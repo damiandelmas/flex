@@ -358,17 +358,10 @@ def main():
     from flex.views import regenerate_views
     regenerate_views(db, {'chunks': 'chunk', 'sources': 'source'})
 
-    # Presets
-    from flex.retrieve.presets import install_presets
-    preset_dir = Path(__file__).resolve().parent.parent.parent.parent / 'retrieve' / 'presets' / 'general'
-    if preset_dir.exists():
-        install_presets(db, preset_dir)
-    platform_preset_dir = Path(__file__).parent.parent / 'stock' / 'presets'
-    if platform_preset_dir.exists():
-        install_presets(db, platform_preset_dir)
-
     # Metadata
     set_meta(db, 'cell_type', 'github')
+    from flex.manage.install_presets import ensure_cell_presets
+    ensure_cell_presets(db, 'github')
     set_meta(db, 'description', args.description or 'GitHub Issues content')
     set_meta(db, 'created_at', datetime.now(timezone.utc).isoformat())
     max_ts = db.execute("SELECT MAX(timestamp) FROM _raw_chunks").fetchone()[0] or 0

@@ -21,12 +21,34 @@ from flex.modules.markdown.compile.wikilinks import (
     extract_raw_wikilinks, resolve_all_wikilinks,
 )
 
+# Vault reconcile cadence. The walk is an rglob + stat over the whole vault; on a
+# real vault on a slow mount it is ~165s for 22k notes and NO per-file tuning fixes
+# that — the cost is the walk itself. It ran on every ~2s tick of the daemon's
+# single serial loop, so it starved capture and every corpus cell behind it for
+# minutes at a time.
+#
+# Same rule the corpus drain already settled: the walk is the correctness FLOOR,
+# not the freshness path. Sub-cadence freshness is the watcher's job (this cell is
+# watched); the walk only has to catch what events miss, so it does not belong on
+# every tick. Env-tunable.
+_VAULT_RECONCILE_INTERVAL_S = float(
+    os.environ.get("FLEX_VAULT_RECONCILE_INTERVAL_S", "900"))
+# Seeded to None → first tick DEFERS the walk one full interval, it does not run it.
+# The corpus drain seeds its cursor to 0.0 so a restart reconciles immediately, and
+# that is right there: its walk is pruned and cheap (~76ms). This one is 165s of 9p
+# round-trips, so "run it on the first tick" means every restart pays a ~3-minute
+# capture stall before the daemon does anything else. `last_soma_heal = time.time()`
+# is the precedent in this same loop: an expensive periodic pass starts its clock at
+# startup rather than firing into a cold process.
+_last_vault_scan: float | None = None
+
 # Module-level stat-signature cache, persisted across daemon ticks
 _size_cache: dict[str, dict[str, str]] = {}  # {cell_name: {rel_path: size:mtime_ns}}
 _hash_cache: dict[str, dict[str, str]] = {}  # {cell_name: {rel_path: sha256}}
 _change_counts: dict[str, int] = {}           # {cell_name: changes since last graph}
 
 GRAPH_STALENESS_THRESHOLD = 20
+_WIKILINKS_PENDING_META_KEY = 'wikilinks_pending:markdown'
 
 
 def _content_hash(path: Path) -> str:
@@ -201,7 +223,7 @@ def _cleanup_stale(db, vault_root: Path, current_paths: set):
     return removed
 
 
-def scan_markdown_cells(embed_fn=None) -> dict:
+def scan_markdown_cells(embed_fn=None, deadline: float | None = None) -> dict:
     """Called by the daemon on the 2-second tick.
 
     For each registered markdown/obsidian cell with lifecycle='watch':
@@ -215,7 +237,19 @@ def scan_markdown_cells(embed_fn=None) -> dict:
 
     Returns dict with 'indexed' and 'skipped' counts.
     """
+    global _last_vault_scan
     stats = {'indexed': 0, 'skipped': 0}
+
+    # Throttled: the walk (step 1) is the whole cost and it is a correctness floor,
+    # not the freshness path — see _VAULT_RECONCILE_INTERVAL_S. Running it on every
+    # 2s tick put a multi-minute rglob in the middle of the daemon's serial loop.
+    now_mono = time.monotonic()
+    if _last_vault_scan is None:
+        _last_vault_scan = now_mono   # start the clock; do not walk on the first tick
+        return stats
+    if now_mono - _last_vault_scan < _VAULT_RECONCILE_INTERVAL_S:
+        return stats
+    _last_vault_scan = now_mono
 
     # Find markdown/obsidian cells with lifecycle='watch'
     watched = discover_watched()
@@ -232,6 +266,10 @@ def scan_markdown_cells(embed_fn=None) -> dict:
             continue
 
         db = open_cell(cell['path'])
+        pending_row = db.execute(
+            "SELECT value FROM _meta WHERE key=?", (_WIKILINKS_PENDING_META_KEY,)
+        ).fetchone()
+        wikilinks_pending = bool(pending_row and pending_row[0] == '1')
 
         # Initialize caches — first tick just populates, doesn't index
         first_tick = cell_name not in _size_cache
@@ -243,15 +281,41 @@ def scan_markdown_cells(embed_fn=None) -> dict:
         sizes = _size_cache[cell_name]
         hashes = _hash_cache[cell_name]
 
-        entries = list(walk_vault(vault_root))
+        # Do not materialize ``walk_vault``: on large slow vaults the old list()
+        # exhausted the entire rglob before this worker checked its nominal tick
+        # deadline.  An interrupted discovery is not deletion authority, so its
+        # partial path set is used only for additive/change work; cleanup waits
+        # for a complete future reconciliation.
+        entries = []
+        discovery_complete = True
+        for entry in walk_vault(vault_root, deadline=deadline):
+            if deadline is not None and time.time() >= deadline:
+                discovery_complete = False
+                stats['deadline_hit'] = stats.get('deadline_hit', 0) + 1
+                break
+            entries.append(entry)
+        else:
+            if deadline is not None and time.time() >= deadline:
+                discovery_complete = False
+                stats['deadline_hit'] = stats.get('deadline_hit', 0) + 1
+        if not discovery_complete:
+            # This reconciliation made only a safe prefix.  Retry on the next
+            # daemon tick instead of treating the normal reconcile cadence as a
+            # 15-minute delay for every unvisited note.
+            _last_vault_scan = now_mono - _VAULT_RECONCILE_INTERVAL_S
         current_paths = {e.rel_path for e in entries}
 
         # First tick: populate cache only, don't treat everything as new
         if first_tick:
             for entry in entries:
                 sizes[entry.rel_path] = f"{entry.size}:{entry.path.stat().st_mtime_ns}"
-            db.close()
-            continue
+            # A pending topology resolution is durable specifically so a process
+            # restart can finish it.  A complete first discovery supplies the
+            # maps it needs; do not let the cache warmup fast path erase that
+            # liveness obligation.
+            if not wikilinks_pending or not discovery_complete:
+                db.close()
+                continue
 
         files_added = []
         files_removed = []
@@ -273,13 +337,14 @@ def scan_markdown_cells(embed_fn=None) -> dict:
                     sizes[key] = signature
 
         # Detect deletions
-        for old_key in list(sizes.keys()):
-            if old_key not in current_paths:
-                files_removed.append(old_key)
-                del sizes[old_key]
-                hashes.pop(old_key, None)
+        if discovery_complete:
+            for old_key in list(sizes.keys()):
+                if old_key not in current_paths:
+                    files_removed.append(old_key)
+                    del sizes[old_key]
+                    hashes.pop(old_key, None)
 
-        if not files_added and not files_changed and not files_removed:
+        if not files_added and not files_changed and not files_removed and not wikilinks_pending:
             db.close()
             continue
 
@@ -294,11 +359,31 @@ def scan_markdown_cells(embed_fn=None) -> dict:
             for entry, signature, content_hash in files_changed
         ]
         limit = max(1, int(os.environ.get('FLEX_DRAIN_FILES_PER_CELL', '200')))
+        cursor_row = db.execute(
+            "SELECT value FROM _meta WHERE key='drain_cursor:markdown'"
+        ).fetchone()
         selected = fair_batch(db, 'markdown', candidates, limit)
-        if selected:
-            db.commit()
+        # fair_batch optimistically stores the end of its proposed slice.  This
+        # tick may expire before consuming it; retain only the last entry we
+        # actually attempted so a deadline cannot skip a selected note.
+        if cursor_row:
+            db.execute(
+                "INSERT OR REPLACE INTO _meta (key,value) VALUES (?,?)",
+                ('drain_cursor:markdown', cursor_row[0]),
+            )
+        else:
+            db.execute("DELETE FROM _meta WHERE key='drain_cursor:markdown'")
         selected_added = []
-        for _key, (kind, entry, signature, content_hash) in selected:
+        for candidate_key, (kind, entry, signature, content_hash) in selected:
+            # A COUNT bound is not a TIME bound (cf. the document-workspace scans). This
+            # runs inside the daemon's single serial tick, and a vault can live on a
+            # slow mount (/mnt/c under WSL) with tens of thousands of notes, so a
+            # 200-file batch can stall the loop for minutes — starving capture and
+            # every corpus cell behind it. The fair_batch cursor is durable: what
+            # this defers resumes next tick.
+            if deadline is not None and time.time() >= deadline:
+                stats['deadline_hit'] = stats.get('deadline_hit', 0) + 1
+                break
             if _index_file(db, entry):
                 stats['indexed'] += 1
                 _change_counts[cell_name] += 1
@@ -306,6 +391,10 @@ def scan_markdown_cells(embed_fn=None) -> dict:
                 stats['skipped'] += 1
             sizes[entry.rel_path] = signature
             hashes[entry.rel_path] = content_hash or _content_hash(entry.path)
+            db.execute(
+                "INSERT OR REPLACE INTO _meta (key,value) VALUES (?,?)",
+                ('drain_cursor:markdown', candidate_key),
+            )
             if kind == 'added':
                 selected_added.append(entry)
 
@@ -315,25 +404,51 @@ def scan_markdown_cells(embed_fn=None) -> dict:
             _change_counts[cell_name] += removed
 
         # Re-resolve wikilinks if topology changed (dirty-set)
-        if selected_added or files_removed:
+        topology_changed = bool(selected_added or files_removed)
+        if topology_changed:
+            # The resolver needs a second full walk.  Record this BEFORE that
+            # walk so a deadline, daemon restart, or resolver failure cannot
+            # make already-indexed topology changes permanently invisible.
+            db.execute(
+                "INSERT OR REPLACE INTO _meta (key,value) VALUES (?,?)",
+                (_WIKILINKS_PENDING_META_KEY, '1'),
+            )
+            wikilinks_pending = True
+        if wikilinks_pending and discovery_complete:
             try:
                 # Re-read entries for resolution maps
-                entries_fresh = list(walk_vault(vault_root))
-                aliases_by_path = {}
-                for e in entries_fresh:
-                    try:
-                        text = e.path.read_text(encoding='utf-8', errors='ignore')
-                        fm, _ = parse_frontmatter(text)
-                        als = extract_aliases(fm)
-                        if als:
-                            aliases_by_path[e.rel_path] = als
-                    except Exception:
-                        pass
+                entries_fresh = []
+                wikilink_discovery_complete = True
+                for entry in walk_vault(vault_root, deadline=deadline):
+                    if deadline is not None and time.time() >= deadline:
+                        wikilink_discovery_complete = False
+                        break
+                    entries_fresh.append(entry)
+                else:
+                    if deadline is not None and time.time() >= deadline:
+                        wikilink_discovery_complete = False
+                if not wikilink_discovery_complete:
+                    stats['deadline_hit'] = stats.get('deadline_hit', 0) + 1
+                else:
+                    aliases_by_path = {}
+                    for e in entries_fresh:
+                        try:
+                            text = e.path.read_text(encoding='utf-8', errors='ignore')
+                            fm, _ = parse_frontmatter(text)
+                            als = extract_aliases(fm)
+                            if als:
+                                aliases_by_path[e.rel_path] = als
+                        except Exception:
+                            pass
 
-                resolved, unresolved = resolve_all_wikilinks(db, entries_fresh, aliases_by_path)
-                if resolved or unresolved:
-                    print(f"  [{cell_name}] Wikilinks: {resolved} resolved, {unresolved} unresolved",
-                          file=sys.stderr)
+                    resolved, unresolved = resolve_all_wikilinks(db, entries_fresh, aliases_by_path)
+                    db.execute(
+                        "DELETE FROM _meta WHERE key=?", (_WIKILINKS_PENDING_META_KEY,)
+                    )
+                    wikilinks_pending = False
+                    if resolved or unresolved:
+                        print(f"  [{cell_name}] Wikilinks: {resolved} resolved, {unresolved} unresolved",
+                              file=sys.stderr)
             except Exception as e:
                 print(f"  [{cell_name}] Wikilink resolution error: {e}", file=sys.stderr)
 

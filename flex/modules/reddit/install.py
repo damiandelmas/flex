@@ -92,37 +92,22 @@ def _parse_since_days(raw: str | None) -> int:
 
 
 def _install_query_surface(db) -> None:
-    """Install reddit views, presets, and self-description metadata."""
+    """Install reddit views and validate its file-backed query contract."""
     from flex.core import set_meta
-    from flex.retrieve.presets import install_presets
     from flex.views import install_views, regenerate_views
 
     root = Path(__file__).resolve().parent
     views_dir = root / "stock" / "views"
-    presets_dir = root / "stock" / "presets"
-    general_presets = root.parents[1] / "retrieve" / "presets" / "general"
+
+    set_meta(db, "cell_type", "reddit")
+    set_meta(db, "description", MODULE["description"])
 
     if views_dir.exists():
         install_views(db, views_dir)
     regenerate_views(db)
 
-    db.execute(
-        """
-        CREATE TABLE IF NOT EXISTS _presets (
-            name TEXT PRIMARY KEY,
-            description TEXT,
-            params TEXT DEFAULT '',
-            sql TEXT
-        )
-        """
-    )
-    if general_presets.exists():
-        install_presets(db, general_presets)
-    if presets_dir.exists():
-        install_presets(db, presets_dir)
-
-    set_meta(db, "cell_type", "reddit")
-    set_meta(db, "description", MODULE["description"])
+    from flex.manage.install_presets import ensure_cell_presets
+    ensure_cell_presets(db, "reddit")
 
 
 def _bootstrap_cell(cell_name: str, subreddits: list[str]) -> Path:
@@ -237,10 +222,10 @@ def run(args, console) -> None:
     panel_content.append(f"{cell_name}\n", style="green")
     panel_content.append("MCP Server            ", style="")
     panel_content.append("http://localhost:7134/mcp\n\n", style="green")
-    panel_content.append("  flex core search --cell ", style="bold")
+    panel_content.append("  flex search --cell ", style="bold")
     panel_content.append(f"{cell_name} ", style="bold green")
     panel_content.append('"@orient"\n', style="bold")
-    panel_content.append("  flex core search --cell ", style="bold")
+    panel_content.append("  flex search --cell ", style="bold")
     panel_content.append(f"{cell_name} ", style="bold green")
     panel_content.append('"SELECT subreddit, COUNT(*) FROM threads GROUP BY subreddit"\n', style="bold")
     console.print(Panel(panel_content, padding=(1, 2), highlight=False))

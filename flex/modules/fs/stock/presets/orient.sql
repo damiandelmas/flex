@@ -38,12 +38,8 @@ SELECT COALESCE((SELECT value FROM _meta WHERE key='embed'),'false') AS enabled,
 -- @query: capabilities
 SELECT 'keyword()' AS surface, 'FTS5 exact-term retrieval across every file kind' AS use
 UNION ALL SELECT 'vec_ops()', 'semantic retrieval when embed=true'
-UNION ALL SELECT '@callers/@callees/@impact', 'Python and JS/TS call navigation'
-UNION ALL SELECT '@subtree', 'heading and symbol containment'
+UNION ALL SELECT '_edges_tree', 'heading/symbol containment via recursive SQL'
 UNION ALL SELECT '_fields_inline/_edges_wikilink', 'Markdown metadata; vault links when obsidian=true';
 
 -- @query: columns
 SELECT 'chunks' AS view, group_concat(name, ', ') AS columns FROM pragma_table_info('chunks');
-
--- @query: presets
-SELECT name, description, params FROM _presets ORDER BY name;

@@ -1,5 +1,5 @@
 <p align="center">
-  <img src="assets/banner.png" alt="flex" width="100%">
+  <img src="https://raw.githubusercontent.com/damiandelmas/flex/main/assets/banner.png" alt="flex" width="100%">
 </p>
 
 # flex
@@ -22,6 +22,9 @@ required.
 
 ## quick start
 
+The installer currently supports macOS and Linux with Bash, Python 3.12+, `git`,
+`curl`, and `file`. Native Windows support is not available yet.
+
 Install flex for Claude Code:
 
 ```bash
@@ -35,8 +38,10 @@ curl -sSL https://getflex.dev/install.sh | bash -s -- codex
 ```
 
 The installer creates a cell from your existing session history, configures the
-MCP server, and starts background refresh. Start a new client session so it loads
-the new MCP configuration, then ask:
+MCP server, and starts background refresh. Session transcripts can contain prompts,
+tool output, and local paths; Flex stores the resulting cell locally under
+`~/.flex/`. Start a new client session so it loads the new MCP configuration, then
+ask:
 
 ```text
 Use flex to orient me to my coding history, then find the decisions that shaped
@@ -55,7 +60,9 @@ To verify the installation from the shell:
 
 ```bash
 flex health --json
-flex core search --cell claude_code "@orient"
+# choose the cell that was installed
+flex search --cell claude_code "@orient"  # Claude Code
+flex search --cell codex "@orient"        # Codex CLI
 ```
 
 ### let your coding agent install it
@@ -68,7 +75,7 @@ Install flex for this client. Use the installer at https://getflex.dev: pass
 Preserve existing flex cells and configuration. Treat any non-zero command or
 unhealthy service as a blocking error. Run `flex health --json`, inspect the JSON,
 and require `status` to be `ok`; the command can report degraded state without a
-non-zero exit. Then verify the query path with `flex core search --cell CELL
+non-zero exit. Then verify the query path with `flex search --cell CELL
 "@orient"`. MCP configuration is loaded at client startup, so do not claim the
 flex MCP tool is available in this running session; tell me to start a new session
 and give me the exact first prompt to run.
@@ -99,7 +106,10 @@ flex init --module filesystem --path /path/to/folder --no-watch
 
 Embeddings are enabled by default. New embedded cells use the revision-pinned
 Nomic v1.5 fp32 model locally, with 768-dimensional storage and a 256-dimensional
-Matryoshka query surface. No embedding API key is required.
+Matryoshka query surface. No embedding API key is required. Structural
+publication is independent: objects, metadata, relationships, and FTS become
+queryable as one committed generation, while NULL vectors converge afterward.
+Semantic backlog never makes exact SQL or keyword retrieval stale.
 
 Refresh is atomic per file: a failed or unreadable update preserves the last good
 indexed version. Filesystem events provide low-latency updates; reconciliation
@@ -108,7 +118,7 @@ catches missed events, restarts, deletions, and edits made while flex was stoppe
 After creating a cell, start here:
 
 ```bash
-flex core search --cell CELL "@orient"
+flex search --cell CELL "@orient"
 ```
 
 `@orient` reports the cell's root, source types, schema, embedding mode, freshness,
@@ -338,12 +348,13 @@ external source.
 
 ### one interface, local-first
 
-MCP is transport, not topology. The agent sees a single read-only tool —
-`flex_search` against a named cell — and retrieval happens inside the cell (see
+MCP is transport, not topology. The agent sees one universal query tool — `flex`
+against a named cell — and retrieval happens inside the cell (see
 [retrieval is a composition](#retrieval-is-a-composition)). The `flex core` CLI is
 for installation and operations: initialize sources, inspect cells, and diagnose
 health. The durable artifact is the cell itself — one local SQLite file, normally
-under `~/.flex/cells/`.
+under `~/.flex/cells/`. Installations with the optional relay dependency may also
+expose `flex_relay`, an explicit operational control for remote MCP access.
 
 ## local-first, optionally networked
 
@@ -393,7 +404,7 @@ FLEX_ONNX_THREADS=8 flex reembed
 ```bash
 flex health --json                         # services, cells, refresh, watchers
 flex status                               # cell lifecycle and freshness
-flex core search --cell CELL "@orient"    # inspect a cell's live contract
+flex search --cell CELL "@orient"    # inspect a cell's live contract
 flex sync --cell CELL                     # bring one cell into parity
 flex warm                                 # inspect or manage the vector warm set
 ```

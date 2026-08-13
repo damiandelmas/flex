@@ -407,17 +407,10 @@ def main():
     from flex.views import regenerate_views
     regenerate_views(db)
 
-    # Presets
-    from flex.retrieve.presets import install_presets
-    preset_dir = Path(__file__).resolve().parent.parent.parent.parent / 'retrieve' / 'presets' / 'general'
-    if preset_dir.exists():
-        install_presets(db, preset_dir)
-    hn_preset_dir = Path(__file__).parent.parent / 'stock' / 'presets'
-    if hn_preset_dir.exists():
-        install_presets(db, hn_preset_dir)
-
     # Metadata
     set_meta(db, 'cell_type', 'hn')
+    from flex.manage.install_presets import ensure_cell_presets
+    ensure_cell_presets(db, 'hn')
     set_meta(db, 'description', args.description or 'Hacker News content')
     set_meta(db, 'created_at', datetime.now(timezone.utc).isoformat())
     set_meta(db, 'queries', json.dumps(queries))

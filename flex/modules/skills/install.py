@@ -56,10 +56,9 @@ def register_args(parser) -> None:
 def run(args, console) -> None:
     """Bootstrap a queryable tools cell without doing network work by default."""
     from flex.cli import _install_claude_assets
-    _install_claude_assets(("flex:tools",))
+    _install_claude_assets(("flex",))
     from flex.core import log_op, open_cell, set_meta, validate_cell
     from flex.registry import CELLS_DIR, register_cell
-    from flex.retrieve.presets import install_presets
     from flex.views import install_views, regenerate_views
     from flex.modules.skills.compile.worker import SCHEMA_DDL
 
@@ -86,11 +85,9 @@ def run(args, console) -> None:
     if views_dir.exists():
         install_views(db, views_dir)
 
-    general_presets = module_root.parents[1] / "retrieve" / "presets" / "general"
-    if general_presets.exists():
-        install_presets(db, general_presets)
-
     regenerate_views(db)
+    from flex.manage.install_presets import ensure_cell_presets
+    ensure_cell_presets(db, "tools")
     validate_cell(db)
 
     log_op(
@@ -120,4 +117,4 @@ def run(args, console) -> None:
         refresh(str(cell_path), dry_run=False, modes=["search"])
 
     console.print(f"  tools cell          [green]{cell_name}[/green]")
-    console.print("  query               [bold]flex core search --cell tools \"@orient\"[/bold]")
+    console.print("  query               [bold]flex search --cell tools \"@orient\"[/bold]")

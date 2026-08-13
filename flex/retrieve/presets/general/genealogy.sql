@@ -4,12 +4,16 @@
 -- @multi: true
 
 -- @query: timeline
-SELECT DISTINCT src.source_id, src.file_date, src.title
+-- file_date is doc-cell shaped and is empty on coding-agent cells, where it would
+-- make this ordering a no-op. Fall back to the source's earliest chunk timestamp,
+-- which every cell type has.
+SELECT src.source_id, src.file_date, src.title
 FROM _raw_chunks c
 JOIN _edges_source e ON c.id = e.chunk_id
 JOIN _raw_sources src ON e.source_id = src.source_id
 WHERE c.content LIKE '%' || :concept || '%'
-ORDER BY src.file_date;
+GROUP BY src.source_id, src.file_date, src.title
+ORDER BY COALESCE(NULLIF(src.file_date, ''), datetime(MIN(c.timestamp), 'unixepoch'));
 
 -- @query: hub_sources
 SELECT DISTINCT src.source_id, src.title,

@@ -9,7 +9,9 @@ Per-cell procedure:
   1. Resolve the cell; refuse if already `vec:model=nomic-v1.5-fp32` unless `force`.
      (A cell tagged plain `nomic-v1.5` is the legacy int8 space — running this
      tool on it converts it forward to fp32, never leaving a mixed-space window.)
-  2. Freeze ingest: `registry.set_active(name, False)` + drain in-flight embed.
+  2. The CLI first quiesces the managed worker and MCP. This function records
+     registry active state only so it can restore the prior warm/discovery
+     declaration; registry state alone is not a writer lock.
   3. `PRAGMA wal_checkpoint(TRUNCATE)` on the LIVE db (fold WAL into the main file).
   4. Backup the live db (reuses `_backup_path`).
   5. Copy live -> `<stem>.reembed.tmp` (same dir/filesystem, for atomic replace).
@@ -137,11 +139,7 @@ def _migration_eligibility(db_path: Path) -> tuple[bool, str | None]:
 
 
 def _drain_ingest(_name: str | None) -> None:
-    """Best-effort wait for an in-flight `embed_new()` cycle to drain after
-    ingest has been frozen (`registry.set_active(name, False)`). There is no
-    per-cell lock file to poll here — a fixed short settle window covers the
-    common case (an in-process worker finishing its current commit) without
-    risking an indefinite hang if something else is stuck."""
+    """Small post-quiescence settle window; never a synchronization primitive."""
     time.sleep(_DRAIN_SETTLE_S)
 
 

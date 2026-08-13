@@ -1,0 +1,6 @@
+interface:
+  display_name: "Flex HN (Compatibility)"
+  short_description: "Forward Hacker News search to Flex"
+  default_prompt: "Use $flex:hn as a compatibility alias and continue through $flex with cell=hn."
+policy:
+  allow_implicit_invocation: false

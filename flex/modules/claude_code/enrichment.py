@@ -78,23 +78,12 @@ def run_enrichment(
                 failures.append(step)
 
         if progress_cb:
-            progress_cb("presets")
+            progress_cb("preset contract")
         try:
-            from flex.manage.install_presets import install_presets, _preset_dirs_for
-            for pd in _preset_dirs_for(cell_type):
-                if pd.exists():
-                    install_presets(conn, pd)
-            # Fallback: compatible cells still get the public coding-agent presets.
-            if cell_type != 'claude-code':
-                for pd in _preset_dirs_for('claude-code')[1:]:
-                    if pd.exists():
-                        install_presets(conn, pd)
-            conn.commit()
-            n_presets = conn.execute("SELECT COUNT(*) FROM _presets").fetchone()[0]
-            if n_presets == 0:
-                failures.append("presets (0 installed)")
+            from flex.manage.install_presets import ensure_cell_presets
+            ensure_cell_presets(conn, cell_type)
         except Exception:
-            failures.append("presets")
+            failures.append("preset contract")
 
         if progress_cb:
             progress_cb("views")
