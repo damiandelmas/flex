@@ -48,6 +48,16 @@ def _last_signature(conn: sqlite3.Connection) -> str | None:
     return f"legacy:{size}:{count}" if size or count else None
 
 
+def _embedding_debt(conn: sqlite3.Connection) -> int:
+    try:
+        return int(conn.execute(
+            "SELECT COUNT(*) FROM _raw_chunks "
+            "WHERE content IS NOT NULL AND embedding IS NULL"
+        ).fetchone()[0])
+    except sqlite3.OperationalError:
+        return 0
+
+
 def _record_meta(
     conn: sqlite3.Connection,
     primary_source: Path,
@@ -89,6 +99,14 @@ def _backfill_exec_wrappers(conn: sqlite3.Connection) -> int:
     return backfill_exec_command_wrappers(conn)
 
 
+def _backfill_thread_provenance(
+    conn: sqlite3.Connection, sources: list[CodexSource],
+) -> int:
+    from flex.modules.codex.compile.worker import backfill_codex_source_provenance
+
+    return backfill_codex_source_provenance(conn, sources)
+
+
 def _transpile_source(source: CodexSource, conn: sqlite3.Connection, meta: dict) -> dict:
     from flex.modules.codex.compile.worker import transpile
 
@@ -108,6 +126,16 @@ def _embed_and_enrich(conn: sqlite3.Connection) -> None:
         run_enrichment(conn, cell_type="codex")
     except Exception as e:
         print(f"[codex.refresh] enrichment failed: {e}", file=sys.stderr)
+    remaining = _embedding_debt(conn)
+    conn.execute(
+        "INSERT OR REPLACE INTO _meta(key,value) VALUES('semantic_pending',?)",
+        ('1' if remaining else '0',),
+    )
+    conn.execute(
+        "INSERT OR REPLACE INTO _meta(key,value) VALUES('semantic_status',?)",
+        ('pending' if remaining else 'ready',),
+    )
+    conn.commit()
 
 
 def refresh(cell_path: str, graph: bool = False, dry_run: bool = False) -> dict:
@@ -130,6 +158,8 @@ def refresh(cell_path: str, graph: bool = False, dry_run: bool = False) -> dict:
 
         primary_source = _source_from_meta(conn)
         sources = resolve_sources(conn)
+        if not dry_run and sources:
+            repaired += _backfill_thread_provenance(conn, sources)
 
         if not sources:
             result = {"chunks": 0, "sources": 0, "skipped": "source missing"}
@@ -140,41 +170,42 @@ def refresh(cell_path: str, graph: bool = False, dry_run: bool = False) -> dict:
         signature = combined_signature(sources)
         last_signature = _last_signature(conn)
         needs_resync = signature != last_signature
+        semantic_debt = _embedding_debt(conn)
 
         if dry_run:
             return {
                 "dry_run": True,
-                "needs_resync": needs_resync,
+                "needs_resync": needs_resync or semantic_debt > 0,
                 "sources": len([source for source in sources if source.usable]),
                 "source_candidates": len(sources),
             }
 
-        if not needs_resync and not graph:
+        if not needs_resync and semantic_debt == 0 and not graph:
             result = {"chunks": 0, "sources": 0, "skipped": "signature unchanged"}
             if repaired:
                 result["repaired"] = repaired
             return result
 
         ok_sources = [source for source in sources if source.usable]
-        conn.execute("DELETE FROM _types_codex_source")
-
         total_sessions = 0
         total_chunks = 0
-        for source in ok_sources:
-            meta = {
-                "source_kind": source.source_kind,
-                "codex_home": str(source.codex_home),
-                "sessions_dir": str(source.sessions_dir),
-                "state_db": str(source.state_db),
-                "source_order": source.source_order,
-            }
-            stats = _transpile_source(source, conn, meta)
-            total_sessions += stats.get("sessions", 0)
-            total_chunks += stats.get("chunks", 0)
+        if needs_resync:
+            conn.execute("DELETE FROM _types_codex_source")
+            for source in ok_sources:
+                meta = {
+                    "source_kind": source.source_kind,
+                    "codex_home": str(source.codex_home),
+                    "sessions_dir": str(source.sessions_dir),
+                    "state_db": str(source.state_db),
+                    "source_order": source.source_order,
+                }
+                stats = _transpile_source(source, conn, meta)
+                total_sessions += stats.get("sessions", 0)
+                total_chunks += stats.get("chunks", 0)
 
-        _record_meta(conn, primary_source, sources, signature)
+            _record_meta(conn, primary_source, sources, signature)
 
-        if total_chunks > 0 or graph:
+        if semantic_debt > 0 or total_chunks > 0 or graph:
             _embed_and_enrich(conn)
 
         result = {

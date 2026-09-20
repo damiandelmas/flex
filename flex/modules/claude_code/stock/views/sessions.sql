@@ -28,4 +28,8 @@ LEFT JOIN _types_source_warmup w ON src.source_id = w.source_id
 LEFT JOIN _enrich_session_summary ess ON src.source_id = ess.source_id
 LEFT JOIN _enrich_source_graph g ON src.source_id = g.source_id
 WHERE COALESCE(w.is_warmup_only, 0) = 0
+  AND EXISTS (
+      SELECT 1 FROM _coding_agent_source_visibility vis
+      WHERE vis.source_id = src.source_id AND vis.visible = 1
+  )
 GROUP BY src.source_id;

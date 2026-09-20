@@ -32,6 +32,16 @@ class LifecycleCoordinator:
 
         results: dict[str, str] = {}
         for cell in discover_watched():
+            # Active-append providers have their own cursor-qualified pass and
+            # bounded reconciliation owner. Sending them through the generic
+            # watch materializer as well launches a competing whole-source
+            # refresh and can overwrite a healthy append receipt with that
+            # child's failure.
+            if (
+                cell.get("detector") == "active_append"
+                or (cell.get("detector") is None and cell.get("cell_type") == "codex")
+            ):
+                continue
             if eligible is not None and not eligible(cell):
                 continue
             name = cell.get("name")
@@ -67,13 +77,19 @@ class LifecycleCoordinator:
         if not due:
             return {}
         results: dict[str, str] = {}
-        with try_heavy_lease(
-            detail="registry remote refreshes", timeout_s=_heavy_admission_wait_s()
-        ) as lease:
-            if not lease.acquired:
-                return {str(cell["name"]): "deferred" for cell in due}
-            for cell in due:
-                name = str(cell["name"])
+        for cell in due:
+            name = str(cell["name"])
+            # Admission is cell-scoped. A slow or timed-out remote provider must
+            # not retain the semantic lane while the scheduler advances through
+            # every other due cell; releasing here gives local publication and
+            # enrichment a fair opportunity between remote work units.
+            with try_heavy_lease(
+                detail=f"registry remote refresh: {name}",
+                timeout_s=_heavy_admission_wait_s(),
+            ) as lease:
+                if not lease.acquired:
+                    results[name] = "deferred"
+                    continue
                 try:
                     stats = self._materialize(name, scheduled=True, _heavy_admitted=True)
                     results[name] = (

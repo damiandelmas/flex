@@ -73,10 +73,10 @@ SELECT 'index an expanded self',
 
 -- @query: mutation_contract
 SELECT 'add' AS operation,
-       'INSERT INTO annotations(annotation_id,note,target_cell_id,target_chunk_id,wing,hall,room,weight,author_provider,author_session_id,author_source) VALUES(ledger_annotation_id(:target_cell_id,:target_chunk_id),:note,:target_cell_id,:target_chunk_id,:wing,:hall,:room,:weight,ledger_author_provider(),ledger_author_session_id(),ledger_author_source()) RETURNING annotation_id,target_cell_id,target_chunk_id' AS sql
+       'INSERT INTO annotations(annotation_id,note,target_cell_id,target_chunk_id,wing,hall,room,weight,author_provider,author_session_id,author_source) VALUES(:annotation_id,:note,:target_cell_id,:target_chunk_id,:wing,:hall,:room,:weight,:author_provider,:author_session_id,:author_source) RETURNING annotation_id,target_cell_id,target_chunk_id' AS sql
 UNION ALL
 SELECT 'revise',
-       'UPDATE annotations SET note=:note,wing=:wing,hall=:hall,room=:room,weight=:weight,author_provider=ledger_author_provider(),author_session_id=ledger_author_session_id(),author_source=ledger_author_source() WHERE target_cell_id=:target_cell_id AND target_chunk_id=:target_chunk_id RETURNING annotation_id'
+       'UPDATE annotations SET note=:note,wing=:wing,hall=:hall,room=:room,weight=:weight,author_provider=:author_provider,author_session_id=:author_session_id,author_source=:author_source WHERE target_cell_id=:target_cell_id AND target_chunk_id=:target_chunk_id RETURNING annotation_id'
 UNION ALL
 SELECT 'remove',
        'DELETE FROM annotations WHERE target_cell_id=:target_cell_id AND target_chunk_id=:target_chunk_id RETURNING annotation_id,target_cell_id,target_chunk_id';

@@ -9,6 +9,8 @@ from __future__ import annotations
 
 import importlib
 import sqlite3
+import sys
+import time
 from pathlib import Path
 from typing import Any, Callable
 
@@ -78,14 +80,18 @@ def run_from_spec(args, console, spec: dict[str, Any]) -> None:
     from rich.progress import BarColumn, Progress, SpinnerColumn, TextColumn
     from rich.text import Text
 
-    from flex.modules.claude_code import ENRICHMENT_STUBS, run_enrichment
-    from flex.modules.claude_code.compile.worker import (
-        _batch_embed_chunks,
-        bootstrap_claude_code_cell,
-    )
+    from flex.modules.claude_code import ENRICHMENT_STUBS
+    from flex.modules.claude_code.compile.worker import bootstrap_claude_code_cell
     from flex.modules.claude_code.contract import validate_coding_agent_cell
     from flex.registry import register_cell
-    from flex.cli import _install_claude_assets
+    from flex.cli import (
+        _install_claude_assets,
+        _install_launchd,
+        _install_systemd,
+        _patch_claude_json,
+        _start_services_direct,
+        _verify_services,
+    )
 
     cell_type = spec["cell_type"]
     name = getattr(args, "name", None) or spec.get("default_cell_name") or cell_type
@@ -116,7 +122,6 @@ def run_from_spec(args, console, spec: dict[str, Any]) -> None:
     )
     conn.commit()
 
-    n_comm = 0
     failed: list[str] = []
     transpile = _load_ref(spec["transpile"])
 
@@ -129,8 +134,8 @@ def run_from_spec(args, console, spec: dict[str, Any]) -> None:
         transient=False,
     ) as progress:
         t_ingest = progress.add_task("Ingesting sessions", total=None, info="", visible=True)
-        t_embed = progress.add_task("Building vectors", total=None, info="", visible=False)
-        t_graph = progress.add_task("Building graph", total=None, info="", visible=False)
+        t_embed = progress.add_task("Queueing vectors", total=None, info="", visible=False)
+        t_graph = progress.add_task("Publishing surface", total=None, info="", visible=False)
 
         def _p_cb(i, total, n_sessions, n_chunks, elapsed):
             progress.update(
@@ -148,34 +153,45 @@ def run_from_spec(args, console, spec: dict[str, Any]) -> None:
             info=f"{stats.get('sessions', 0)} sessions / {stats.get('chunks', 0)} chunks",
         )
 
-        progress.update(t_embed, visible=True, info="encoding")
-        if stats.get("chunks", 0) > 0:
-            def _e_cb(done, total):
-                progress.update(
-                    t_embed,
-                    completed=done,
-                    total=total,
-                    info=f"{done:,} / {total:,} chunks",
-                )
-            try:
-                _batch_embed_chunks(conn, quiet=True, progress_cb=_e_cb)
-            except Exception as e:
-                console.print(f"  [yellow]embed: {e}[/yellow]")
-                conn.commit()
-        progress.update(t_embed, visible=True, total=1, completed=1, info="done")
+        progress.update(
+            t_embed, visible=True, total=1, completed=1,
+            info=f"{stats.get('chunks', 0):,} chunks queued",
+        )
+        progress.update(t_graph, visible=True, info="publishing structural surface")
+        try:
+            from flex.cli import _find_view_dirs
+            from flex.manage.install_presets import ensure_cell_presets
+            from flex.views import install_views, regenerate_views
 
-        progress.update(t_graph, visible=True, info="analyzing")
-
-        def _g_cb(step):
-            progress.update(t_graph, info=step)
-
-        n_comm, failed = run_enrichment(conn, cell_type=cell_type, progress_cb=_g_cb)
+            for view_dir in _find_view_dirs("claude_code", cell_type):
+                install_views(conn, view_dir)
+            regenerate_views(conn)
+            ensure_cell_presets(conn, cell_type)
+            conn.commit()
+        except Exception as exc:
+            failed.append("structural surface")
+            console.print(f"  [yellow]surface: {exc}[/yellow]")
+        semantic_pending = bool(stats.get("chunks", 0))
+        model_available = bool(getattr(args, "_model_ok", True))
+        conn.execute(
+            "INSERT OR REPLACE INTO _meta(key,value) VALUES('semantic_status',?)",
+            (
+                "ready" if not semantic_pending
+                else "pending" if model_available
+                else "unavailable",
+            ),
+        )
+        conn.execute(
+            "INSERT OR REPLACE INTO _meta(key,value) VALUES('semantic_pending',?)",
+            ("1" if semantic_pending else "0",),
+        )
+        conn.commit()
         progress.update(
             t_graph,
             visible=True,
             total=1,
             completed=1,
-            info=f"{n_comm} topic clusters found" if n_comm else "done",
+            info="queued for background convergence",
         )
 
     try:
@@ -204,11 +220,26 @@ def run_from_spec(args, console, spec: dict[str, Any]) -> None:
         **_registration_lifecycle_kwargs(spec, source),
     )
 
+    if sys.platform != "win32":
+        managed = _install_systemd() or _install_launchd()
+        time.sleep(1)
+        worker_ok, mcp_ok = _verify_services()
+        if not worker_ok or not mcp_ok:
+            _start_services_direct()
+            time.sleep(1)
+            worker_ok, mcp_ok = _verify_services()
+        if not managed:
+            failed.append("service manager registration could not be verified")
+        if not worker_ok:
+            failed.append("worker service is not running")
+        if not mcp_ok:
+            failed.append("MCP service is not running")
+    _patch_claude_json()
+
     console.print()
     console.print(
         f"  [bold]{stats.get('sessions', 0):,} sessions[/bold] · "
         f"[bold]{stats.get('chunks', 0):,} chunks[/bold]"
-        + (f" · [bold]{n_comm}[/bold] topic clusters" if n_comm else "")
     )
     console.print()
 

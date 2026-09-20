@@ -20,6 +20,7 @@ _SQLITE_DELETE = 9
 _SQLITE_INSERT = 18
 _SQLITE_UPDATE = 23
 _SQLITE_ATTACH = 24
+_SQLITE_DROP_INDEX = 27
 
 
 _SEARCH_ALLOW = {
@@ -81,6 +82,12 @@ def materialize_authorizer(action, arg1, arg2, db_name, trigger_name):
     if action == _SQLITE_PRAGMA:
         return _SQLITE_OK if (arg1 or "").lower() in _MATERIALIZE_PRAGMAS else _SQLITE_DENY
     if action in {_SQLITE_INSERT, _SQLITE_UPDATE, _SQLITE_DELETE}:
+        return _SQLITE_OK if db_name == "temp" else _SQLITE_DENY
+    # SQLite reports cleanup of a temporary index as DROP_INDEX (27), not
+    # DROP_TEMP_INDEX (12), on some supported runtimes. Keep that operation
+    # confined to temp so result materializers can create and discard their
+    # query-local indexes without opening a durable write path.
+    if action == _SQLITE_DROP_INDEX:
         return _SQLITE_OK if db_name == "temp" else _SQLITE_DENY
     if action == _SQLITE_ATTACH:
         return _SQLITE_DENY

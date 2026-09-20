@@ -35,6 +35,9 @@ ORDER BY touches DESC LIMIT 15;
 -- @query: delegations
 SELECT d.agent_type, COUNT(*) as spawned
 FROM _edges_delegations d
+JOIN _coding_agent_source_visibility vis
+  ON vis.source_id = COALESCE(d.parent_source_id, substr(d.chunk_id, 1, 36))
+ AND vis.visible = 1
 WHERE d.created_at > strftime('%s', 'now', '-' || :days || ' days')
 GROUP BY d.agent_type
 ORDER BY spawned DESC;

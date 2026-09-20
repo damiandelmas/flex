@@ -6,6 +6,7 @@ import json
 import re
 import sqlite3
 import uuid
+from collections.abc import Mapping, Sequence
 
 
 ANNOTATION_NAMESPACE = uuid.UUID("733c2562-df4a-4dd1-b71c-e7c6711f4418")
@@ -46,8 +47,12 @@ def register_functions(
     conn.create_function("ledger_author_source", 0, lambda: author_source)
 
 
-def execute_mutation(conn: sqlite3.Connection, sql: str) -> str:
-    """Execute one canonical Ledger mutation transaction and return JSON."""
+def execute_mutation(
+    conn: sqlite3.Connection,
+    sql: str,
+    params: Mapping[str, object] | Sequence[object] = (),
+) -> str:
+    """Execute one parameterized Ledger mutation transaction and return JSON."""
     operation = mutation_operation(sql)
     if operation is None:
         return json.dumps({
@@ -56,7 +61,7 @@ def execute_mutation(conn: sqlite3.Connection, sql: str) -> str:
 
     try:
         conn.execute("BEGIN IMMEDIATE")
-        cursor = conn.execute(sql)
+        cursor = conn.execute(sql, params)
         columns = [item[0] for item in cursor.description or ()]
         rows = [dict(zip(columns, row)) for row in cursor.fetchall()]
         conn.commit()

@@ -10,6 +10,7 @@ SELECT
 FROM _edges_tool_ops t
 JOIN _raw_chunks c ON t.chunk_id = c.id
 JOIN _edges_source es ON t.chunk_id = es.chunk_id
+JOIN _coding_agent_source_visibility vis ON vis.source_id = es.source_id AND vis.visible = 1
 LEFT JOIN _edges_file_identity fi ON t.chunk_id = fi.chunk_id
 WHERE (
     fi.file_uuid = (

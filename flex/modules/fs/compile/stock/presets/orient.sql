@@ -31,7 +31,7 @@ SELECT 'chunks' AS view, group_concat(name, ', ') AS columns FROM pragma_table_i
 -- The code-cell tables that make it a graph, and what each carries. Query the graph via the nav
 -- presets below (or these tables directly); see the flex:code skill for the SQL recipes.
 SELECT '_symbols' AS tbl, 'the symbol index — name, kind, defining file (name, def_id, file_id, kind)' AS carries
-UNION ALL SELECT '_types_instant', 'per-node metadata — section_title (symbol name), depth (1=top-level, 2=method), container_id (parent node), position'
+UNION ALL SELECT '_types_filesystem', 'per-node metadata — section_title (symbol name), depth (1=top-level, 2=method), container_id (parent node), position'
 UNION ALL SELECT '_edges_call', 'the call graph — caller_id -> callee_name (name-resolved; unresolved/external calls keep the name)'
 UNION ALL SELECT '_edges_import', 'the import graph — source_id imports module (name)'
 UNION ALL SELECT '_edges_tree', 'containment — id -> parent_id, depth (module > class > method)'

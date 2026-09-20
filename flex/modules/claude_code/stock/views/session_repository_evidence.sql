@@ -20,6 +20,11 @@ WITH occurrences AS (
         END AS evidence_basis
     FROM _enrich_observations o
     WHERE o.normalized_path IS NOT NULL
+      AND EXISTS (
+          SELECT 1 FROM _coding_agent_source_visibility vis
+          WHERE vis.source_id = o.session_id
+            AND vis.visible = 1
+      )
 
     UNION ALL
 
@@ -38,6 +43,11 @@ WITH occurrences AS (
     JOIN _raw_chunks r ON r.id = so.chunk_id
     WHERE so.file_path IS NOT NULL
       AND so.file_path != ''
+      AND EXISTS (
+          SELECT 1 FROM _coding_agent_source_visibility vis
+          WHERE vis.source_id = es.source_id
+            AND vis.visible = 1
+      )
       AND NOT EXISTS (
           SELECT 1
           FROM _enrich_observations direct

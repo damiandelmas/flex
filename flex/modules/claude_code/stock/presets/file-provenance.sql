@@ -33,6 +33,7 @@ scoped AS (
     FROM _edges_tool_ops t
     JOIN _raw_chunks c ON c.id = t.chunk_id
     JOIN _edges_source es ON es.chunk_id = t.chunk_id
+    JOIN _coding_agent_source_visibility vis ON vis.source_id = es.source_id AND vis.visible = 1
     LEFT JOIN _edges_file_identity fi ON fi.chunk_id = t.chunk_id
     LEFT JOIN _edges_content_identity ci ON ci.chunk_id = t.chunk_id
     WHERE t.target_file IS NOT NULL
@@ -57,6 +58,7 @@ scoped AS (
     FROM _edges_soft_ops so
     JOIN _raw_chunks c ON c.id = so.chunk_id
     JOIN _edges_source es ON es.chunk_id = so.chunk_id
+    JOIN _coding_agent_source_visibility vis ON vis.source_id = es.source_id AND vis.visible = 1
     WHERE so.file_path LIKE '%' || :path || '%'
 ),
 latest AS (
@@ -117,6 +119,8 @@ scoped AS (
         0 AS inferred
     FROM _edges_tool_ops t
     JOIN _raw_chunks c ON c.id = t.chunk_id
+    JOIN _edges_source es ON es.chunk_id = t.chunk_id
+    JOIN _coding_agent_source_visibility vis ON vis.source_id = es.source_id AND vis.visible = 1
     LEFT JOIN _edges_file_identity fi ON fi.chunk_id = t.chunk_id
     LEFT JOIN _edges_content_identity ci ON ci.chunk_id = t.chunk_id
     WHERE t.target_file IS NOT NULL
@@ -136,6 +140,8 @@ scoped AS (
         1 AS inferred
     FROM _edges_soft_ops so
     JOIN _raw_chunks c ON c.id = so.chunk_id
+    JOIN _edges_source es ON es.chunk_id = so.chunk_id
+    JOIN _coding_agent_source_visibility vis ON vis.source_id = es.source_id AND vis.visible = 1
     WHERE so.file_path LIKE '%' || :path || '%'
 ),
 homes AS (
@@ -189,6 +195,7 @@ scoped AS (
     FROM _edges_tool_ops t
     JOIN _raw_chunks c ON c.id = t.chunk_id
     JOIN _edges_source es ON es.chunk_id = t.chunk_id
+    JOIN _coding_agent_source_visibility vis ON vis.source_id = es.source_id AND vis.visible = 1
     LEFT JOIN _edges_file_identity fi ON fi.chunk_id = t.chunk_id
     LEFT JOIN _edges_content_identity ci ON ci.chunk_id = t.chunk_id
     WHERE t.target_file IS NOT NULL
@@ -212,6 +219,7 @@ scoped AS (
     FROM _edges_soft_ops so
     JOIN _raw_chunks c ON c.id = so.chunk_id
     JOIN _edges_source es ON es.chunk_id = so.chunk_id
+    JOIN _coding_agent_source_visibility vis ON vis.source_id = es.source_id AND vis.visible = 1
     WHERE so.file_path LIKE '%' || :path || '%'
 ),
 ordered AS (
@@ -262,6 +270,7 @@ scoped AS (
     FROM _edges_tool_ops t
     JOIN _raw_chunks c ON c.id = t.chunk_id
     JOIN _edges_source es ON es.chunk_id = t.chunk_id
+    JOIN _coding_agent_source_visibility vis ON vis.source_id = es.source_id AND vis.visible = 1
     LEFT JOIN _edges_file_identity fi ON fi.chunk_id = t.chunk_id
     WHERE t.target_file IS NOT NULL
       AND (
@@ -282,6 +291,7 @@ scoped AS (
     FROM _edges_soft_ops so
     JOIN _raw_chunks c ON c.id = so.chunk_id
     JOIN _edges_source es ON es.chunk_id = so.chunk_id
+    JOIN _coding_agent_source_visibility vis ON vis.source_id = es.source_id AND vis.visible = 1
     LEFT JOIN _edges_tool_ops t ON t.chunk_id = so.chunk_id
     WHERE so.file_path LIKE '%' || :path || '%'
 ),

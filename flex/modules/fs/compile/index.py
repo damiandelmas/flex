@@ -5,15 +5,22 @@ from __future__ import annotations
 import sqlite3
 from dataclasses import dataclass
 from pathlib import Path
+from typing import Callable
 
 import numpy as np
 
 from flex.modules.fs.compile.extract import ExtractionResult, extract_file
-from flex.modules.fs.compile.schema import ensure_schema
+from flex.modules.fs.compile.schema import (
+    DOCUMENT_PROFILE_VERSION, document_identity_required, ensure_schema,
+)
 from flex.modules.fs.compile.walker import FileEntry
 
 
 class ExtractionFailure(RuntimeError):
+    pass
+
+
+class PublicationConflict(RuntimeError):
     pass
 
 
@@ -22,6 +29,30 @@ class IndexOutcome:
     status: str
     source_id: str
     chunks: int = 0
+
+
+@dataclass(frozen=True)
+class PublicationEvent:
+    """One accepted source mutation, visible to a transactional sidecar.
+
+    The callback receiving this event executes inside the compiler's
+    ``BEGIN IMMEDIATE`` transaction.  It may issue SQL on ``conn`` but must not
+    begin, commit, or roll back a transaction itself.
+    """
+
+    status: str
+    source_id: str
+    source_path: str
+    file_kind: str
+    content_hash: str
+    size_bytes: int
+    mtime_ns: int
+    chunks: int
+    file_uuid: str | None
+    accepted_generation: int | None
+
+
+SidecarCallback = Callable[[sqlite3.Connection, PublicationEvent], None]
 
 
 @dataclass(frozen=True)
@@ -41,10 +72,11 @@ def _resolve_embedder(conn: sqlite3.Connection):
     return embed_doc
 
 
-def _compute_embeddings(result: ExtractionResult, embed_fn) -> tuple[list[bytes], bytes | None]:
-    if not result.chunks:
-        return [], None
-    texts = [chunk.content for chunk in result.chunks]
+def _compute_chunk_embeddings(chunks, embed_fn) -> list[bytes]:
+    """Embed one bounded chunk group and return normalized fp32 blobs."""
+    if not chunks:
+        return []
+    texts = [chunk.content for chunk in chunks]
     try:
         matrix = embed_fn(texts, batch_size=64)
     except TypeError:
@@ -56,12 +88,36 @@ def _compute_embeddings(result: ExtractionResult, embed_fn) -> tuple[list[bytes]
         )
     if not np.isfinite(matrix).all():
         raise RuntimeError("embedder returned non-finite values")
-    chunk_blobs = [np.ascontiguousarray(row, dtype=np.float32).tobytes() for row in matrix]
+    norms = np.linalg.norm(matrix, axis=1)
+    if np.any(norms <= 0):
+        raise RuntimeError("embedder returned a zero-length vector")
+    matrix = matrix / norms[:, np.newaxis]
+    return [np.ascontiguousarray(row, dtype=np.float32).tobytes() for row in matrix]
+
+
+def _pool_source_embedding(chunk_blobs: list[bytes]) -> bytes | None:
+    """Mean-pool one document's normalized chunk blobs into a unit vector."""
+    if not chunk_blobs:
+        return None
+    try:
+        matrix = np.stack([
+            np.frombuffer(blob, dtype=np.float32) for blob in chunk_blobs
+        ])
+    except ValueError as exc:
+        raise RuntimeError("document chunks have inconsistent vector widths") from exc
+    if not np.isfinite(matrix).all():
+        raise RuntimeError("document chunks contain non-finite vectors")
     mean = matrix.mean(axis=0, dtype=np.float32)
     norm = float(np.linalg.norm(mean))
-    if norm:
-        mean = mean / norm
-    return chunk_blobs, np.ascontiguousarray(mean, dtype=np.float32).tobytes()
+    if norm <= 0:
+        raise RuntimeError("document chunks produced a zero-length source vector")
+    mean = mean / norm
+    return np.ascontiguousarray(mean, dtype=np.float32).tobytes()
+
+
+def _compute_embeddings(result: ExtractionResult, embed_fn) -> tuple[list[bytes], bytes | None]:
+    chunk_blobs = _compute_chunk_embeddings(result.chunks, embed_fn)
+    return chunk_blobs, _pool_source_embedding(chunk_blobs)
 
 
 def _old_chunk_ids(conn: sqlite3.Connection, source_id: str) -> list[str]:
@@ -85,6 +141,7 @@ def _delete_source_rows(conn: sqlite3.Connection, source_id: str, *,
         conn.execute(f"DELETE FROM _raw_chunks WHERE id IN ({placeholders})", chunk_ids)
     conn.execute("DELETE FROM _edges_source WHERE source_id=?", (source_id,))
     conn.execute("DELETE FROM _fields_inline WHERE source_id=?", (source_id,))
+    conn.execute("DELETE FROM _fields_frontmatter WHERE source_id=?", (source_id,))
     conn.execute("DELETE FROM _symbols WHERE file_id=?", (source_id,))
     conn.execute("DELETE FROM _edges_import WHERE source_id=?", (source_id,))
     conn.execute("DELETE FROM _types_markdown_source WHERE source_id=?", (source_id,))
@@ -103,32 +160,44 @@ def _mint_identity(conn: sqlite3.Connection, result: ExtractionResult) -> None:
         "SELECT 1 FROM _edges_fs_identity WHERE source_id=?", (result.source_id,)
     ).fetchone():
         return
+    required = document_identity_required(conn)
     try:
         from flex.modules.soma.lib.identity.file_identity import get_instance
         absolute = str(Path(result.source_path).resolve())
         file_uuid = get_instance().assign_batch([absolute]).get(absolute)
-    except Exception:
+    except Exception as exc:
+        if required:
+            raise RuntimeError(
+                f"required filesystem identity unavailable: {result.source_id}"
+            ) from exc
         file_uuid = None
     if file_uuid:
         conn.execute(
             "INSERT INTO _edges_fs_identity(source_id,file_uuid) VALUES(?,?)",
             (result.source_id, file_uuid),
         )
+    elif required:
+        raise RuntimeError(
+            f"required filesystem identity unavailable: {result.source_id}"
+        )
 
 
-def _write_state(conn: sqlite3.Connection, result: ExtractionResult, state: str) -> None:
+def _write_state(conn: sqlite3.Connection, result: ExtractionResult, state: str,
+                 *, accepted_generation: int) -> None:
     conn.execute(
         "INSERT INTO _filesystem_source_state "
         "(source_id,source_path,file_kind,content_hash,size_bytes,mtime_ns,"
-        "source_state,extraction_state) VALUES(?,?,?,?,?,?,?,?)",
+        "source_state,extraction_state,accepted_generation,profile_version) "
+        "VALUES(?,?,?,?,?,?,?,?,?,?)",
         (
             result.source_id, result.source_path, result.file_kind, result.content_hash,
             result.size_bytes, result.mtime_ns, state, result.extraction_state,
+            accepted_generation, DOCUMENT_PROFILE_VERSION,
         ),
     )
 
 
-def _resolve_obsidian_links(conn: sqlite3.Connection) -> None:
+def _resolve_wikilinks(conn: sqlite3.Connection) -> None:
     """Rebuild corpus-level link side tables without committing independently."""
     from flex.modules.markdown.compile.wikilinks import build_resolution_maps, resolve_wikilink
 
@@ -168,6 +237,19 @@ def _resolve_obsidian_links(conn: sqlite3.Connection) -> None:
                 "INSERT OR IGNORE INTO _edges_wikilink_unresolved(from_path,raw_target) VALUES(?,?)",
                 (source_id, target),
             )
+
+
+def refresh_wikilinks(conn: sqlite3.Connection) -> None:
+    """Resolve all accepted raw Markdown links in one atomic projection pass."""
+    ensure_schema(conn)
+    conn.commit()
+    try:
+        conn.execute("BEGIN IMMEDIATE")
+        _resolve_wikilinks(conn)
+        conn.commit()
+    except Exception:
+        conn.rollback()
+        raise
 
 
 def _insert_result(conn: sqlite3.Connection, result: ExtractionResult,
@@ -235,6 +317,16 @@ def _insert_result(conn: sqlite3.Connection, result: ExtractionResult,
             [(field.chunk_id, result.source_id, field.key, field.value)
              for field in result.fields],
         )
+        conn.executemany(
+            "INSERT INTO _fields_frontmatter(source_id,field_key,field_value,position) "
+            "VALUES(?,?,?,?)",
+            [(result.source_id, field.key, field.value, field.position)
+             for field in result.frontmatter],
+        )
+        conn.executemany(
+            "INSERT INTO _edges_wikilink_raw(source_id,raw_target) VALUES(?,?)",
+            [(result.source_id, target) for target in result.wikilinks],
+        )
         if obsidian:
             conn.executemany(
                 "INSERT INTO _fields_inline(chunk_id,source_id,field_key,field_value) "
@@ -242,17 +334,37 @@ def _insert_result(conn: sqlite3.Connection, result: ExtractionResult,
                 [(first, result.source_id, "tag", tag) for tag in meta.tags]
                 + [(first, result.source_id, "alias", alias) for alias in meta.aliases],
             )
-            conn.executemany(
-                "INSERT INTO _edges_wikilink_raw(source_id,raw_target) VALUES(?,?)",
-                [(result.source_id, target) for target in result.wikilinks],
-            )
     _mint_identity(conn, result)
-    _write_state(conn, result, "indexed")
+    # State is written by apply_result() after it selects the next generation.
+
+
+def _event_for_result(conn: sqlite3.Connection, result: ExtractionResult,
+                      status: str, accepted_generation: int) -> PublicationEvent:
+    identity = conn.execute(
+        "SELECT file_uuid FROM _edges_fs_identity WHERE source_id=?",
+        (result.source_id,),
+    ).fetchone()
+    return PublicationEvent(
+        status=status,
+        source_id=result.source_id,
+        source_path=result.source_path,
+        file_kind=result.file_kind,
+        content_hash=result.content_hash,
+        size_bytes=result.size_bytes,
+        mtime_ns=result.mtime_ns,
+        chunks=len(result.chunks),
+        file_uuid=identity[0] if identity else None,
+        accepted_generation=accepted_generation,
+    )
 
 
 def apply_result(conn: sqlite3.Connection, result: ExtractionResult, *,
                  chunk_embeddings: list[bytes] | None = None,
-                 source_embedding: bytes | None = None, obsidian: bool = False) -> IndexOutcome:
+                 source_embedding: bytes | None = None, obsidian: bool = False,
+                 sidecar_callback: SidecarCallback | None = None,
+                 expected_generation: int | None = None,
+                 _defer_wikilinks: bool = False,
+                 _schema_ready: bool = False) -> IndexOutcome:
     """Atomically replace one source with a fully prepared extraction result."""
     if result.status == "failed":
         raise ExtractionFailure(result.error or f"extraction failed: {result.source_path}")
@@ -261,23 +373,48 @@ def apply_result(conn: sqlite3.Connection, result: ExtractionResult, *,
             f"embedding count {len(chunk_embeddings)} does not match "
             f"chunk count {len(result.chunks)}"
         )
-    ensure_schema(conn)
-    conn.commit()
+    if not _schema_ready:
+        ensure_schema(conn)
+        conn.commit()
     try:
         conn.execute("BEGIN IMMEDIATE")
+        previous = conn.execute(
+            "SELECT accepted_generation FROM _filesystem_source_state WHERE source_id=?",
+            (result.source_id,),
+        ).fetchone()
+        current_generation = int(previous[0]) if previous else 0
+        if (expected_generation is not None
+                and current_generation != expected_generation):
+            raise PublicationConflict(
+                f"stale source generation for {result.source_id}: expected "
+                f"{expected_generation}, found {current_generation}"
+            )
+        accepted_generation = current_generation + 1
         _delete_source_rows(conn, result.source_id, drop_state=True)
         if result.status == "empty":
             _mint_identity(conn, result)
-            _write_state(conn, result, "empty")
+            _write_state(
+                conn, result, "empty", accepted_generation=accepted_generation,
+            )
         elif result.status == "indexed":
             _insert_result(
                 conn, result, chunk_embeddings or [None] * len(result.chunks),
                 source_embedding, obsidian=obsidian,
             )
+            _write_state(
+                conn, result, "indexed", accepted_generation=accepted_generation,
+            )
         else:
             raise ValueError(f"unsupported extraction status: {result.status}")
-        if obsidian:
-            _resolve_obsidian_links(conn)
+        if result.file_kind == "markdown" and not _defer_wikilinks:
+            _resolve_wikilinks(conn)
+        if sidecar_callback is not None:
+            sidecar_callback(
+                conn,
+                _event_for_result(
+                    conn, result, result.status, accepted_generation,
+                ),
+            )
         conn.commit()
     except Exception:
         conn.rollback()
@@ -286,24 +423,75 @@ def apply_result(conn: sqlite3.Connection, result: ExtractionResult, *,
 
 
 def index_file(conn: sqlite3.Connection, entry: FileEntry, *, embed_fn=None,
-               embed_enabled: bool | None = None, obsidian: bool = False) -> IndexOutcome:
+               embed_enabled: bool | None = None, obsidian: bool = False,
+               sidecar_callback: SidecarCallback | None = None,
+               _defer_wikilinks: bool = False) -> IndexOutcome:
     """Extract, embed, and atomically replace one discovered file."""
     if entry is None:
         raise ValueError("index_file requires a discovered FileEntry")
     result = extract_file(entry)
     if result.status == "failed":
         raise ExtractionFailure(result.error or f"extraction failed: {entry.path}")
+    ensure_schema(conn)
+    conn.commit()
     previous = conn.execute(
-        "SELECT content_hash,file_kind,source_state FROM _filesystem_source_state "
+        "SELECT content_hash,file_kind,source_state,profile_version,accepted_generation "
+        "FROM _filesystem_source_state "
         "WHERE source_id=?", (result.source_id,),
     ).fetchone()
-    if previous and tuple(previous) == (result.content_hash, result.file_kind, result.status):
-        conn.execute(
-            "UPDATE _filesystem_source_state SET source_path=?,size_bytes=?,mtime_ns=? "
-            "WHERE source_id=?",
-            (result.source_path, result.size_bytes, result.mtime_ns, result.source_id),
-        )
-        conn.commit()
+    if previous and tuple(previous[:4]) == (
+        result.content_hash, result.file_kind, result.status, DOCUMENT_PROFILE_VERSION,
+    ):
+        try:
+            conn.execute("BEGIN IMMEDIATE")
+            current = conn.execute(
+                "SELECT content_hash,file_kind,source_state,profile_version,"
+                "accepted_generation FROM _filesystem_source_state WHERE source_id=?",
+                (result.source_id,),
+            ).fetchone()
+            if current is None or tuple(current) != tuple(previous):
+                actual_generation = int(current[4]) if current else 0
+                raise PublicationConflict(
+                    f"stale source generation for {result.source_id}: expected "
+                    f"{int(previous[4])}, found {actual_generation}"
+                )
+            _mint_identity(conn, result)
+            conn.execute(
+                "UPDATE _filesystem_source_state SET "
+                "source_path=?,size_bytes=?,mtime_ns=?,extraction_state=? "
+                "WHERE source_id=?",
+                (
+                    result.source_path, result.size_bytes, result.mtime_ns,
+                    result.extraction_state, result.source_id,
+                ),
+            )
+            timestamp = result.mtime_ns // 1_000_000_000
+            conn.execute(
+                "UPDATE _raw_sources SET timestamp=? WHERE source_id=?",
+                (timestamp, result.source_id),
+            )
+            conn.execute(
+                "UPDATE _raw_chunks SET timestamp=? WHERE id IN "
+                "(SELECT chunk_id FROM _edges_source WHERE source_id=?)",
+                (timestamp, result.source_id),
+            )
+            if result.markdown is not None:
+                conn.execute(
+                    "UPDATE _types_markdown_source SET file_modified=? "
+                    "WHERE source_id=?",
+                    (result.markdown.file_modified, result.source_id),
+                )
+            if sidecar_callback is not None:
+                sidecar_callback(
+                    conn,
+                    _event_for_result(
+                        conn, result, "unchanged", int(previous[4]),
+                    ),
+                )
+            conn.commit()
+        except Exception:
+            conn.rollback()
+            raise
         return IndexOutcome("unchanged", result.source_id, len(result.chunks))
     enabled = _embedding_enabled(conn) if embed_enabled is None else embed_enabled
     chunk_embeddings: list[bytes] | None = None
@@ -315,22 +503,64 @@ def index_file(conn: sqlite3.Connection, entry: FileEntry, *, embed_fn=None,
     return apply_result(
         conn, result, chunk_embeddings=chunk_embeddings,
         source_embedding=source_embedding, obsidian=obsidian,
+        sidecar_callback=sidecar_callback,
+        expected_generation=int(previous[4]) if previous else 0,
+        _defer_wikilinks=_defer_wikilinks,
+        _schema_ready=True,
     )
 
 
-def delete_source(conn: sqlite3.Connection, source_id: str, *, obsidian: bool = False) -> bool:
+def delete_source(conn: sqlite3.Connection, source_id: str, *, obsidian: bool = False,
+                  sidecar_callback: SidecarCallback | None = None,
+                  expected_generation: int | None = None,
+                  _defer_wikilinks: bool = False) -> bool:
     """Commit deletion of one vanished source and all of its optional artifacts."""
-    exists = conn.execute(
-        "SELECT 1 FROM _filesystem_source_state WHERE source_id=?", (source_id,)
-    ).fetchone()
-    if not exists:
-        return False
+    ensure_schema(conn)
     conn.commit()
     try:
         conn.execute("BEGIN IMMEDIATE")
+        previous = conn.execute(
+            "SELECT source_path,file_kind,content_hash,size_bytes,mtime_ns,"
+            "accepted_generation FROM _filesystem_source_state WHERE source_id=?",
+            (source_id,),
+        ).fetchone()
+        if not previous:
+            if expected_generation not in (None, 0):
+                raise PublicationConflict(
+                    f"stale source generation for {source_id}: expected "
+                    f"{expected_generation}, found 0"
+                )
+            conn.rollback()
+            return False
+        current_generation = int(previous[5])
+        if (expected_generation is not None
+                and current_generation != expected_generation):
+            raise PublicationConflict(
+                f"stale source generation for {source_id}: expected "
+                f"{expected_generation}, found {current_generation}"
+            )
+        identity = conn.execute(
+            "SELECT file_uuid FROM _edges_fs_identity WHERE source_id=?", (source_id,)
+        ).fetchone()
+        chunks = conn.execute(
+            "SELECT COUNT(*) FROM _edges_source WHERE source_id=?", (source_id,)
+        ).fetchone()[0]
         _delete_source_rows(conn, source_id, drop_identity=True, drop_state=True)
-        if obsidian:
-            _resolve_obsidian_links(conn)
+        if previous[1] == "markdown" and not _defer_wikilinks:
+            _resolve_wikilinks(conn)
+        if sidecar_callback is not None:
+            sidecar_callback(conn, PublicationEvent(
+                status="removed",
+                source_id=source_id,
+                source_path=previous[0],
+                file_kind=previous[1],
+                content_hash=previous[2],
+                size_bytes=int(previous[3]),
+                mtime_ns=int(previous[4]),
+                chunks=int(chunks),
+                file_uuid=identity[0] if identity else None,
+                accepted_generation=current_generation + 1,
+            ))
         conn.commit()
     except Exception:
         conn.rollback()

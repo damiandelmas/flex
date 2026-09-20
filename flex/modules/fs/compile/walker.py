@@ -96,6 +96,44 @@ def entry_for_path(root: Path, path: Path, *, exclude: tuple[str, ...] = (),
     return FileEntry(root, resolved, rel, kind, stat.st_size, stat.st_mtime_ns)
 
 
+def entries_for_paths(root: Path, paths, *, exclude: tuple[str, ...] = (),
+                      max_file_bytes: int = DEFAULT_MAX_FILE_BYTES) -> tuple[FileEntry, ...]:
+    """Resolve an explicit authoritative file set without walking ``root``.
+
+    Unlike :func:`walk_files`, every supplied path is a declaration.  A
+    missing, unsupported, excluded, outside-root, or duplicate declaration is
+    therefore an error rather than an item to skip.  This is the selection
+    seam used by provider-owned cells such as Recall: neighboring files under
+    the same root are never discovered implicitly.
+    """
+    root = Path(root).expanduser().resolve()
+    if not root.is_dir():
+        raise ValueError(f"filesystem root is not a readable directory: {root}")
+
+    entries: dict[str, FileEntry] = {}
+    failures: list[str] = []
+    for raw_path in paths:
+        candidate = Path(raw_path).expanduser()
+        if not candidate.is_absolute():
+            candidate = root / candidate
+        entry = entry_for_path(
+            root, candidate, exclude=tuple(exclude), max_file_bytes=max_file_bytes,
+        )
+        if entry is None:
+            failures.append(str(raw_path))
+            continue
+        if entry.source_id in entries:
+            failures.append(f"duplicate:{entry.source_id}")
+            continue
+        entries[entry.source_id] = entry
+
+    if failures:
+        raise ValueError(
+            "invalid explicit filesystem declaration(s): " + ", ".join(failures)
+        )
+    return tuple(entries[source_id] for source_id in sorted(entries))
+
+
 def walk_files(root: Path, *, exclude: tuple[str, ...] = (),
                max_file_bytes: int = DEFAULT_MAX_FILE_BYTES):
     """Yield supported files in stable root-relative order without following links."""

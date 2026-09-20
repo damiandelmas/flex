@@ -57,6 +57,12 @@ CREATE VIRTUAL TABLE IF NOT EXISTS chunks_fts USING fts5(
     content='_raw_chunks',
     content_rowid='rowid'
 );
+
+CREATE TABLE IF NOT EXISTS _vector_generations (
+    relation    TEXT PRIMARY KEY,
+    generation  INTEGER NOT NULL DEFAULT 0,
+    updated_at  INTEGER NOT NULL DEFAULT (strftime('%s','now'))
+);
 """
 
 _SOURCE_SCHEMA = """\
@@ -305,11 +311,15 @@ def install_retrieval(db: sqlite3.Connection) -> None:
     if not had_fts and db.execute("SELECT 1 FROM _raw_chunks LIMIT 1").fetchone():
         db.execute("INSERT INTO chunks_fts(chunks_fts) VALUES('rebuild')")
     db.executescript(_FTS_TRIGGERS)
+    from flex.retrieve.vector_generation import ensure_vector_generations
+    ensure_vector_generations(db)
 
 
 def install_source_provenance(db: sqlite3.Connection) -> None:
     """Install the optional SDK source-membership profile."""
     db.executescript(_SOURCE_SCHEMA)
+    from flex.retrieve.vector_generation import ensure_vector_generations
+    ensure_vector_generations(db)
 
 
 def install_view_catalog(db: sqlite3.Connection) -> None:

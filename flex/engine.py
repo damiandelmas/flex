@@ -1,10 +1,14 @@
 """Engine facade — single import point for retrieve + manage internals."""
 
 import json
+import gc
+import hashlib
 import os
 import sqlite3
 import sys
 import threading
+import time
+import uuid
 from pathlib import Path
 
 
@@ -14,12 +18,29 @@ from pathlib import Path
 
 _embedder = None
 _embedder_lock = threading.Lock()
+_embedder_last_used: dict[str, float] = {}
+_inference_lock = threading.Lock()
+
+
+def _touch_embedder(name: str) -> None:
+    _embedder_last_used[name] = time.monotonic()
+
+
+def _encode_with_owner(name: str, embedder, text, **kwargs):
+    """Serialize inference so one owner cannot multiply peak workspaces."""
+    with _inference_lock:
+        _touch_embedder(name)
+        try:
+            return embedder.encode(text, **kwargs)
+        finally:
+            _touch_embedder(name)
 
 
 def get_embedder():
     """Lazy-load ONNX embedder singleton (thread-safe)."""
     global _embedder
     if _embedder is not None:
+        _touch_embedder('default')
         return _embedder
     with _embedder_lock:
         if _embedder is not None:
@@ -27,6 +48,7 @@ def get_embedder():
         try:
             from flex.onnx import get_model
             _embedder = get_model()
+            _touch_embedder('default')
             return _embedder
         except ImportError:
             print("[flex-engine] Embedding not available", file=sys.stderr)
@@ -107,6 +129,7 @@ def _get_legacy_embedder():
     """Load the retained pre-0.52 MiniLM model for legacy cells only."""
     global _legacy_embedder
     if _legacy_embedder is not None:
+        _touch_embedder('legacy')
         return _legacy_embedder
     with _legacy_embedder_lock:
         if _legacy_embedder is None:
@@ -115,6 +138,7 @@ def _get_legacy_embedder():
                 model_path=_LEGACY_MODEL_PATH,
                 tokenizer_path=_LEGACY_TOKENIZER_PATH,
             )
+        _touch_embedder('legacy')
         return _legacy_embedder
 
 
@@ -124,6 +148,7 @@ def _get_nomic_embedder():
     does not re-check, it only constructs+caches."""
     global _nomic_embedder
     if _nomic_embedder is not None:
+        _touch_embedder('nomic')
         return _nomic_embedder
     with _nomic_embedder_lock:
         if _nomic_embedder is not None:
@@ -131,6 +156,7 @@ def _get_nomic_embedder():
         from flex.onnx.embed import ONNXEmbedder
         _nomic_embedder = ONNXEmbedder(
             model_path=_NOMIC_MODEL_PATH, tokenizer_path=_NOMIC_TOKENIZER_PATH)
+        _touch_embedder('nomic')
         return _nomic_embedder
 
 
@@ -140,6 +166,7 @@ def _get_nomic_fp32_embedder():
     this does not re-check, it only constructs+caches."""
     global _nomic_fp32_embedder
     if _nomic_fp32_embedder is not None:
+        _touch_embedder('nomic-fp32')
         return _nomic_fp32_embedder
     with _nomic_fp32_embedder_lock:
         if _nomic_fp32_embedder is not None:
@@ -148,7 +175,63 @@ def _get_nomic_fp32_embedder():
         _nomic_fp32_embedder = ONNXEmbedder(
             model_path=_NOMIC_FP32_MODEL_PATH,
             tokenizer_path=_NOMIC_FP32_TOKENIZER_PATH)
+        _touch_embedder('nomic-fp32')
         return _nomic_fp32_embedder
+
+
+def embedder_state() -> dict[str, object]:
+    """Return process-local model residency without initializing a model."""
+    return {
+        'resident': [
+            name for name, value in (
+                ('default', _embedder),
+                ('legacy', _legacy_embedder),
+                ('nomic', _nomic_embedder),
+                ('nomic-fp32', _nomic_fp32_embedder),
+            ) if value is not None
+        ],
+        'last_used': dict(_embedder_last_used),
+    }
+
+
+def release_idle_embedders(idle_seconds: float | None = None) -> list[str]:
+    """Release singleton ownership after inactivity.
+
+    In-flight encode closures retain their own reference, so clearing the
+    singleton cannot invalidate a running inference.  It only allows the ONNX
+    session to be collected after that call completes.
+    """
+    global _embedder, _legacy_embedder, _nomic_embedder, _nomic_fp32_embedder
+    try:
+        idle = float(
+            idle_seconds if idle_seconds is not None
+            else os.environ.get('FLEX_EMBED_IDLE_SEC', '300')
+        )
+    except (TypeError, ValueError):
+        idle = 300.0
+    idle = max(0.0, idle)
+    now = time.monotonic()
+    released = []
+    slots = (
+        ('default', _embedder_lock, '_embedder'),
+        ('legacy', _legacy_embedder_lock, '_legacy_embedder'),
+        ('nomic', _nomic_embedder_lock, '_nomic_embedder'),
+        ('nomic-fp32', _nomic_fp32_embedder_lock, '_nomic_fp32_embedder'),
+    )
+    namespace = globals()
+    for name, lock, variable in slots:
+        used = _embedder_last_used.get(name)
+        if namespace[variable] is None or used is None or now - used < idle:
+            continue
+        with lock:
+            used = _embedder_last_used.get(name)
+            if namespace[variable] is not None and used is not None and now - used >= idle:
+                namespace[variable] = None
+                _embedder_last_used.pop(name, None)
+                released.append(name)
+    if released:
+        gc.collect()
+    return released
 
 
 def _query_embedder_for(tag: str | None, serve_dim: int | None = None):
@@ -178,10 +261,12 @@ def _query_embedder_for(tag: str | None, serve_dim: int | None = None):
             raise RuntimeError(
                 f"vec:model={tag!r} requires missing model {_NOMIC_FP32_MODEL_PATH}")
         emb = _get_nomic_fp32_embedder()
-        embed_query = lambda text, **kw: emb.encode(
-            text, prefix='search_query: ', matryoshka_dim=dim, **kw)
-        embed_doc = lambda text, **kw: emb.encode(
-            text, prefix='search_document: ', matryoshka_dim=dim, **kw)
+        embed_query = lambda text, **kw: _encode_with_owner(
+            'nomic-fp32', emb, text,
+            prefix='search_query: ', matryoshka_dim=dim, **kw)
+        embed_doc = lambda text, **kw: _encode_with_owner(
+            'nomic-fp32', emb, text,
+            prefix='search_document: ', matryoshka_dim=dim, **kw)
         return embed_query, embed_doc
 
     elif tag == 'nomic-v1.5':
@@ -189,10 +274,12 @@ def _query_embedder_for(tag: str | None, serve_dim: int | None = None):
             raise RuntimeError(
                 f"vec:model={tag!r} requires missing model {_NOMIC_MODEL_PATH}")
         emb = _get_nomic_embedder()
-        embed_query = lambda text, **kw: emb.encode(
-            text, prefix='search_query: ', matryoshka_dim=dim, **kw)
-        embed_doc = lambda text, **kw: emb.encode(
-            text, prefix='search_document: ', matryoshka_dim=dim, **kw)
+        embed_query = lambda text, **kw: _encode_with_owner(
+            'nomic', emb, text,
+            prefix='search_query: ', matryoshka_dim=dim, **kw)
+        embed_doc = lambda text, **kw: _encode_with_owner(
+            'nomic', emb, text,
+            prefix='search_document: ', matryoshka_dim=dim, **kw)
         return embed_query, embed_doc
 
     elif tag not in (None, 'minilm'):
@@ -206,10 +293,12 @@ def _query_embedder_for(tag: str | None, serve_dim: int | None = None):
             "the model is not installed"
         )
     embedder = _get_legacy_embedder()
-    embed_query = lambda text, **kw: embedder.encode(
-        text, prefix='search_query: ', matryoshka_dim=dim, **kw)
-    embed_doc = lambda text, **kw: embedder.encode(
-        text, prefix='search_document: ', matryoshka_dim=dim, **kw)
+    embed_query = lambda text, **kw: _encode_with_owner(
+        'legacy', embedder, text,
+        prefix='search_query: ', matryoshka_dim=dim, **kw)
+    embed_doc = lambda text, **kw: _encode_with_owner(
+        'legacy', embedder, text,
+        prefix='search_document: ', matryoshka_dim=dim, **kw)
     return embed_query, embed_doc
 
 
@@ -275,13 +364,59 @@ def build_vec_state(name: str, db: sqlite3.Connection, mtime: float) -> dict | N
     if not caches:
         return None
 
+    main_path = None
+    try:
+        main_row = next(
+            row for row in db.execute("PRAGMA database_list").fetchall()
+            if str(row[1]) == "main"
+        )
+        if main_row[2]:
+            main_path = str(Path(str(main_row[2])).resolve())
+    except (StopIteration, OSError, sqlite3.DatabaseError):
+        pass
+
     return {
         'caches': caches,
+        'vector_generations': {
+            table: cache.source_generation for table, cache in caches.items()
+        },
         'config': _read_vec_config(db),
         'mtime': mtime,
+        'path': main_path,
         'model': model,          # active vec:model (None = legacy _raw_chunks path)
         'serve_dim': serve_dim,  # Matryoshka slice the query must match
     }
+
+
+def vector_state_is_current(state: dict, db: sqlite3.Connection) -> bool | None:
+    """Compare a cached state to transactional vector/config generations.
+
+    ``None`` means the cell predates generation receipts and callers should use
+    the legacy database-mtime fallback. ``False`` is authoritative staleness,
+    including WAL-only commits that do not change the main database mtime.
+    """
+    recorded = (state or {}).get('vector_generations')
+    if not isinstance(recorded, dict) or not recorded:
+        return None
+    try:
+        from flex.retrieve.embeddings import active_model, _serve_dim
+        from flex.retrieve.vector_generation import vector_generation
+
+        for table, expected in recorded.items():
+            if expected is None:
+                return None
+            if vector_generation(db, table) != expected:
+                return False
+        if _read_vec_config(db) != (state.get('config') or {}):
+            return False
+        if active_model(db) != state.get('model'):
+            return False
+        serve_dim = int(_serve_dim(db) or 128)
+        if serve_dim not in (64, 128, 256, 512, 768):
+            serve_dim = 128
+        return serve_dim == int(state.get('serve_dim') or 0)
+    except (ValueError, TypeError, sqlite3.DatabaseError):
+        return False
 
 
 # Force a full VectorCache reload this often even if appends succeed —
@@ -303,6 +438,21 @@ def refresh_vec_state(state: dict, db: sqlite3.Connection) -> str:
     caches = (state or {}).get('caches') or {}
     if not caches:
         return 'rebuild'
+    try:
+        from flex.retrieve.embeddings import active_model, _serve_dim
+
+        current_serve_dim = int(_serve_dim(db) or 128)
+        if current_serve_dim not in (64, 128, 256, 512, 768):
+            current_serve_dim = 128
+        if (
+            _read_vec_config(db) != (state.get('config') or {})
+            or ('model' in state and active_model(db) != state.get('model'))
+            or ('serve_dim' in state
+                and current_serve_dim != int(state.get('serve_dim') or 0))
+        ):
+            return 'rebuild'
+    except (ValueError, TypeError, sqlite3.DatabaseError):
+        return 'rebuild'
 
     updates = {}
     for table, id_col in [('_raw_chunks', 'id'), ('_raw_sources', 'source_id')]:
@@ -322,6 +472,11 @@ def refresh_vec_state(state: dict, db: sqlite3.Connection) -> str:
 
     for table, succ in updates.items():
         caches[table] = succ  # single dict-key assignment — atomic swap
+
+    state['vector_generations'] = {
+        table: cache.source_generation for table, cache in caches.items()
+    }
+    state['config'] = _read_vec_config(db)
 
     return 'appended'
 
@@ -344,6 +499,364 @@ def register_vec_udf(db: sqlite3.Connection, state: dict):
     if embed_query:
         register_vec_ops(db, state['caches'], embed_query, state['config'],
                          embed_doc_fn=embed_doc)
+
+
+def _quoted_schema(value: str) -> str:
+    return '"' + str(value).replace('"', '""') + '"'
+
+
+def _world_vec_metadata(db: sqlite3.Connection, alias: str) -> dict[str, str]:
+    schema = _quoted_schema(alias)
+    try:
+        return {
+            str(row[0]): str(row[1])
+            for row in db.execute(
+                f"SELECT key,value FROM {schema}._meta "
+                "WHERE key LIKE 'vec:%' "
+                "OR key IN ('embedding_model','embedding_dim')"
+            ).fetchall()
+            if row[1] is not None
+        }
+    except sqlite3.DatabaseError as exc:
+        raise RuntimeError(f"missing vector metadata: {exc}") from exc
+
+
+def register_world_vec_udf(
+    db: sqlite3.Connection, members, native_states
+) -> dict[str, str]:
+    """Register one exact semantic landscape over native member caches.
+
+    The combined matrix is a derived, disk-backed artifact. Every member is
+    validated against its live attached rows before composition; incomplete,
+    stale, or incompatible state fails the unified operation rather than
+    silently serving a subset.
+    """
+    import numpy as np
+
+    from flex import registry
+    from flex.meta import (
+        RETRIEVAL_WORLD_DEFAULT_EXCLUSIONS,
+        RETRIEVAL_WORLD_OBJECTS,
+    )
+    from flex.retrieve.vec_ops import VectorCache, _open_npy_stream, register_vec_ops
+
+    members = tuple(members)
+    if not members:
+        raise RuntimeError("retrieval world semantic unavailable: no members")
+
+    matrices = []
+    member_cache_versions = []
+    world_ids: list[str] = []
+    timestamps = []
+    coordinates: dict[str, tuple[str, str]] = {}
+    semantic_contract = None
+    shared_config = None
+    shared_model = None
+    shared_serve_dim = None
+
+    for member in members:
+        registry_metadata = registry.get_cell_metadata(member.cell_name)
+        if not registry_metadata or not registry_metadata.get("active", 1):
+            raise RuntimeError(
+                "retrieval world semantic unavailable: "
+                f"{member.cell_name} is no longer active"
+            )
+        if str(registry_metadata.get("id") or "") != member.cell_id:
+            raise RuntimeError(
+                "retrieval world semantic unavailable: "
+                f"{member.cell_name} Registry identity changed after attachment"
+            )
+        registry_path = registry.resolve_cell(member.cell_name)
+        if registry_path is None or Path(registry_path).resolve() != member.path.resolve():
+            raise RuntimeError(
+                "retrieval world semantic unavailable: "
+                f"{member.cell_name} Registry path changed after attachment"
+            )
+        state = (
+            native_states.get(member.cell_name)
+            or native_states.get(member.cell_id)
+        )
+        if not state:
+            raise RuntimeError(
+                "retrieval world semantic unavailable: "
+                f"{member.cell_name} has no native vector state"
+            )
+        state_path = state.get('path')
+        if not state_path or Path(str(state_path)).resolve() != member.path.resolve():
+            raise RuntimeError(
+                "retrieval world semantic unavailable: "
+                f"{member.cell_name} native vector state path mismatch"
+            )
+        try:
+            current_mtime = member.path.stat().st_mtime
+        except OSError as exc:
+            raise RuntimeError(
+                "retrieval world semantic unavailable: "
+                f"{member.cell_name} path cannot be read: {exc}"
+            ) from exc
+        if state.get('mtime') != current_mtime:
+            raise RuntimeError(
+                "retrieval world semantic unavailable: "
+                f"{member.cell_name} native vector state is stale"
+            )
+
+        cache = (state.get('caches') or {}).get('_raw_chunks')
+        if cache is None or cache.matrix is None:
+            raise RuntimeError(
+                "retrieval world semantic unavailable: "
+                f"{member.cell_name} has no chunk vector cache"
+            )
+        schema = _quoted_schema(member.schema_alias)
+        total, embedded, widths, min_width, max_width = db.execute(
+            f"SELECT count(*),count(embedding),count(DISTINCT length(embedding)),"
+            f"min(length(embedding)),max(length(embedding)) "
+            f"FROM {schema}._raw_chunks"
+        ).fetchone()
+        if total <= 0 or embedded != total or widths != 1 or min_width != max_width:
+            raise RuntimeError(
+                "retrieval world semantic unavailable: "
+                f"{member.cell_name} embedding coverage is incomplete or mixed "
+                f"({embedded}/{total})"
+            )
+        stored_dim = int(min_width) // 4
+        if int(min_width) % 4 or cache.size != total:
+            raise RuntimeError(
+                "retrieval world semantic unavailable: "
+                f"{member.cell_name} native cache coverage mismatch "
+                f"({cache.size}/{total})"
+            )
+        if cache._stored_dim != stored_dim or cache.matrix.dtype != np.float32:
+            raise RuntimeError(
+                "retrieval world semantic unavailable: "
+                f"{member.cell_name} vector width or dtype mismatch"
+            )
+
+        metadata = _world_vec_metadata(db, member.schema_alias)
+        required_metadata = {
+            'vec:model',
+            'embedding_model',
+            'embedding_dim',
+            'vec:serve_dim',
+            'vec:dtype',
+            'vec:normalization',
+            'vec:score',
+        }
+        missing_metadata = sorted(required_metadata - metadata.keys())
+        if missing_metadata:
+            raise RuntimeError(
+                "retrieval world semantic unavailable: "
+                f"{member.cell_name} lacks explicit vector metadata: "
+                + ", ".join(missing_metadata)
+            )
+        model = metadata['vec:model']
+        model_fingerprint = metadata['embedding_model']
+        try:
+            declared_storage_dim = int(metadata['embedding_dim'])
+            serve_dim = int(metadata['vec:serve_dim'])
+        except ValueError as exc:
+            raise RuntimeError(
+                "retrieval world semantic unavailable: "
+                f"{member.cell_name} has invalid vector dimensions"
+            ) from exc
+        if (
+            not model
+            or not model_fingerprint
+            or not declared_storage_dim
+            or not serve_dim
+            or declared_storage_dim != stored_dim
+            or cache.dims != serve_dim
+        ):
+            raise RuntimeError(
+                "retrieval world semantic unavailable: "
+                f"{member.cell_name} model/dimension metadata disagrees with data"
+            )
+        declared_dtype = metadata['vec:dtype'].lower()
+        if declared_dtype != str(cache.matrix.dtype):
+            raise RuntimeError(
+                "retrieval world semantic unavailable: "
+                f"{member.cell_name} declared dtype disagrees with native cache"
+            )
+        if (
+            metadata['vec:normalization'].lower() != 'l2'
+            or metadata['vec:score'].lower() != 'cosine'
+        ):
+            raise RuntimeError(
+                "retrieval world semantic unavailable: "
+                f"{member.cell_name} declares unsupported scoring semantics"
+            )
+        state_config = {
+            str(key): str(value) for key, value in (state.get('config') or {}).items()
+        }
+        if state.get('model') != model or int(state.get('serve_dim') or 0) != serve_dim:
+            raise RuntimeError(
+                "retrieval world semantic unavailable: "
+                f"{member.cell_name} native state disagrees with live metadata"
+            )
+        live_vec_config = {
+            key: value for key, value in metadata.items() if key.startswith('vec:')
+        }
+        if state_config != live_vec_config:
+            raise RuntimeError(
+                "retrieval world semantic unavailable: "
+                f"{member.cell_name} scoring/config state is stale"
+            )
+
+        member_contract = (
+            model, model_fingerprint, stored_dim, serve_dim,
+            str(cache.matrix.dtype),
+            tuple(sorted(metadata.items())),
+        )
+        if semantic_contract is None:
+            semantic_contract = member_contract
+            shared_config = metadata
+            shared_model = model
+            shared_serve_dim = serve_dim
+        elif member_contract != semantic_contract:
+            raise RuntimeError(
+                "retrieval world semantic unavailable: member vector contracts "
+                "are incompatible"
+            )
+
+        coordinate_rows = db.execute(
+            f"SELECT id,native_id FROM temp.{RETRIEVAL_WORLD_OBJECTS} "
+            "WHERE object_kind='chunk' AND cell_id=?",
+            (member.cell_id,),
+        ).fetchall()
+        native_to_world = {str(row[1]): str(row[0]) for row in coordinate_rows}
+        if len(native_to_world) != total or set(cache.ids) != set(native_to_world):
+            raise RuntimeError(
+                "retrieval world semantic unavailable: "
+                f"{member.cell_name} coordinate coverage mismatch"
+            )
+        member_world_ids = [native_to_world[str(native_id)] for native_id in cache.ids]
+        world_ids.extend(member_world_ids)
+        coordinates.update({
+            world_id: (member.cell_id, str(native_id))
+            for world_id, native_id in zip(member_world_ids, cache.ids)
+        })
+        matrices.append(cache.matrix)
+        member_cache_versions.append({
+            'vector_generation': cache.source_generation,
+            'fallback_mtime': (
+                state.get('mtime') if cache.source_generation is None else None
+            ),
+        })
+        timestamps.append(
+            cache.timestamps
+            if cache.timestamps is not None
+            else np.zeros(cache.size, dtype=np.float64)
+        )
+
+    if len(world_ids) != len(set(world_ids)):
+        raise RuntimeError(
+            "retrieval world semantic unavailable: world vector IDs collide"
+        )
+    combined = VectorCache()
+    combined.ids = world_ids
+    combined._id_bytes = sum(sys.getsizeof(value) for value in world_ids)
+    combined._id_to_idx = {value: index for index, value in enumerate(world_ids)}
+    combined.dims = int(shared_serve_dim)
+    combined._stored_dim = int(semantic_contract[2])
+    combined.embedded_count = len(world_ids)
+
+    # Preserve the exact single-landscape scoring contract without allocating
+    # a query-local concatenate of every native matrix.  The world artifact is
+    # derived from the validated member states and mapped read-only; repeated
+    # queries with the same member generations reuse it.
+    signature = hashlib.sha256(json.dumps({
+        'members': [
+            {
+                'cell_id': member.cell_id,
+                **version,
+                'rows': int(matrix.shape[0]),
+            }
+            for member, matrix, version in zip(
+                members, matrices, member_cache_versions,
+            )
+        ],
+        'contract': semantic_contract,
+    }, sort_keys=True, default=str).encode('utf-8')).hexdigest()[:24]
+    artifact_dir = (
+        Path(os.environ.get('FLEX_HOME', str(Path.home() / '.flex')))
+        / 'cache' / 'vectors' / 'worlds'
+    )
+    artifact_dir.mkdir(parents=True, exist_ok=True)
+    matrix_path = artifact_dir / f'{signature}.matrix.npy'
+    timestamp_path = artifact_dir / f'{signature}.timestamps.npy'
+    total_rows = len(world_ids)
+
+    if matrix_path.exists() and timestamp_path.exists():
+        world_matrix = np.load(matrix_path, mmap_mode='r')
+        world_timestamps = np.load(timestamp_path, mmap_mode='r')
+        if (
+            world_matrix.shape != (total_rows, int(shared_serve_dim))
+            or world_timestamps.shape != (total_rows,)
+            or world_matrix.dtype != np.float32
+            or world_timestamps.dtype != np.float64
+        ):
+            world_matrix = None
+    else:
+        world_matrix = None
+
+    if world_matrix is None:
+        matrix_tmp = matrix_path.with_name(
+            f'{matrix_path.name}.{os.getpid()}.{uuid.uuid4().hex}.tmp'
+        )
+        timestamp_tmp = timestamp_path.with_name(
+            f'{timestamp_path.name}.{os.getpid()}.{uuid.uuid4().hex}.tmp'
+        )
+        matrix_out = _open_npy_stream(
+            matrix_tmp, np.float32, (total_rows, int(shared_serve_dim)),
+        )
+        timestamp_out = _open_npy_stream(
+            timestamp_tmp, np.float64, (total_rows,),
+        )
+        try:
+            copy_batch = max(1, int(os.environ.get('FLEX_VEC_LOAD_BATCH', '2048')))
+            for matrix, member_timestamps in zip(matrices, timestamps):
+                for start in range(0, matrix.shape[0], copy_batch):
+                    end = min(start + copy_batch, matrix.shape[0])
+                    matrix_block = np.ascontiguousarray(
+                        matrix[start:end], dtype=np.float32,
+                    )
+                    timestamp_block = np.ascontiguousarray(
+                        member_timestamps[start:end], dtype=np.float64,
+                    )
+                    matrix_out.write(memoryview(matrix_block).cast('B'))
+                    timestamp_out.write(memoryview(timestamp_block).cast('B'))
+        finally:
+            matrix_out.close()
+            timestamp_out.close()
+        os.replace(matrix_tmp, matrix_path)
+        os.replace(timestamp_tmp, timestamp_path)
+        world_matrix = np.load(matrix_path, mmap_mode='r')
+        world_timestamps = np.load(timestamp_path, mmap_mode='r')
+
+    combined.matrix = world_matrix
+    combined.timestamps = world_timestamps
+
+    embed_query, embed_doc = _query_embedder_for(shared_model, shared_serve_dim)
+    register_vec_ops(
+        db,
+        {'_raw_chunks': combined},
+        embed_query,
+        shared_config,
+        embed_doc_fn=embed_doc,
+        result_coordinates=coordinates,
+        token_resolver=None,
+        reject_extra_tokens=True,
+        default_pre_filter_sql=(
+            f"SELECT o.id FROM temp.{RETRIEVAL_WORLD_OBJECTS} o "
+            f"LEFT JOIN temp.{RETRIEVAL_WORLD_DEFAULT_EXCLUSIONS} x "
+            "ON x.object_kind=o.object_kind AND x.id=o.id "
+            "WHERE o.object_kind='chunk' AND x.id IS NULL"
+        ),
+    )
+    return {
+        "model": str(shared_model),
+        "store_dim": str(semantic_contract[2]),
+        "serve_dim": str(shared_serve_dim),
+    }
 
 
 # ============================================================
@@ -413,7 +926,38 @@ def execute_preset(
 
 
 def materialize(db: sqlite3.Connection, sql: str, *, context=None) -> str:
-    """Run materializers. Returns transformed SQL or error JSON."""
+    """Run materializers without making a read-only cell writable.
+
+    MCP query connections use SQLite ``query_only`` so publication bytes stay
+    immutable. Materializers still need query-local TEMP relations. SQLite
+    blocks TEMP DDL while ``query_only`` is enabled, so briefly disable that
+    connection-local guard around the trusted materializer chain; the staging
+    authorizer below continues to deny every durable write and the guard is
+    restored before user SQL executes.
+    """
+    was_query_only = False
+    try:
+        # MCP enters this function with the staging authorizer already set.
+        # ``query_only`` is a connection-local guard, not user SQL; inspect it
+        # through the trusted engine boundary before the materializer chain
+        # installs its own authorizer.
+        db.set_authorizer(None)
+        row = db.execute("PRAGMA query_only").fetchone()
+        was_query_only = bool(row and row[0])
+        if was_query_only:
+            db.execute("PRAGMA query_only=OFF")
+        return _materialize(db, sql, context=context)
+    finally:
+        if was_query_only:
+            # The materializer chain leaves its staging authorizer installed;
+            # clear it for this connection-local PRAGMA, then the MCP wrapper
+            # installs the final search authorizer before user SQL runs.
+            db.set_authorizer(None)
+            db.execute("PRAGMA query_only=ON")
+
+
+def _materialize(db: sqlite3.Connection, sql: str, *, context=None) -> str:
+    """Run the trusted materializer chain. ``materialize`` owns the guard."""
     from flex.mcp_core import materialize_authorizer
     from flex.meta import attach_registered_cells
     from flex.retrieve.doc_mounts import materialize_docs

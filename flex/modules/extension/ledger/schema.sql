@@ -161,6 +161,8 @@ FROM annotations;
 CREATE TRIGGER IF NOT EXISTS annotations_insert
 INSTEAD OF INSERT ON annotations BEGIN
     SELECT CASE
+        WHEN NEW.annotation_id IS NULL
+        THEN RAISE(ABORT, 'annotation identity is required')
         WHEN NEW.target_cell_id IS NULL OR NEW.target_chunk_id IS NULL
         THEN RAISE(ABORT, 'annotation target identity is required')
         WHEN NEW.note IS NULL
@@ -168,10 +170,7 @@ INSTEAD OF INSERT ON annotations BEGIN
     END;
     INSERT INTO _raw_chunks(id, content, timestamp)
     VALUES (
-        COALESCE(
-            NEW.annotation_id,
-            ledger_annotation_id(NEW.target_cell_id, NEW.target_chunk_id)
-        ),
+        NEW.annotation_id,
         NEW.note,
         COALESCE(NEW.created_at, CAST(strftime('%s','now') AS INTEGER))
     );
@@ -179,10 +178,7 @@ INSTEAD OF INSERT ON annotations BEGIN
         chunk_id, wing, hall, room, weight,
         author_provider, author_session_id, author_source, updated_at
     ) VALUES (
-        COALESCE(
-            NEW.annotation_id,
-            ledger_annotation_id(NEW.target_cell_id, NEW.target_chunk_id)
-        ),
+        NEW.annotation_id,
         NEW.wing,
         COALESCE(NEW.hall, 'discoveries'),
         NEW.room,
@@ -195,10 +191,7 @@ INSTEAD OF INSERT ON annotations BEGIN
     INSERT INTO _edges_annotation_target(
         chunk_id, target_cell_id, target_chunk_id
     ) VALUES (
-        COALESCE(
-            NEW.annotation_id,
-            ledger_annotation_id(NEW.target_cell_id, NEW.target_chunk_id)
-        ),
+        NEW.annotation_id,
         NEW.target_cell_id,
         NEW.target_chunk_id
     );

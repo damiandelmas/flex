@@ -35,6 +35,13 @@ ENRICHMENT_STUBS: list[str] = [
     """CREATE TABLE IF NOT EXISTS _views (
         name TEXT PRIMARY KEY, sql TEXT NOT NULL,
         description TEXT, created_at INTEGER)""",
+    """CREATE TABLE IF NOT EXISTS _coding_agent_source_visibility (
+        source_id TEXT PRIMARY KEY,
+        visible INTEGER NOT NULL DEFAULT 1,
+        reason TEXT,
+        basis TEXT NOT NULL,
+        generation INTEGER NOT NULL DEFAULT 0,
+        updated_at INTEGER NOT NULL DEFAULT (strftime('%s','now')))""",
 ]
 
 

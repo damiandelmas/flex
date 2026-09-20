@@ -16,11 +16,16 @@ SQL usage (legacy — still supported):
 """
 
 import json
+import hashlib
+import os
 import re
+import sqlite3
 import sys
+import tempfile
 import time
 import uuid
 from datetime import datetime
+from pathlib import Path
 
 import numpy as np
 from typing import Optional, List, Dict, Any
@@ -29,6 +34,19 @@ from flex.retrieve.score import parse_modifiers, score_candidates, _mmr_select
 
 _TOKEN_RESOLVER = None
 _EXTRA_BOUNDARIES = None
+
+
+def _open_npy_stream(path: Path, dtype, shape):
+    """Open a sequentially writable .npy without mapping output pages."""
+    stream = path.open('wb')
+    np.lib.format.write_array_header_2_0(stream, {
+        'descr': np.lib.format.dtype_to_descr(np.dtype(dtype)),
+        'fortran_order': False,
+        'shape': tuple(shape),
+    })
+    return stream
+
+
 try:
     from flex.modules.query import resolve_token, registered_token_names
     _TOKEN_RESOLVER = resolve_token
@@ -219,6 +237,7 @@ class VectorCache:
 
     def __init__(self):
         self.ids: List[str] = []
+        self._id_bytes: int = 0
         self.matrix: Optional[np.ndarray] = None  # (n, dims), normalized
         self._id_to_idx: Dict[str, int] = {}
         self.loaded_at: Optional[float] = None
@@ -235,75 +254,289 @@ class VectorCache:
         # Incremental-append cursor state (see append_from_db)
         self.max_rowid: int = 0          # highest rowid seen among loaded embedded rows
         self.embedded_count: int = 0     # rows in the matrix (post dim-filter)
+        self.source_generation: int | None = None
+        self.source_mtime_ns: int | None = None
 
     def load_from_db(self, db, table: str, embedding_col: str = 'embedding',
                      id_col: str = 'id', serve_dim: int | None = None) -> 'VectorCache':
-        """Load vectors from SQLite BLOB column into numpy matrix.
+        """Load vectors from SQLite into their final serving representation.
 
-        serve_dim: optional Matryoshka slice applied AFTER the dominant-dim
-        guard and BEFORE normalization. No-op when serve_dim >= the loaded
-        matrix width (e.g. MiniLM@128 stays 128)."""
+        The old path fetched every full-width BLOB, retained Python views over
+        them, vstacked a second full-width matrix, copied a serving slice, and
+        copied again while normalizing.  Memmap happened only after that peak.
+
+        This loader first discovers the dominant stored width, then streams
+        bounded batches directly into the final serving-width array/memmap and
+        normalizes each batch in place.  Peak construction memory is therefore
+        O(batch * stored_dim), not O(corpus * stored_dim * copies).
+
+        serve_dim: optional Matryoshka prefix served after the dominant-width
+        guard. No-op when serve_dim >= stored width."""
         start = time.time()
 
-        rows = db.execute(
-            f"SELECT rowid, [{id_col}], [{embedding_col}] FROM [{table}] "
+        shape = db.execute(
+            f"SELECT length([{embedding_col}]) AS nbytes, COUNT(*) AS n, "
+            f"MAX(rowid) AS max_rowid FROM [{table}] "
+            f"WHERE [{embedding_col}] IS NOT NULL "
+            f"GROUP BY length([{embedding_col}]) "
+            "ORDER BY n DESC, nbytes DESC LIMIT 1"
+        ).fetchone()
+        if not shape or not shape[0] or not shape[1]:
+            return self
+
+        stored_bytes = int(shape[0])
+        dominant_dim = stored_bytes // np.dtype(np.float32).itemsize
+        count = int(shape[1])
+        self.max_rowid = int(shape[2] or 0)
+        if dominant_dim <= 0 or stored_bytes % 4:
+            return self
+        served_dim = min(int(serve_dim or dominant_dim), dominant_dim)
+
+        total_embedded = db.execute(
+            f"SELECT COUNT(*) FROM [{table}] "
             f"WHERE [{embedding_col}] IS NOT NULL"
-        ).fetchall()
-
-        if not rows:
-            return self
-
-        self.ids = []
-        vectors = []
-
-        for row in rows:
-            if row[0] is not None and row[0] > self.max_rowid:
-                self.max_rowid = row[0]
-            self.ids.append(row[1])
-            vectors.append(np.frombuffer(row[2], dtype=np.float32))
-
-        # Detect dominant dimension and filter outliers (guards against mixed-model migrations)
-        dims = [v.shape[0] for v in vectors]
-        dominant_dim = max(set(dims), key=dims.count)
-        skipped = sum(1 for d in dims if d != dominant_dim)
+        ).fetchone()[0]
+        skipped = int(total_embedded) - count
         if skipped:
-            print(f"VectorCache: skipping {skipped} vectors with dim != {dominant_dim} (mixed-model artifacts)",
+            print(f"VectorCache: skipping {skipped} vectors with dim != {dominant_dim} "
+                  "(mixed-model artifacts)",
                   file=sys.stderr)
-            filtered = [(id_, v) for id_, v, d in zip(self.ids, vectors, dims) if d == dominant_dim]
-            self.ids, vectors = zip(*filtered) if filtered else ([], [])
-            self.ids = list(self.ids)
-            vectors = list(vectors)
 
-        if not vectors:
-            return self
+        self._stored_dim = dominant_dim
+        self.dims = served_dim
+        self.embedded_count = count
 
-        # Stack into matrix
-        self.matrix = np.vstack(vectors)  # (n, dims)
-        self._stored_dim = self.matrix.shape[1]   # pre-slice column width
+        columns = {
+            str(row[1]) for row in db.execute(f"PRAGMA table_info([{table}])")
+        }
+        has_timestamp = 'timestamp' in columns
+        memmap_enabled = bool(os.environ.get('FLEX_VEC_MEMMAP'))
+        artifact = self._artifact_paths(db, table, served_dim)
+        if memmap_enabled and artifact is None:
+            temp_base = Path(tempfile.gettempdir()) / (
+                f"flexvec-{os.getpid()}-{id(self)}-{uuid.uuid4().hex}"
+            )
+            artifact = {
+                'source': None,
+                'matrix': temp_base.with_suffix('.matrix.npy'),
+                'timestamps': temp_base.with_suffix('.timestamps.npy'),
+                'manifest': temp_base.with_suffix('.manifest.json'),
+            }
+        matrix_path = artifact.get('matrix') if artifact else None
+        timestamp_path = artifact.get('timestamps') if artifact else None
+        manifest_path = artifact.get('manifest') if artifact else None
+        source_path = artifact.get('source') if artifact else None
+        source_mtime_ns = None
+        if source_path is not None:
+            try:
+                source_mtime_ns = source_path.stat().st_mtime_ns
+            except OSError:
+                pass
+        try:
+            from flex.retrieve.vector_generation import vector_generation
+            source_generation = vector_generation(db, table)
+        except Exception:
+            source_generation = None
+        self.source_generation = source_generation
+        self.source_mtime_ns = source_mtime_ns
 
-        if serve_dim and serve_dim < self.matrix.shape[1]:        # Matryoshka slice
-            self.matrix = np.ascontiguousarray(self.matrix[:, :serve_dim])
+        reused = False
+        if memmap_enabled and matrix_path and manifest_path:
+            try:
+                manifest = json.loads(manifest_path.read_text())
+                reused = (
+                    manifest.get('format') == 2
+                    and manifest.get('source') == str(source_path)
+                    and (
+                        manifest.get('source_generation') == source_generation
+                        if source_generation is not None
+                        else manifest.get('source_mtime_ns') == source_mtime_ns
+                    )
+                    and manifest.get('table') == table
+                    and manifest.get('stored_dim') == dominant_dim
+                    and manifest.get('serve_dim') == served_dim
+                    and manifest.get('count') == count
+                    and manifest.get('max_rowid') == self.max_rowid
+                    and matrix_path.exists()
+                )
+                if reused:
+                    matrix = np.load(matrix_path, mmap_mode='r')
+                    reused = (
+                        matrix.shape == (count, served_dim)
+                        and matrix.dtype == np.float32
+                    )
+                    if reused:
+                        self.matrix = matrix
+                        if has_timestamp and timestamp_path and timestamp_path.exists():
+                            timestamps = np.load(timestamp_path, mmap_mode='r')
+                            if (
+                                timestamps.shape == (count,)
+                                and timestamps.dtype == np.float64
+                            ):
+                                self.timestamps = timestamps
+            except (OSError, ValueError, TypeError, json.JSONDecodeError):
+                reused = False
 
-        self.dims = self.matrix.shape[1]
+        matrix_tmp = None
+        timestamp_tmp = None
+        if not reused:
+            matrix_stream = None
+            timestamp_stream = None
+            if memmap_enabled and matrix_path:
+                matrix_path.parent.mkdir(parents=True, exist_ok=True)
+                matrix_tmp = matrix_path.with_name(
+                    f"{matrix_path.name}.{os.getpid()}.{uuid.uuid4().hex}.tmp"
+                )
+                matrix_stream = _open_npy_stream(
+                    matrix_tmp, np.float32, (count, served_dim),
+                )
+                if has_timestamp and timestamp_path:
+                    timestamp_tmp = timestamp_path.with_name(
+                        f"{timestamp_path.name}.{os.getpid()}.{uuid.uuid4().hex}.tmp"
+                    )
+                    timestamp_stream = _open_npy_stream(
+                        timestamp_tmp, np.float64, (count,),
+                    )
+                target = None
+                timestamp_target = None
+            else:
+                target = np.empty((count, served_dim), dtype=np.float32)
+                timestamp_target = (
+                    np.zeros(count, dtype=np.float64) if has_timestamp else None
+                )
 
-        # Normalize for cosine similarity (in-place slice is a fresh contiguous
-        # array from the copy above; the unsliced path keeps the original
-        # vstack buffer, so /= is still safe there too)
-        norms = np.linalg.norm(self.matrix, axis=1, keepdims=True)
-        norms[norms == 0] = 1
-        self.matrix = self.matrix / norms
+            select_timestamp = ", [timestamp]" if has_timestamp else ""
+            cursor = db.execute(
+                f"SELECT rowid, [{id_col}], "
+                f"substr([{embedding_col}], 1, ?){select_timestamp} "
+                f"FROM [{table}] WHERE [{embedding_col}] IS NOT NULL "
+                f"AND length([{embedding_col}]) = ? ORDER BY rowid",
+                (served_dim * 4, stored_bytes),
+            )
+            offset = 0
+            batch_size = max(1, int(os.environ.get('FLEX_VEC_LOAD_BATCH', '2048')))
+            try:
+                while True:
+                    rows = cursor.fetchmany(batch_size)
+                    if not rows:
+                        break
+                    block = np.empty((len(rows), served_dim), dtype=np.float32)
+                    timestamp_block = (
+                        np.zeros(len(rows), dtype=np.float64)
+                        if has_timestamp else None
+                    )
+                    for index, row in enumerate(rows):
+                        vector = np.frombuffer(row[2], dtype=np.float32)
+                        if vector.shape[0] != served_dim:
+                            raise ValueError(
+                                f"short vector slice for {table}: "
+                                f"expected {served_dim}, got {vector.shape[0]}"
+                            )
+                        block[index] = vector
+                        id_value = str(row[1])
+                        self.ids.append(id_value)
+                        self._id_bytes += sys.getsizeof(id_value)
+                        if timestamp_block is not None and row[3] is not None:
+                            ts = _coerce_timestamp(row[3])
+                            if ts is not None:
+                                timestamp_block[index] = ts
+                    norms = np.linalg.norm(block, axis=1, keepdims=True)
+                    norms[norms == 0] = 1
+                    np.divide(block, norms, out=block)
+                    if matrix_stream is not None:
+                        matrix_stream.write(memoryview(block).cast('B'))
+                        if timestamp_stream is not None:
+                            timestamp_stream.write(memoryview(timestamp_block).cast('B'))
+                    else:
+                        target[offset:offset + len(rows)] = block
+                        if timestamp_target is not None:
+                            timestamp_target[offset:offset + len(rows)] = timestamp_block
+                    offset += len(rows)
+            finally:
+                if matrix_stream is not None:
+                    matrix_stream.close()
+                if timestamp_stream is not None:
+                    timestamp_stream.close()
 
-        # Build index
+            if offset != count:
+                raise RuntimeError(
+                    f"VectorCache streamed {offset} rows for {table}; expected {count}"
+                )
+
+            if matrix_stream is not None:
+                os.replace(matrix_tmp, matrix_path)
+                if timestamp_tmp and timestamp_path:
+                    os.replace(timestamp_tmp, timestamp_path)
+                manifest_tmp = manifest_path.with_name(
+                    f"{manifest_path.name}.{os.getpid()}.{uuid.uuid4().hex}.tmp"
+                )
+                manifest_tmp.write_text(json.dumps({
+                    'format': 2,
+                    'source': str(source_path),
+                    'source_mtime_ns': source_mtime_ns,
+                    'source_generation': source_generation,
+                    'table': table,
+                    'stored_dim': dominant_dim,
+                    'serve_dim': served_dim,
+                    'count': count,
+                    'max_rowid': self.max_rowid,
+                }, sort_keys=True))
+                os.replace(manifest_tmp, manifest_path)
+                self.matrix = np.load(matrix_path, mmap_mode='r')
+                if timestamp_path and timestamp_path.exists():
+                    self.timestamps = np.load(timestamp_path, mmap_mode='r')
+            else:
+                self.matrix = target
+                self.timestamps = timestamp_target
+        else:
+            # Reusing a matrix still needs the stable row-order identity map.
+            select_timestamp = ", [timestamp]" if has_timestamp else ""
+            cursor = db.execute(
+                f"SELECT rowid, [{id_col}]{select_timestamp} FROM [{table}] "
+                f"WHERE [{embedding_col}] IS NOT NULL "
+                f"AND length([{embedding_col}]) = ? ORDER BY rowid",
+                (stored_bytes,),
+            )
+            while True:
+                rows = cursor.fetchmany(4096)
+                if not rows:
+                    break
+                for row in rows:
+                    id_value = str(row[1])
+                    self.ids.append(id_value)
+                    self._id_bytes += sys.getsizeof(id_value)
+
         self._id_to_idx = {id_: i for i, id_ in enumerate(self.ids)}
-
-        self.embedded_count = len(self.ids)
 
         self.loaded_at = time.time()
         elapsed = (self.loaded_at - start) * 1000
         self._load_msg = f"VectorCache: {len(self.ids)} vectors ({self.dims}d) in {elapsed:.1f}ms"
-
-        self._memmap_matrix(db, table)
         return self
+
+    @staticmethod
+    def _artifact_paths(db, table: str, serve_dim: int) -> dict[str, Path] | None:
+        """Return writable derived-cache paths for a file-backed database."""
+        source = None
+        try:
+            for row in db.execute("PRAGMA database_list"):
+                if row[1] == 'main' and row[2]:
+                    source = Path(str(row[2])).resolve()
+                    break
+        except Exception:
+            pass
+        if source is None:
+            return None
+        flex_home = Path(os.environ.get('FLEX_HOME', Path.home() / '.flex'))
+        digest = hashlib.sha256(str(source).encode('utf-8')).hexdigest()[:20]
+        safe_table = re.sub(r'[^A-Za-z0-9_.-]+', '_', table)
+        base = flex_home / 'cache' / 'vectors' / digest
+        stem = f"{safe_table}.{serve_dim}"
+        return {
+            'source': source,
+            'matrix': base / f"{stem}.matrix.npy",
+            'timestamps': base / f"{stem}.timestamps.npy",
+            'manifest': base / f"{stem}.manifest.json",
+        }
 
     def _memmap_matrix(self, db, table: str) -> None:
         """turbovec (opt-in via FLEX_VEC_MEMMAP): persist the normalized matrix to
@@ -364,6 +597,24 @@ class VectorCache:
         if self.matrix is None or not self.ids or self.dims == 0:
             return None
 
+        # A generation change can be an append, an in-place vector rewrite, an
+        # ID change, or a timestamp change. Only rowid polling cannot tell them
+        # apart safely, so generation-aware caches rebuild from the bounded
+        # artifact stream. Legacy cells without receipts retain append probing.
+        if self.source_generation is not None:
+            try:
+                from flex.retrieve.vector_generation import vector_generation
+                if vector_generation(db, table) != self.source_generation:
+                    return None
+            except Exception:
+                return None
+
+        # Disk-backed caches are rebuilt by the bounded streaming loader.  A
+        # full np.concatenate would reintroduce the exact corpus-sized peak the
+        # artifact path exists to eliminate.
+        if isinstance(self.matrix, np.memmap):
+            return None
+
         # Match new rows on the STORED (pre-slice) column width, not the served
         # width — a nomic column stores native 768d while self.dims is the
         # Matryoshka serve_dim (e.g. 128). Matching on self.dims would match
@@ -415,10 +666,17 @@ class VectorCache:
         succ = VectorCache()
         succ.dims = self.dims
         succ._stored_dim = self._stored_dim
+        try:
+            from flex.retrieve.vector_generation import vector_generation
+            succ.source_generation = vector_generation(db, table)
+        except Exception:
+            succ.source_generation = None
+        succ.source_mtime_ns = self.source_mtime_ns
         succ.loaded_at = self.loaded_at  # full-load age survives appends (rebuild floor)
         succ.max_rowid = new_max
         succ.embedded_count = self.embedded_count + len(new_ids)
         succ.ids = self.ids + new_ids
+        succ._id_bytes = self._id_bytes + sum(sys.getsizeof(id_) for id_ in new_ids)
         succ._id_to_idx = dict(self._id_to_idx)
         base = len(self.ids)
         for i, id_ in enumerate(new_ids):
@@ -468,6 +726,9 @@ class VectorCache:
         if not self.ids:
             return
 
+        if self.timestamps is not None and len(self.timestamps) == len(self.ids):
+            return
+
         N = len(self.ids)
 
         self.timestamps = np.zeros(N, dtype=np.float64)
@@ -493,7 +754,8 @@ class VectorCache:
                mask: np.ndarray = None, threshold: float = 0.0,
                mmr_lambda: float = 0.7,
                modifiers: dict = None, config: dict = None,
-               embed_fn=None, embed_doc_fn=None) -> List[Dict[str, Any]]:
+               embed_fn=None, embed_doc_fn=None,
+               token_resolver=_TOKEN_RESOLVER) -> List[Dict[str, Any]]:
         """Search for similar vectors with optional landscape modulations.
 
         Delegates to the scoring engine (score.score_candidates).
@@ -519,7 +781,7 @@ class VectorCache:
             config=config,
             embed_fn=embed_fn,
             embed_doc_fn=embed_doc_fn,
-            token_resolver=_TOKEN_RESOLVER,
+            token_resolver=token_resolver,
         )
 
     def _mmr_select_on(self, candidates: list, similarities: np.ndarray,
@@ -563,9 +825,20 @@ class VectorCache:
 
     @property
     def memory_mb(self) -> float:
+        return self.memory_bytes / (1024 * 1024)
+
+    @property
+    def memory_bytes(self) -> int:
+        """Estimated retained bytes, including Python identity structures."""
         if self.matrix is None:
-            return 0.0
-        return self.matrix.nbytes / (1024 * 1024)
+            return 0
+        total = int(self.matrix.nbytes)
+        if self.timestamps is not None:
+            total += int(self.timestamps.nbytes)
+        total += sys.getsizeof(self.ids) + sys.getsizeof(self._id_to_idx)
+        total += self._id_bytes
+        total += len(self._id_to_idx) * sys.getsizeof(0)  # per-entry integer index
+        return total
 
     def __repr__(self):
         return f"VectorCache({self.size} vectors, {self.dims}d, {self.memory_mb:.1f}MB)"
@@ -619,6 +892,26 @@ def _mask_sql_data(sql: str) -> str:
     return ''.join(masked)
 
 
+_VEC_OPS_CALL_RE = re.compile(r'\bvec_ops\s*\(', re.IGNORECASE)
+
+
+def _find_vec_ops_call(sql: str):
+    """Return the executable-SQL mask and first vec_ops call, if present."""
+    code = _mask_sql_data(sql)
+    return code, _VEC_OPS_CALL_RE.search(code)
+
+
+def query_uses_vec_ops(sql: str) -> bool:
+    """Whether executable SQL contains a vec_ops call.
+
+    Strings, quoted identifiers, and comments are excluded using the same
+    byte-preserving mask as the materializer, so query intent cannot drift
+    from the syntax the materializer recognizes.
+    """
+    _code, call = _find_vec_ops_call(sql)
+    return call is not None
+
+
 def materialize_vec_ops(db, sql: str) -> str:
     """Transparently materialize vec_ops() as a temp table.
 
@@ -630,7 +923,7 @@ def materialize_vec_ops(db, sql: str) -> str:
     Skips if wrapped in json_each() (backward compat).
     Only triggers when vec_ops appears as a table source (after FROM/JOIN).
     """
-    code = _mask_sql_data(sql)
+    code, start = _find_vec_ops_call(sql)
     lower = code.lower()
 
     # json_each(vec_ops(...)) — explicit pattern, don't touch
@@ -638,7 +931,6 @@ def materialize_vec_ops(db, sql: str) -> str:
         return sql
 
     # Find vec_ops(...) call — balanced paren matching for quoted strings
-    start = re.search(r'\bvec_ops\s*\(', code, re.IGNORECASE)
     if not start:
         return sql
 
@@ -693,6 +985,21 @@ def materialize_vec_ops(db, sql: str) -> str:
     tmp_name = f"_vec_results_{uuid.uuid4().hex[:8]}"
 
     base_cols = [('id', 'TEXT PRIMARY KEY'), ('score', 'REAL')]
+    try:
+        from flex.meta import has_retrieval_world
+
+        is_world = has_retrieval_world(db)
+    except (ImportError, sqlite3.DatabaseError):
+        is_world = False
+    if is_world:
+        if any(
+            result.get('cell_id') is None or result.get('native_id') is None
+            for result in results
+        ):
+            return json.dumps({
+                "error": "retrieval world vec_ops returned incomplete coordinates"
+            })
+        base_cols.extend([('cell_id', 'TEXT'), ('native_id', 'TEXT')])
     extra_cols = []
     if results:
         for key in sorted(results[0].keys()):
@@ -722,7 +1029,10 @@ def materialize_vec_ops(db, sql: str) -> str:
 
 
 def register_vec_ops(conn, caches: dict, embed_fn, cell_config: dict = None,
-                     embed_doc_fn=None):
+                     embed_doc_fn=None, *, result_coordinates: dict | None = None,
+                     token_resolver=_TOKEN_RESOLVER,
+                     reject_extra_tokens: bool = False,
+                     default_pre_filter_sql: str | None = None):
     """Register vec_ops as a SQL-callable function with modifier support.
 
     Args:
@@ -768,11 +1078,13 @@ def register_vec_ops(conn, caches: dict, embed_fn, cell_config: dict = None,
             table = '_raw_chunks'
             token_str = args[0]
             pre_filter_sql = args[1] if len(args) > 1 else None
-
             # Parse tokens to extract query_text from similar: token
             modifiers_preview = parse_modifiers(token_str, extra_boundaries=_registered_token_names())
             query_text = modifiers_preview.get('similar')
             modifier_str = token_str
+
+        if pre_filter_sql is None:
+            pre_filter_sql = default_pre_filter_sql
 
         # Validate modulation tokens before doing any work — fail loud on typo'd
         # or malformed directives instead of silently degrading the query.
@@ -786,6 +1098,12 @@ def register_vec_ops(conn, caches: dict, embed_fn, cell_config: dict = None,
             return json.dumps([])
 
         modifiers = parse_modifiers(modifier_str, extra_boundaries=_registered_token_names()) if modifier_str else None
+        if reject_extra_tokens and modifiers and modifiers.get('extra_tokens'):
+            return json.dumps({
+                "error": "vec_ops: structural enrichment tokens are not "
+                         "defined for this retrieval world",
+                "unrecognized_tokens": list(modifiers['extra_tokens']),
+            })
 
         # SQL pre-filter: execute to get chunk IDs
         # Authorizer whitelist: pure SELECT only (READ=20, SELECT=21, FUNCTION=31, RECURSIVE=33)
@@ -808,6 +1126,22 @@ def register_vec_ops(conn, caches: dict, embed_fn, cell_config: dict = None,
                 return json.dumps({"error": f"vec_ops pre-filter SQL failed: {e}"})
             finally:
                 conn.set_authorizer(None)
+        hidden_visibility_ids = None
+        try:
+            from flex.modules.claude_code.source_visibility import hidden_ids
+            hidden_visibility_ids = hidden_ids(conn, table)
+        except Exception as exc:
+            return json.dumps({"error": f"vec_ops visibility policy failed: {exc}"})
+        if pre_filter_ids is not None and hidden_visibility_ids is not None:
+            pre_filter_ids -= hidden_visibility_ids
+
+        visibility_mask = None
+        if hidden_visibility_ids is not None:
+            visibility_mask = np.ones(len(cache.ids), dtype=bool)
+            for hidden_id in hidden_visibility_ids:
+                idx = cache._id_to_idx.get(hidden_id)
+                if idx is not None:
+                    visibility_mask[idx] = False
 
         # Handle NULL/empty query text (for centroid: or from:to: tokens)
         if query_text is None or query_text == '':
@@ -829,14 +1163,26 @@ def register_vec_ops(conn, caches: dict, embed_fn, cell_config: dict = None,
             config=cfg,
             embed_fn=embed_fn,
             embed_doc_fn=embed_doc_fn,
+            token_resolver=token_resolver,
             diverse=bool(modifiers.get('diverse')) if modifiers else False,
             limit=limit,
             oversample=min(limit * 3, cache.size),
+            mask=visibility_mask,
         )
-        return json.dumps([
-            {k: (round(v, 4) if k == 'score' else v)
-             for k, v in r.items()}
-            for r in results
-        ])
+        rendered = []
+        for result in results:
+            item = {
+                key: (round(value, 4) if key == 'score' else value)
+                for key, value in result.items()
+            }
+            if result_coordinates is not None:
+                coordinate = result_coordinates.get(str(result.get('id')))
+                if coordinate is None:
+                    return json.dumps({
+                        "error": "vec_ops: retrieval world result has no native coordinate"
+                    })
+                item['cell_id'], item['native_id'] = coordinate
+            rendered.append(item)
+        return json.dumps(rendered)
 
     conn.create_function("vec_ops", -1, vec_ops_fn)

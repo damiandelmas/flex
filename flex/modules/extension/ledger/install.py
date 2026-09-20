@@ -16,7 +16,7 @@ from flex.registry import CELLS_DIR, register_cell, resolve_cell
 LEDGER_CELL = "ledger"
 EXT_DIR = Path(__file__).resolve().parent
 SCHEMA = EXT_DIR / "schema.sql"
-SCHEMA_VERSION = 4
+SCHEMA_VERSION = 5
 
 
 def _table_exists(conn: sqlite3.Connection, name: str) -> bool:
@@ -101,6 +101,9 @@ def ensure_schema(conn: sqlite3.Connection) -> bool:
     existing_columns = _columns(conn, "_types_annotation") if existing else set()
     statements = [
         "BEGIN IMMEDIATE",
+        "DROP TRIGGER IF EXISTS annotations_insert",
+        "DROP TRIGGER IF EXISTS annotations_update",
+        "DROP TRIGGER IF EXISTS annotations_delete",
         "DROP VIEW IF EXISTS annotation_history",
         "DROP VIEW IF EXISTS annotations",
     ]
@@ -116,8 +119,8 @@ def ensure_schema(conn: sqlite3.Connection) -> bool:
         "INSERT OR REPLACE INTO _meta(key,value) VALUES "
         "('cell_type','ledger'),"
         "('description','Annotations referencing objects in other Flex cells.'),"
-        "('schema','ledger.v4'),"
-        "('ledger_schema_version','4'),"
+        "('schema','ledger.v5'),"
+        "('ledger_schema_version','5'),"
         "('embed','false'),"
         "('lifecycle','authored')",
         "COMMIT",
@@ -132,14 +135,32 @@ def ensure_schema(conn: sqlite3.Connection) -> bool:
 
 
 def ensure_presets(conn: sqlite3.Connection) -> bool:
-    """Compatibility no-op for pre-file-backed Ledger installations.
+    """Seed missing stock SQL programs without replacing database-owned rows."""
+    from flex.retrieve.presets import parse_preset
 
-    Ledger's checked-in SQL files are resolved at query time by the shared
-    preset resolver.  Existing ``_presets`` rows remain untouched as
-    recoverable legacy state, but opening Ledger never copies or rewrites them.
-    """
-    del conn
-    return False
+    existing = {
+        str(row[0]) for row in conn.execute("SELECT name FROM _presets")
+    }
+    installed = False
+    for path in sorted((EXT_DIR / "stock" / "presets").glob("*.sql")):
+        text = path.read_text()
+        preset = parse_preset(text, path.stem)
+        if preset["name"] in existing:
+            continue
+        cursor = conn.execute(
+            "INSERT OR IGNORE INTO _presets(name,description,params,sql,source) "
+            "VALUES (?,?,?,?, 'stock')",
+            (
+                preset["name"],
+                preset["description"],
+                preset.get("params", ""),
+                text,
+            ),
+        )
+        installed = cursor.rowcount > 0 or installed
+    if installed:
+        conn.commit()
+    return installed
 
 
 def ledger_path() -> Path:
@@ -155,6 +176,7 @@ def open_ledger() -> sqlite3.Connection:
     path = ledger_path()
     conn = open_cell(str(path))
     ensure_schema(conn)
+    ensure_presets(conn)
     if resolve_cell(LEDGER_CELL) is None:
         register_cell(
             LEDGER_CELL,
@@ -179,7 +201,7 @@ def install() -> dict:
         return {
             "cell": LEDGER_CELL,
             "path": str(ledger_path()),
-            "schema": "ledger.v4",
+            "schema": "ledger.v5",
             "presets": [p.stem for p in sorted((EXT_DIR / "stock" / "presets").glob("*.sql"))],
         }
     finally:

@@ -41,6 +41,7 @@ from flex.registry import (
     resolve_cell as registry_resolve,
     discover_cells as registry_discover,
     get_cell_metadata as registry_cell_metadata,
+    query_target_opener as registry_query_target_opener,
 )
 
 # Engine facade — degrades gracefully when .whl engine not installed
@@ -50,6 +51,7 @@ try:
         warm_embedder,
         build_vec_state as _engine_build_vec_state,
         refresh_vec_state as _engine_refresh_vec_state,
+        vector_state_is_current as _engine_vector_state_is_current,
         register_vec_udf,
         execute_preset as _engine_execute_preset,
         materialize as _engine_materialize,
@@ -86,23 +88,52 @@ _vec_locks_guard = threading.Lock()  # protects _vec_locks dict creation only
 # much less often. Only rebuild if mtime is stale by more than this threshold.
 _VEC_REBUILD_DEBOUNCE_S = 60
 
-# Matrix-byte budget for resident VectorCaches. Cells queried once would
-# otherwise stay resident forever; least-recently-used cells are evicted
-# when the total exceeds the budget (re-warm on next query costs seconds).
-# Counts matrix bytes only — python id-list/dict overhead is excluded.
-_VEC_BUDGET_BYTES = int(os.environ.get('FLEX_VEC_BUDGET_MB', '3072')) * 1024 * 1024
+def _effective_memory_mb() -> int:
+    values = []
+    try:
+        values.append(
+            int(os.sysconf('SC_PAGE_SIZE')) * int(os.sysconf('SC_PHYS_PAGES'))
+        )
+    except (AttributeError, OSError, ValueError):
+        pass
+    for path in (
+        Path('/sys/fs/cgroup/memory.max'),
+        Path('/sys/fs/cgroup/memory/memory.limit_in_bytes'),
+    ):
+        try:
+            raw = path.read_text().strip()
+            if raw != 'max':
+                value = int(raw)
+                if 0 < value < (1 << 60):
+                    values.append(value)
+        except (OSError, ValueError):
+            pass
+    return (min(values) // (1024 * 1024)) if values else 8192
+
+
+def _default_vec_budget_mb() -> int:
+    effective = _effective_memory_mb()
+    service_cap = max(1536, min(4096, effective // 4))
+    # Keep cache admission inside the service's own MemoryMax, not merely
+    # inside host RAM. The fp32 model is ~910MB steady-state; reserve 1280MB
+    # for it, Python, SQLite, transports, and inference temporaries.
+    return max(256, min(2048, effective // 8, service_cap - 1280))
+
+
+# Resident cache budget includes matrices, timestamps, ID strings, list, and
+# dict storage.  It intentionally excludes the separately-observed model owner.
+_VEC_BUDGET_BYTES = int(
+    os.environ.get('FLEX_VEC_BUDGET_MB', str(_default_vec_budget_mb()))
+) * 1024 * 1024
 
 
 def _state_matrix_bytes(state: dict) -> int:
-    """Total numpy matrix bytes held by one cell's cached state."""
+    """Estimated retained cache bytes for one cell's state."""
     total = 0
     for cache in (state.get('caches') or {}).values():
         m = getattr(cache, 'matrix', None)
         if m is not None:
-            total += m.nbytes
-        ts = getattr(cache, 'timestamps', None)
-        if ts is not None:
-            total += ts.nbytes
+            total += int(getattr(cache, 'memory_bytes', m.nbytes))
     return total
 
 
@@ -167,10 +198,19 @@ def _schedule_vec_refresh(name: str, cell_lock: threading.Lock) -> None:
                     return
                 cur_mtime = p.stat().st_mtime
                 state = _vec_state.get(name)
-                if state and state.get('mtime') == cur_mtime:
-                    return  # already fresh
                 bgdb = _open_query_cell(p)
                 try:
+                    generation_current = (
+                        _engine_vector_state_is_current(state, bgdb)
+                        if state else None
+                    )
+                    if state and (
+                        generation_current is True
+                        or (generation_current is None
+                            and state.get('mtime') == cur_mtime)
+                    ):
+                        state['mtime'] = cur_mtime
+                        return  # already fresh
                     refreshed = None
                     if state:
                         try:
@@ -311,21 +351,33 @@ def get_cell(name: str, warm_vec: bool = True):
         # by more than _VEC_REBUILD_DEBOUNCE_S, or if no cache exists yet (warmup).
         current_mtime = p.stat().st_mtime
         state = _vec_state.get(name)
+        generation_current = (
+            _engine_vector_state_is_current(state, db)
+            if HAS_ENGINE and state else None
+        )
 
         if not warm_vec or cell_is_no_embed(db):
             # embed-off cell → only NULL embeddings; never warm a VectorCache
             # (would be a phantom empty scoring surface). Serve FTS/SQL/structural
             # only — the query surface @orient marks semantic-scoring INERT.
             pass
-        elif HAS_ENGINE and state and state['mtime'] == current_mtime:
+        elif HAS_ENGINE and state and (
+            generation_current is True
+            or (generation_current is None and state['mtime'] == current_mtime)
+        ):
             # Cache is fresh — just register UDF on this connection
+            state['mtime'] = current_mtime
             state['last_used'] = time.time()
             register_vec_udf(db, state)
         elif HAS_ENGINE and not _no_embed:
             # Debounce: if cache exists and mtime drift is small, reuse stale cache.
             # Embeddings are mostly append-only — a slightly stale cache misses new
             # rows but doesn't return wrong results. First warmup (state None) always runs.
-            if state and (current_mtime - state['mtime']) < _VEC_REBUILD_DEBOUNCE_S:
+            if (
+                state
+                and generation_current is not False
+                and (current_mtime - state['mtime']) < _VEC_REBUILD_DEBOUNCE_S
+            ):
                 state['last_used'] = time.time()
                 register_vec_udf(db, state)
             else:
@@ -368,6 +420,79 @@ def get_cell(name: str, warm_vec: bool = True):
         db.close()
 
 
+def _resolve_current_vector_state(name: str) -> dict | None:
+    """Synchronously return vector state for an exact current cell generation.
+
+    Physical-cell queries may serve a slightly stale warm cache while a daemon
+    refreshes it. A composed retrieval world cannot: all member vectors must
+    describe the same accepted member generations before one global scoring
+    pass. This resolver therefore rebuilds a drifted member synchronously and
+    publishes it to the ordinary process cache only when the database mtime was
+    stable across the build.
+    """
+    if _no_embed or not HAS_ENGINE:
+        return None
+    metadata = registry_cell_metadata(name)
+    if not metadata or not metadata.get("active", 1):
+        return None
+    try:
+        path = _db_path(name)
+    except FileNotFoundError:
+        return None
+    if not path.is_file():
+        return None
+    resolved_path = str(path.resolve())
+
+    with _vec_locks_guard:
+        cell_lock = _vec_locks.setdefault(name, threading.Lock())
+
+    with cell_lock:
+        current_mtime = path.stat().st_mtime
+        state = _vec_state.get(name)
+        if state is not None and state.get("path") == resolved_path:
+            probe = _open_query_cell(path)
+            try:
+                generation_current = _engine_vector_state_is_current(state, probe)
+            finally:
+                probe.close()
+            if (
+                generation_current is True
+                or (generation_current is None
+                    and state.get("mtime") == current_mtime)
+            ):
+                state["mtime"] = current_mtime
+                state["last_used"] = time.time()
+                return state
+
+        for _attempt in range(2):
+            before_mtime = path.stat().st_mtime
+            db = _open_query_cell(path)
+            try:
+                if cell_is_no_embed(db):
+                    return None
+                new_state = _engine_build_vec_state(name, db, before_mtime)
+            finally:
+                db.close()
+            after_mtime = path.stat().st_mtime
+            if before_mtime != after_mtime:
+                continue
+            if new_state is None:
+                return None
+            built_path = new_state.get("path")
+            if built_path is not None and str(Path(built_path).resolve()) != resolved_path:
+                continue
+            new_state["mtime"] = after_mtime
+            # This resolver opened the exact Registry path itself. Stamp that
+            # boundary even for legacy/test builders that predate state-path
+            # metadata; a mismatched non-empty builder path is rejected above.
+            new_state["path"] = resolved_path
+            new_state["last_used"] = time.time()
+            _vec_state[name] = new_state
+            _enforce_vec_budget(current=name)
+            return new_state
+        return None
+
+
 _no_embed = False
 
 
@@ -382,9 +507,9 @@ def init(
 
     Called by serve.py (the entrypoint) before transport starts.
     cell_names: default-discoverable cells (appear in tool enum/schema).
-    active_names: subset to pre-warm VectorCaches at startup. Inactive cells
-                  are unavailable to query; unlisted active cells are not in
-                  cell_names but remain addressable by exact name.
+    active_names: compatibility name for the subset whose VectorCaches should
+                  be pre-warmed. Query availability is read from Registry
+                  ``active``; unlisted active cells remain addressable by name.
     restrict_to_cells: True only for explicit --cell startup selection; when
                        False, exact-name active unlisted cells can still query.
     warm: when False, defer VectorCache warmup until after the MCP transport is
@@ -438,7 +563,12 @@ def get_server() -> Server:
 
 
 def _warm_all(cell_names: list[str]):
-    """Pre-warm VectorCaches and ONNX embedder at startup."""
+    """Pre-warm explicitly selected VectorCaches without loading a model.
+
+    Cache construction reads stored vectors.  Query/document embedders remain
+    lazy so a prewarm roster cannot pin a per-process ONNX session before any
+    semantic request exists.
+    """
     if not HAS_ENGINE:
         _set_warmup_state(
             status='skipped',
@@ -461,16 +591,6 @@ def _warm_all(cell_names: list[str]):
         started_at=time.time(),
         completed_at=None,
     )
-    try:
-        warm_embedder()
-    except Exception as e:
-        _set_warmup_state(
-            status='error',
-            current=None,
-            errors=[f"embedder: {e}"],
-            completed_at=time.time(),
-        )
-        raise
     completed = 0
     errors = []
     for name in cell_names:
@@ -951,8 +1071,10 @@ def _query_needs_vectors(
     Preset SQL is inspected before execution so custom semantic presets still
     warm on demand.
     """
+    from flex.retrieve.vec_ops import query_uses_vec_ops
+
     sql = query.strip().lstrip("!").lstrip()
-    if "vec_ops(" in sql.lower():
+    if query_uses_vec_ops(sql):
         return True
     if not sql.startswith("@"):
         return False
@@ -973,9 +1095,9 @@ def _query_needs_vectors(
             ).fetchone()
         except sqlite3.Error:
             return False
-        return bool(row and row[0] and "vec_ops(" in str(row[0]).lower())
+        return bool(row and row[0] and query_uses_vec_ops(str(row[0])))
     return any(
-        "vec_ops(" in str(item.get("sql") or "").lower()
+        query_uses_vec_ops(str(item.get("sql") or ""))
         for item in preset.get("queries", [])
     )
 
@@ -1120,6 +1242,25 @@ def _execute_cell_query(
     runtime_environ: dict[str, str] | None = None,
 ) -> str:
     """Synchronous cell query — warm vectors only for semantic execution."""
+    target_opener = registry_query_target_opener(cell)
+    if target_opener is not None:
+        if _explicit_cells and cell not in _explicit_cells:
+            return _unknown_cell_result(cell)
+        try:
+            with target_opener(
+                query=query,
+                vector_state_resolver=_resolve_current_vector_state,
+                explicit_cells=tuple(sorted(_explicit_cells)),
+                available_cells=tuple(sorted(_known_cells)),
+            ) as db:
+                return _execute_open_cell_query(
+                    cell, query, db, runtime_environ=runtime_environ
+                )
+        except (OSError, RuntimeError, sqlite3.DatabaseError) as exc:
+            result = json.dumps({"error": str(exc)})
+            _log_query(cell, query, result, 0.0)
+            return result
+
     if cell == "ledger":
         if _explicit_cells and cell not in _explicit_cells:
             return _unknown_cell_result(cell)

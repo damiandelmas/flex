@@ -272,9 +272,12 @@ class ONNXEmbedder:
         tok.enable_truncation(max_length=MAX_LENGTH)
         tok.enable_padding()
 
-        # Tokenize all to get lengths for sorting + adaptive batch sizing
+        # Tokenize all to get lengths for sorting + adaptive batch sizing.
+        # Padding is already enabled so the same tokenizer is ready for the
+        # inference batches below; count the attention mask rather than padded
+        # ids so one long input cannot make every sentence appear MAX_LENGTH.
         pre_encoded = tok.encode_batch(sentences)
-        lengths = [len(e.ids) for e in pre_encoded]
+        lengths = [int(sum(e.attention_mask)) for e in pre_encoded]
 
         # Sort by length: short texts first, long texts last
         order = np.argsort(lengths)

@@ -4,7 +4,36 @@ Public changes to **flex** ([getflex.dev](https://getflex.dev)).
 
 ---
 
-## 0.55.0 — Unreleased
+## 0.55.1 — September 19, 2026
+
+### Bounded local memory
+
+- Coding-agent installs now publish text, FTS, relationships, views, and
+  presets first, then leave observable semantic debt for the worker. `flex
+  init` no longer loads a model or blocks on historical embedding/enrichment;
+  callers needing an explicit maintenance boundary use `flex sync --full`.
+- Background compilers share the lazy model owner in the local MCP process.
+  Vector artifacts build in bounded batches directly to disk, carry
+  transactional generation receipts, and map read-only for reuse. Structural
+  queries and `@orient` do not warm vectors or load the model.
+- Startup residency is now an independent `prewarm` policy managed by `flex
+  warm`; Registry `active` continues to mean availability. Service memory caps
+  and VectorCache admission budgets scale to the host/cgroup instead of using a
+  workstation-specific ceiling.
+- `flex search` reuses the local query service by default, avoiding a second
+  short-lived cache/model owner. An ambiguous timeout is not retried.
+
+### Fast, faithful coding-agent orientation
+
+- Coding-agent `@orient` retains instructions, query surfaces, graph guidance,
+  presets, and samples, while exact live shape and coverage audits move to
+  `@stats` and `@coverage`.
+- Hub guidance reads the materialized source graph directly rather than
+  expanding the aggregate `sessions` view.
+
+---
+
+## 0.55.0 — September 19, 2026
 
 ### Experimental Windows container distribution
 

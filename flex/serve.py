@@ -15,10 +15,13 @@ Usage:
 """
 
 import asyncio
+import base64
+import json
 import os
 import signal
 import sys
 import threading
+from functools import partial
 
 
 def _start_daemon_thread(target, *args, name: str):
@@ -32,6 +35,18 @@ def _start_daemon_thread(target, *args, name: str):
     thread = threading.Thread(target=target, args=args, name=name, daemon=True)
     thread.start()
     return thread
+
+
+def _physical_warm_names(names: list[str]) -> list[str]:
+    """Return only physical cells eligible for eager cache warmup.
+
+    Query-local targets resolve their member state lazily from the submitted
+    query. They remain authorized and addressable, but are not themselves
+    physical cache owners.
+    """
+    from flex.registry import query_target_opener
+
+    return [name for name in names if query_target_opener(name) is None]
 
 
 # ============================================================
@@ -68,7 +83,7 @@ def run_http_server(port: int = 7134, active_names: list[str] | None = None, no_
 
     from flex.mcp_server import (
         get_server, discover_cells, get_warmup_state, warm_cells,
-        _vec_state, _known_cells,
+        _vec_state, _known_cells, _execute_cell_query, _QUERY_SEMAPHORE,
     )
 
     server = get_server()
@@ -110,6 +125,11 @@ def run_http_server(port: int = 7134, active_names: list[str] | None = None, no_
             or warmup.get("status") == "error"
             or watcher.get("status") == "degraded"
         ) else "ok"
+        try:
+            from flex.engine import embedder_state
+            model = embedder_state()
+        except Exception:
+            model = {"resident": [], "last_used": {}}
         return JSONResponse({
             "status": status,
             "cells": sorted(_known_cells),
@@ -118,6 +138,106 @@ def run_http_server(port: int = 7134, active_names: list[str] | None = None, no_
             "warmup": warmup,
             "refresh": refresh,
             "watcher": watcher,
+            "model": model,
+        })
+
+    async def local_query(request: Request) -> JSONResponse:
+        """Trusted loopback query endpoint used by the local CLI.
+
+        Keep the result as the query kernel's JSON string.  MCP response
+        windows are a transport concern and must not make the CLI rerun SQL.
+        """
+        client = request.client
+        if client is not None and client.host not in {
+            "127.0.0.1", "::1", "localhost", "testclient",
+        }:
+            return JSONResponse({"error": "loopback access required"}, status_code=403)
+
+        body = await request.body()
+        if len(body) > 1_000_000:
+            return JSONResponse({"error": "request too large"}, status_code=413)
+        try:
+            payload = json.loads(body or b"{}")
+        except (json.JSONDecodeError, UnicodeDecodeError):
+            return JSONResponse({"error": "invalid JSON"}, status_code=400)
+        if not isinstance(payload, dict):
+            return JSONResponse({"error": "JSON object required"}, status_code=400)
+
+        cell = payload.get("cell", "claude_code")
+        query = payload.get("query")
+        runtime_environ = payload.get("runtime_environ") or {}
+        allowed_runtime_keys = {
+            "CODEX_THREAD_ID", "CLAUDE_SESSION_ID",
+            "FLEX_RUNTIME_SESSION_ID", "FLEX_RUNTIME_PROVIDER",
+        }
+        if not isinstance(cell, str) or not cell or len(cell) > 256:
+            return JSONResponse({"error": "invalid cell"}, status_code=400)
+        if not isinstance(query, str) or not query or len(query) > 1_000_000:
+            return JSONResponse({"error": "invalid query"}, status_code=400)
+        if not isinstance(runtime_environ, dict) or any(
+            key not in allowed_runtime_keys or not isinstance(value, str)
+            for key, value in runtime_environ.items()
+        ):
+            return JSONResponse({"error": "invalid runtime environment"}, status_code=400)
+
+        if _QUERY_SEMAPHORE.locked():
+            return JSONResponse(
+                {"error": "Flex query concurrency limit reached"}, status_code=429,
+            )
+        await _QUERY_SEMAPHORE.acquire()
+        try:
+            loop = asyncio.get_running_loop()
+            result = await loop.run_in_executor(
+                None,
+                partial(_execute_cell_query, cell, query, runtime_environ),
+            )
+        finally:
+            _QUERY_SEMAPHORE.release()
+        return JSONResponse({"result": result})
+
+    async def internal_embed(request: Request) -> JSONResponse:
+        """Loopback-only owner for query and document ONNX inference."""
+        client = request.client
+        if client is not None and client.host not in {
+            "127.0.0.1", "::1", "localhost", "testclient",
+        }:
+            return JSONResponse({"error": "loopback access required"}, status_code=403)
+        body = await request.body()
+        if len(body) > 1_000_000:
+            return JSONResponse({"error": "request too large"}, status_code=413)
+        try:
+            payload = json.loads(body or b"{}")
+            model = str(payload["model"])
+            mode = str(payload["mode"])
+            dim = int(payload["dim"])
+            texts = payload["texts"]
+        except (KeyError, TypeError, ValueError, json.JSONDecodeError):
+            return JSONResponse({"error": "invalid embedding request"}, status_code=400)
+        if (
+            mode not in {"query", "document"}
+            or dim not in {64, 128, 256, 512, 768}
+            or not isinstance(texts, list)
+            or not 1 <= len(texts) <= 64
+            or any(not isinstance(text, str) or len(text) > 32768 for text in texts)
+        ):
+            return JSONResponse({"error": "invalid embedding request"}, status_code=400)
+
+        def _encode():
+            from flex.engine import _query_embedder_for
+
+            query_fn, document_fn = _query_embedder_for(model, dim)
+            fn = query_fn if mode == "query" else document_fn
+            return fn(texts, batch_size=64)
+
+        try:
+            vectors = await asyncio.get_running_loop().run_in_executor(None, _encode)
+        except Exception as exc:
+            return JSONResponse({"error": str(exc)}, status_code=503)
+        vectors = vectors.astype("float32", copy=False)
+        return JSONResponse({
+            "dtype": "float32",
+            "shape": list(vectors.shape),
+            "data": base64.b64encode(vectors.tobytes()).decode("ascii"),
         })
 
     from contextlib import asynccontextmanager
@@ -125,6 +245,7 @@ def run_http_server(port: int = 7134, active_names: list[str] | None = None, no_
     @asynccontextmanager
     async def lifespan(app):
         task = None
+        model_reaper = None
         warm_thread = None
         if active_names and not no_embed:
             warm_thread = _start_daemon_thread(
@@ -135,9 +256,17 @@ def run_http_server(port: int = 7134, active_names: list[str] | None = None, no_
             task = asyncio.create_task(start_background())
         except (ImportError, Exception):
             pass
+
+        async def _reap_idle_models():
+            from flex.engine import release_idle_embedders
+            while True:
+                await asyncio.sleep(30)
+                release_idle_embedders()
+
+        model_reaper = asyncio.create_task(_reap_idle_models())
         async with session_manager.run():
             yield
-        for t in (task,):
+        for t in (task, model_reaper):
             if t:
                 t.cancel()
 
@@ -148,6 +277,8 @@ def run_http_server(port: int = 7134, active_names: list[str] | None = None, no_
         lifespan=lifespan,
         routes=[
             Route("/health", health),
+            Route("/query", local_query, methods=["POST"]),
+            Route("/internal/embed", internal_embed, methods=["POST"]),
             Mount("/mcp", app=handle_mcp),
         ],
     )
@@ -213,8 +344,9 @@ def main():
         restrict_to_cells = True
     else:
         from flex.mcp_server import discover_cells
+        from flex.registry import discover_prewarm_cells
         cell_names = discover_cells()
-        active_names = cell_names
+        active_names = discover_prewarm_cells()
         restrict_to_cells = False
         print(f"[flex-mcp] Discovered {len(cell_names)} cells: {cell_names}", file=sys.stderr)
 
@@ -222,7 +354,8 @@ def main():
     # eagerly defeats the LRU budget because allocator/RSS pressure survives
     # individual evictions. Keep broad servers lazy; explicit --cell servers
     # remain warm by default, and --prewarm is the opt-in for bulk warming.
-    warm_names = active_names if (args.cell or args.prewarm) else []
+    requested_warm_names = cell_names if args.prewarm else active_names
+    warm_names = _physical_warm_names(requested_warm_names)
 
     init(
         cell_names,

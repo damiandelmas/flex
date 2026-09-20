@@ -4,6 +4,7 @@ The database is the runtime authority.  Files are compile-time defaults only;
 this module never scans skills or chooses among runtime filesystem sources.
 Existing rows are preserved so SQL edits remain authoritative.
 """
+import hashlib
 import sqlite3
 import sys
 from pathlib import Path
@@ -20,6 +21,14 @@ GENERAL_DIR = PRESET_ROOT / "general"
 MODULE_ROOT = Path(__file__).resolve().parent.parent / "modules"
 PUBLIC_PRESET_GROUPS = {
     "claude_code": ("claude_code", "soma"),
+}
+
+# Exact prior stock programs that may be upgraded in place. User-authored SQL
+# remains authoritative; only a byte-identical known stock revision qualifies.
+LEGACY_STOCK_SHA256 = {
+    "orient": {
+        "839536bc5b67ec71b7a39ec43bd41eae848b3cb838c64bf21877cf178eeeea17",
+    },
 }
 
 
@@ -95,7 +104,11 @@ def ensure_cell_presets(
                 "INSERT INTO _presets(name,description,params,sql) VALUES (?,?,?,?)",
                 (name, *values[:3]),
             )
-        elif existing[0] != sql and existing[0] in variants.get(name, set()):
+        elif existing[0] != sql and (
+            existing[0] in variants.get(name, set())
+            or hashlib.sha256(existing[0].encode("utf-8")).hexdigest()
+            in LEGACY_STOCK_SHA256.get(name, set())
+        ):
             conn.execute(
                 "UPDATE _presets SET description=?,params=?,sql=? WHERE name=?",
                 values,

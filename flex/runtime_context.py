@@ -85,16 +85,25 @@ def resolve_runtime_seed(
         provider = cell or "claude_code"
         source = "CLAUDE_SESSION_ID"
         sid = env["CLAUDE_SESSION_ID"]
+    elif env.get("PI_SESSION_ID"):
+        provider = cell or "pi"
+        source = "PI_SESSION_ID"
+        sid = env["PI_SESSION_ID"]
     else:
         runtime_sid = env.get("FLEX_RUNTIME_SESSION_ID")
         runtime_provider = (env.get("FLEX_RUNTIME_PROVIDER") or "").lower()
-        if not runtime_sid or runtime_provider not in {"codex", "claude", "claude_code"}:
+        if not runtime_sid or runtime_provider not in {
+            "codex", "claude", "claude_code", "pi"
+        }:
             raise ValueError(
                 "no current coding-agent session in the runtime environment "
-                "(expected CODEX_THREAD_ID, CLAUDE_SESSION_ID, or a Flex runtime binding)"
+                "(expected CODEX_THREAD_ID, CLAUDE_SESSION_ID, PI_SESSION_ID, "
+                "or a Flex runtime binding)"
             )
         provider = cell or (
-            "claude_code" if runtime_provider.startswith("claude") else "codex"
+            "claude_code"
+            if runtime_provider.startswith("claude")
+            else runtime_provider
         )
         source = "FLEX_RUNTIME_SESSION_ID"
         sid = runtime_sid

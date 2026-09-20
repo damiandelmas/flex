@@ -16,7 +16,7 @@ not reconciled. Instead:
     dangling edge is impossible (the FK is never stored).
 
 Every table row this primitive writes is keyed to this one file:
-  - `_raw_chunks / _edges_source / _types_instant / _edges_tree / _edges_import
+  - `_raw_chunks / _edges_source / _types_filesystem / _edges_tree / _edges_import
      / _edges_fs_identity` by the file's resolved path (`source_id`, matching
      instant's full-regen exactly → byte-identical chunk_ids).
   - `_symbols` by the passed `file_id` (the SOMA file_uuid / reconcile delete key).
@@ -35,19 +35,26 @@ from pathlib import Path
 
 
 # ── Schema ────────────────────────────────────────────────────────────────────
-# Code-cell tables. Mirrors instant/install.py's _TYPES_DDL / _edges_import /
+# Code-cell tables use the canonical Filesystem type surface plus code graph rows.
 # _edges_fs_identity, but _edges_call DROPS callee_id (Option A: the cross-file
 # FK is eliminated, resolution is late-bound via _symbols) and adds _symbols.
 
 _TYPES_DDL = """
-CREATE TABLE IF NOT EXISTS _types_instant (
+CREATE TABLE IF NOT EXISTS _types_filesystem (
     chunk_id      TEXT PRIMARY KEY,
+    file_kind     TEXT NOT NULL DEFAULT 'code',
+    chunk_kind    TEXT NOT NULL DEFAULT 'definition',
     section_title TEXT,
     section_type  TEXT,
     position      INTEGER,
     depth         INTEGER,
     container_id  TEXT,
-    content_hash  TEXT
+    content_hash  TEXT,
+    language      TEXT,
+    start_line    INTEGER,
+    end_line      INTEGER,
+    signature     TEXT,
+    extraction_state TEXT NOT NULL DEFAULT 'ok'
 );
 """
 
@@ -77,7 +84,7 @@ CREATE INDEX IF NOT EXISTS _edges_import_module ON _edges_import(module);
 _SYMBOLS_DDL = """
 CREATE TABLE IF NOT EXISTS _symbols (
     name    TEXT NOT NULL,     -- def/class/method name (the resolution key)
-    def_id  TEXT NOT NULL,     -- that def's chunk_id  (→ _types_instant.chunk_id)
+    def_id  TEXT NOT NULL,     -- that def's chunk_id  (→ _types_filesystem.chunk_id)
     file_id TEXT NOT NULL,     -- SOMA file_uuid / source_id  (the per-file delete key)
     kind    TEXT,              -- func|class|method  (future disambiguation)
     PRIMARY KEY (name, def_id)
@@ -121,7 +128,7 @@ _CALLERS_SQL = (
     "CASE WHEN COALESCE(r.candidate_count, 0)=0 THEN 'unresolved' "
     "     WHEN r.candidate_count=1 THEN 'unique' ELSE 'ambiguous' END "
     "AS resolution_state, COALESCE(r.candidate_count, 0) AS candidate_count "
-    "FROM _edges_call e JOIN _types_instant t ON e.caller_id = t.chunk_id "
+    "FROM _edges_call e JOIN _types_filesystem t ON e.caller_id = t.chunk_id "
     "LEFT JOIN resolution r ON r.name=e.callee_name "
     "LEFT JOIN _symbols s ON s.name=e.callee_name "
     "LEFT JOIN _edges_source ds ON ds.chunk_id=s.def_id "
@@ -140,7 +147,7 @@ _CALLEES_SQL = (
     "CASE WHEN COALESCE(r.candidate_count, 0)=0 THEN 'unresolved' "
     "     WHEN r.candidate_count=1 THEN 'unique' ELSE 'ambiguous' END "
     "AS resolution_state, COALESCE(r.candidate_count, 0) AS candidate_count "
-    "FROM _edges_call e JOIN _types_instant t ON e.caller_id = t.chunk_id "
+    "FROM _edges_call e JOIN _types_filesystem t ON e.caller_id = t.chunk_id "
     "JOIN _edges_source cs ON cs.chunk_id=e.caller_id "
     "LEFT JOIN resolution r ON r.name=e.callee_name "
     "LEFT JOIN _symbols s ON s.name = e.callee_name "
@@ -172,7 +179,7 @@ _IMPACT_SQL = (
     "  SELECT e.caller_id, up.depth+1 "
     "  FROM up "
     "  JOIN resolution root ON root.name=:symbol AND root.candidate_count=1 "
-    "  JOIN _types_instant current ON current.chunk_id=up.id "
+    "  JOIN _types_filesystem current ON current.chunk_id=up.id "
     "  JOIN resolution safe ON safe.name=current.section_title "
     "                           AND safe.candidate_count=1 "
     "  JOIN _edges_call e ON e.callee_name=current.section_title "
@@ -182,7 +189,7 @@ _IMPACT_SQL = (
     "  SELECT EXISTS("
     "    SELECT 1 FROM up frontier "
     "    JOIN resolution root ON root.name=:symbol AND root.candidate_count=1 "
-    "    JOIN _types_instant current ON current.chunk_id=frontier.id "
+    "    JOIN _types_filesystem current ON current.chunk_id=frontier.id "
     "    JOIN resolution safe ON safe.name=current.section_title "
     "                             AND safe.candidate_count=1 "
     "    JOIN _edges_call e ON e.callee_name=current.section_title "
@@ -200,7 +207,7 @@ _IMPACT_SQL = (
     "CASE WHEN COALESCE(rr.candidate_count,0)=0 THEN 'unresolved' "
     "     WHEN rr.candidate_count=1 THEN 'unique' ELSE 'ambiguous' END "
     "AS root_resolution_state, COALESCE(rr.candidate_count,0) AS root_candidate_count "
-    "FROM up JOIN _types_instant t ON up.id = t.chunk_id "
+    "FROM up JOIN _types_filesystem t ON up.id = t.chunk_id "
     "JOIN _edges_source es ON es.chunk_id=up.id "
     "LEFT JOIN resolution ar ON ar.name=t.section_title "
     "LEFT JOIN resolution rr ON rr.name=:symbol "
@@ -217,7 +224,7 @@ _SUBTREE_PRESET_SQL = (
     "SELECT c.id, es.source_id, t.section_title, t.section_type, t.position, "
     "t.depth, t.container_id, c.content "
     "FROM sub JOIN _raw_chunks c ON c.id=sub.id "
-    "JOIN _types_instant t ON t.chunk_id=sub.id "
+    "JOIN _types_filesystem t ON t.chunk_id=sub.id "
     "JOIN _edges_source es ON es.chunk_id=sub.id "
     "ORDER BY sub.depth, t.position"
 )
@@ -243,7 +250,7 @@ _CODE_PRESETS = (
 # FIXED fact (code is always no-embed), and is honest about call-graph coverage. NOT
 # the fs orient (which only discovers columns). Colocated with this module's build.
 _CODE_STOCK_PRESETS = Path(__file__).resolve().parent / "stock" / "presets"
-_CODE_SURFACE_VERSION = "code@4"
+_CODE_SURFACE_VERSION = "code@5"
 
 
 def install_code_presets(conn: sqlite3.Connection) -> None:
@@ -269,7 +276,7 @@ def install_code_presets(conn: sqlite3.Connection) -> None:
 
 def _ensure_code_surface(conn: sqlite3.Connection) -> bool:
     """Self-heal a code cell's QUERY SURFACE — the `chunks` view + @orient + the 4 nav
-    presets. index_file_code writes the DATA (_types_instant/_edges_*/_symbols/
+    presets. index_file_code writes the DATA (_types_filesystem/_edges_*/_symbols/
     _raw_chunks) but never built the view or installed @orient, so migrated codegraph
     cells shipped degraded (no `chunks` view — even @subtree, which does `FROM chunks`,
     was broken — and no @orient the flex-code skill assumes). Mirrors docpac's
@@ -325,6 +332,7 @@ def _ensure_schema(conn: sqlite3.Connection) -> None:
             f"index_file_code requires an already-created cell — base table(s) "
             f"{missing} absent. Create the cell first (flex.sdk.create(..., "
             f"schema=CODE_SCHEMA_DDL)); index_file_code only adds the code tables.")
+    legacy_types = "_types_instant" in present
     tree_ddl = (
         "CREATE TABLE IF NOT EXISTS _edges_tree ("
         " id TEXT NOT NULL, parent_id TEXT, branch_at TEXT,"
@@ -338,6 +346,33 @@ def _ensure_schema(conn: sqlite3.Connection) -> None:
         for statement in ddl.split(';'):
             if statement.strip():
                 conn.execute(statement)
+    # CREATE TABLE IF NOT EXISTS does not migrate an already-created code cell.
+    # Keep the incremental path source-compatible with cells made before the
+    # skeleton metadata existed; the next changed file will populate these
+    # columns, while unchanged rows remain explicitly NULL until re-indexed.
+    type_columns = {
+        row[1] for row in conn.execute(
+            "PRAGMA table_info(_types_filesystem)"
+        ).fetchall()
+    }
+    for column, kind in (
+        ("start_line", "INTEGER"),
+        ("end_line", "INTEGER"),
+        ("signature", "TEXT"),
+    ):
+        if column not in type_columns:
+            conn.execute(
+                f"ALTER TABLE _types_filesystem ADD COLUMN {column} {kind}"
+            )
+    if legacy_types:
+        conn.execute(
+            "INSERT OR IGNORE INTO _types_filesystem "
+            "(chunk_id,file_kind,chunk_kind,section_title,section_type,position,depth,"
+            "container_id,content_hash,language,extraction_state) "
+            "SELECT chunk_id,'code','definition',section_title,section_type,position,"
+            "depth,container_id,content_hash,NULL,'ok' FROM _types_instant"
+        )
+        conn.execute("DROP TABLE _types_instant")
 
 
 def _stored_content_hash(conn: sqlite3.Connection, source_id: str) -> str | None:
@@ -362,7 +397,7 @@ def _delete_file_rows(conn: sqlite3.Connection, source_id: str, file_id: str,
     if old_chunk_ids:
         ph = ",".join("?" * len(old_chunk_ids))
         conn.execute(f"DELETE FROM _raw_chunks WHERE id IN ({ph})", old_chunk_ids)
-        conn.execute(f"DELETE FROM _types_instant WHERE chunk_id IN ({ph})", old_chunk_ids)
+        conn.execute(f"DELETE FROM _types_filesystem WHERE chunk_id IN ({ph})", old_chunk_ids)
         conn.execute(f"DELETE FROM _edges_tree WHERE id IN ({ph})", old_chunk_ids)
         conn.execute(f"DELETE FROM _edges_call WHERE caller_id IN ({ph})", old_chunk_ids)
         conn.execute("DELETE FROM _edges_source WHERE source_id = ?", (source_id,))
@@ -453,10 +488,13 @@ def _replace_code_file(conn: sqlite3.Connection, *, abs_path: str, file_path: st
                        import_rows: list[tuple]) -> None:
     """Atomically replace one file's complete code projection."""
     call_rows = [(n["id"], nm) for n in nodes for nm in n.get("_calls", ())]
+    language = Path(abs_path).suffix.lstrip(".").lower() or None
+    symbol_kinds = {"function", "method", "class"}
     sym_rows = [
-        (st, n["id"], file_id, None)
+        (st, n["id"], file_id, n.get("section_type"))
         for n in nodes
         if (st := n.get("section_title")) and not st.startswith("(")
+        and n.get("section_type") in symbol_kinds
     ]
 
     savepoint = "code_file_replace"
@@ -481,11 +519,14 @@ def _replace_code_file(conn: sqlite3.Connection, *, abs_path: str, file_path: st
                 "INSERT OR IGNORE INTO _edges_source (chunk_id, source_id) VALUES (?, ?)",
                 (cid, abs_path))
             conn.execute(
-                "INSERT OR IGNORE INTO _types_instant "
-                "(chunk_id, section_title, position, depth, container_id, content_hash) "
-                "VALUES (?, ?, ?, ?, ?, ?)",
-                (cid, n.get("section_title"), n.get("position"), n.get("depth"),
-                 n.get("container_id"), node_hash))
+                "INSERT OR IGNORE INTO _types_filesystem "
+                "(chunk_id,file_kind,chunk_kind,section_title,section_type,position,depth,"
+                "container_id,content_hash,language,start_line,end_line,signature,"
+                "extraction_state) "
+                "VALUES (?, 'code', 'definition', ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'ok')",
+                (cid, n.get("section_title"), n.get("section_type"), n.get("position"),
+                 n.get("depth"), n.get("container_id"), node_hash, language,
+                 n.get("start_line"), n.get("end_line"), n.get("signature")))
             conn.execute(
                 "INSERT OR IGNORE INTO _edges_tree "
                 "(id, parent_id, branch_at, relation, depth) VALUES (?, ?, ?, ?, ?)",
@@ -530,15 +571,17 @@ def index_file_code(conn: sqlite3.Connection, file_path: str, *,
         corpus_root: accepted for drain-signature parity with docpac's index_file;
                      unused (code resolution is per-file, no corpus config).
     """
-    from flex.compile.chunkers import _TS_EXTS, _build_code_tree, _build_code_tree_ts
+    from flex.compile.chunkers import (
+        _TS_EXTS, _build_code_tree, _build_code_tree_ts, _flat_nodes,
+    )
 
     p = Path(file_path)
     if not p.exists():
         return False
     abs_path = str(p.resolve())
     ext = abs_path.rsplit(".", 1)[-1].lower() if "." in abs_path else ""
-    if ext != "py" and ext not in _TS_EXTS:
-        return False  # code cells only index py + JS/TS-family files
+    if p.suffix.lower() not in _CODE_WALK_EXTS:
+        return False
 
     try:
         text = p.read_text(encoding="utf-8", errors="ignore")
@@ -559,8 +602,15 @@ def index_file_code(conn: sqlite3.Connection, file_path: str, *,
         return False
 
     # 2) node tree for this file.
-    nodes = _build_code_tree(abs_path, text) if ext == "py" \
-        else _build_code_tree_ts(abs_path, text, ext)
+    if ext == "py":
+        nodes = _build_code_tree(abs_path, text)
+    elif ext in _TS_EXTS:
+        nodes = _build_code_tree_ts(abs_path, text, ext)
+    else:
+        # Broad-language coverage is exact at the file/body level even when a
+        # language-specific symbol extractor is unavailable. Keep the source
+        # queryable and advertise no invented symbols or call edges.
+        nodes = _flat_nodes(abs_path, text)
     import_rows = _extract_imports(abs_path, ext, text)
     _replace_code_file(
         conn, abs_path=abs_path, file_path=file_path, file_id=file_id,

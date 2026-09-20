@@ -48,6 +48,9 @@ def _resolve_ingest_target(db):
 
     tag = _cell_tag(db)
     dim = 768 if tag in ('nomic-v1.5', 'nomic-v1.5-fp32') else STORE_DIM
+    from flex.semantic_client import document_encoder, service_only_enabled
+    if service_only_enabled():
+        return document_encoder(tag, dim), dim, tag
     _, embed_doc = _query_embedder_for(tag, serve_dim=dim)
     return embed_doc, dim, tag
 
@@ -176,6 +179,10 @@ def _try_rust_embed(db):
             for line in result.stdout.strip().split('\n'):
                 if line.startswith('embedded '):
                     count = int(line.split()[1])
+                    if count:
+                        from flex.retrieve.vector_generation import bump_vector_generation
+                        bump_vector_generation(db, "_raw_chunks")
+                        db.commit()
                     print(f"[flex-embed] {count} chunks (Rust)", file=sys.stderr)
                     return count
             return 0
@@ -228,6 +235,8 @@ def _python_embed(db, batch_size=64, commit_every=500, enrich_fn=None):
             db.execute("UPDATE _raw_chunks SET embedding = ? WHERE id = ?",
                        (blob, chunk_id))
 
+        from flex.retrieve.vector_generation import bump_vector_generation
+        bump_vector_generation(db, "_raw_chunks")
         db.commit()
         embedded += len(chunk_ids)
 
@@ -338,6 +347,12 @@ def _mean_pool_sources(db, sources, commit_every=500):
                    (mean_vec.tobytes(), source_id))
 
         if (idx + 1) % commit_every == 0:
+            from flex.retrieve.vector_generation import bump_vector_generation
+            bump_vector_generation(db, "_raw_sources")
             db.commit()
+    if sources:
+        from flex.retrieve.vector_generation import bump_vector_generation
+        bump_vector_generation(db, "_raw_sources")
+        db.commit()
 
     db.commit()

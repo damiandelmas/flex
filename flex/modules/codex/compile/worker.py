@@ -1345,10 +1345,20 @@ def _sync_session_jsonl(
         try:
             conn.execute(
                 """
-                INSERT OR IGNORE INTO _types_codex_source (
+                INSERT INTO _types_codex_source (
                     session_id, source_kind, codex_home, sessions_dir,
-                    state_db, rollout_path
-                ) VALUES (?, ?, ?, ?, ?, ?)
+                    state_db, rollout_path, thread_source, agent_role,
+                    agent_nickname
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+                ON CONFLICT(session_id) DO UPDATE SET
+                    source_kind=excluded.source_kind,
+                    codex_home=excluded.codex_home,
+                    sessions_dir=excluded.sessions_dir,
+                    state_db=excluded.state_db,
+                    rollout_path=excluded.rollout_path,
+                    thread_source=excluded.thread_source,
+                    agent_role=excluded.agent_role,
+                    agent_nickname=excluded.agent_nickname
                 """,
                 (
                     session_id,
@@ -1357,6 +1367,9 @@ def _sync_session_jsonl(
                     source_meta.get("sessions_dir"),
                     source_meta.get("state_db"),
                     str(jsonl_path),
+                    meta.get("source"),
+                    meta.get("agent_role"),
+                    meta.get("agent_nickname"),
                 ),
             )
         except Exception as e:
@@ -1582,7 +1595,10 @@ CODEX_OPTIONAL_TABLES_DDL: tuple[str, ...] = (
         codex_home TEXT,
         sessions_dir TEXT,
         state_db TEXT,
-        rollout_path TEXT
+        rollout_path TEXT,
+        thread_source TEXT,
+        agent_role TEXT,
+        agent_nickname TEXT
     )
     """,
     "CREATE INDEX IF NOT EXISTS idx_codex_source_home ON _types_codex_source(codex_home)",
@@ -1632,7 +1648,88 @@ def ensure_codex_tables(conn: sqlite3.Connection) -> None:
     ):
         if name not in columns:
             conn.execute(f"ALTER TABLE _codex_source_state ADD COLUMN {name} {declaration}")
+    source_columns = {
+        row[1] for row in conn.execute("PRAGMA table_info(_types_codex_source)")
+    }
+    for name in ("thread_source", "agent_role", "agent_nickname"):
+        if name not in source_columns:
+            conn.execute(f"ALTER TABLE _types_codex_source ADD COLUMN {name} TEXT")
+
+    # Provider invocation origin lives in state_5 and can change independently
+    # of rollout bytes.  Backfill it before refresh's source-signature short
+    # circuit so unchanged cells still acquire the coverage provenance.
+    state_paths = [
+        str(row[0])
+        for row in conn.execute(
+            "SELECT DISTINCT state_db FROM _types_codex_source "
+            "WHERE state_db IS NOT NULL AND state_db<>''"
+        )
+    ]
+    for state_path in state_paths:
+        metadata = _load_thread_meta(Path(state_path))
+        conn.executemany(
+            """
+            UPDATE _types_codex_source
+            SET thread_source=?, agent_role=?, agent_nickname=?
+            WHERE session_id=? AND state_db=?
+            """,
+            (
+                (
+                    item.get("source"), item.get("agent_role"),
+                    item.get("agent_nickname"), session_id, state_path,
+                )
+                for session_id, item in metadata.items()
+            ),
+        )
     conn.commit()
+
+
+def backfill_codex_source_provenance(
+    conn: sqlite3.Connection, sources,
+) -> int:
+    """Populate invocation provenance without replaying immutable rollouts."""
+    source_state = {
+        str(row[0]): str(row[1])
+        for row in conn.execute(
+            "SELECT session_id,source_path FROM _codex_source_state "
+            "WHERE session_id IS NOT NULL AND session_id<>''"
+        )
+    }
+    raw_sources = {
+        str(row[0]) for row in conn.execute("SELECT source_id FROM _raw_sources")
+    }
+    before = conn.total_changes
+    for source in sources:
+        state_db = Path(source.state_db)
+        metadata = _load_thread_meta(state_db)
+        for session_id, item in metadata.items():
+            if session_id not in raw_sources:
+                continue
+            conn.execute(
+                """
+                INSERT INTO _types_codex_source (
+                    session_id,source_kind,codex_home,sessions_dir,state_db,
+                    rollout_path,thread_source,agent_role,agent_nickname
+                ) VALUES (?,?,?,?,?,?,?,?,?)
+                ON CONFLICT(session_id) DO UPDATE SET
+                    source_kind=excluded.source_kind,
+                    codex_home=excluded.codex_home,
+                    sessions_dir=excluded.sessions_dir,
+                    state_db=excluded.state_db,
+                    rollout_path=COALESCE(excluded.rollout_path,rollout_path),
+                    thread_source=excluded.thread_source,
+                    agent_role=excluded.agent_role,
+                    agent_nickname=excluded.agent_nickname
+                """,
+                (
+                    session_id, source.source_kind, str(source.codex_home),
+                    str(source.sessions_dir), str(source.state_db),
+                    source_state.get(session_id), item.get("source"),
+                    item.get("agent_role"), item.get("agent_nickname"),
+                ),
+            )
+    conn.commit()
+    return conn.total_changes - before
 
 
 def _stored_exec_source(raw_content: str) -> str | None:
@@ -1808,10 +1905,25 @@ def _stable_jsonl_end(path: Path, offset: int, *, max_bytes: int | None = None) 
         with path.open("rb") as handle:
             handle.seek(offset)
             suffix = handle.read(-1 if max_bytes is None else max(0, max_bytes))
+            newline = suffix.rfind(b"\n")
+            if newline >= 0:
+                return offset + newline + 1
+            if max_bytes is None or not suffix:
+                return offset
+
+            # JSONL records are atomic. Tool results and compacted messages can
+            # legitimately exceed the ordinary append batch, so stopping at the
+            # byte budget would leave this cursor parked forever. Admit exactly
+            # one complete oversized record, still under an explicit ceiling.
+            remaining = _append_record_byte_budget() - len(suffix)
+            if remaining <= 0:
+                return offset
+            tail = handle.readline(remaining)
+            if not tail.endswith(b"\n"):
+                return offset
+            return offset + len(suffix) + len(tail)
     except OSError:
         return offset
-    newline = suffix.rfind(b"\n")
-    return offset if newline < 0 else offset + newline + 1
 
 
 def _append_byte_budget() -> int:
@@ -1822,6 +1934,17 @@ def _append_byte_budget() -> int:
         return max(1024, int(os.environ.get("FLEX_CODEX_APPEND_MAX_BYTES", str(64 * 1024))))
     except ValueError:
         return 64 * 1024
+
+
+def _append_record_byte_budget() -> int:
+    """Maximum atomic JSONL record admitted when one exceeds the batch budget."""
+    try:
+        return max(
+            _append_byte_budget(),
+            int(os.environ.get("FLEX_CODEX_APPEND_MAX_RECORD_BYTES", str(8 * 1024 * 1024))),
+        )
+    except ValueError:
+        return max(_append_byte_budget(), 8 * 1024 * 1024)
 
 
 def _count_jsonl_lines(path: Path, start: int, end: int) -> int:
@@ -2037,7 +2160,11 @@ def sync_rollout_path(
                 read_offset=append_offset, read_limit=append_limit,
                 line_number_base=append_lines, parser_state=append_state,
                 admit_enrichment=False,
-                deadline=deadline,
+                # The caller's deadline is an admission boundary. Once this
+                # byte/record-bounded JSONL transaction starts, aborting it on
+                # that same clock would roll back and retry the identical
+                # atomic record forever.
+                deadline=None,
             )
         except Exception:
             conn.execute("ROLLBACK TO SAVEPOINT codex_append_publication")

@@ -168,6 +168,16 @@ def refresh(cell_path: str, graph: bool = False, dry_run: bool = False) -> dict:
                 run_enrichment(conn, cell_type="goose")
             except Exception as e:
                 print(f"[goose.refresh] enrichment failed: {e}", file=sys.stderr)
+        remaining = _embedding_debt(conn)
+        conn.execute(
+            "INSERT OR REPLACE INTO _meta(key,value) VALUES('semantic_pending',?)",
+            ('1' if remaining else '0',),
+        )
+        conn.execute(
+            "INSERT OR REPLACE INTO _meta(key,value) VALUES('semantic_status',?)",
+            ('pending' if remaining else 'ready',),
+        )
+        conn.commit()
 
         result = {
             "sources": stats.get("sessions", 0),

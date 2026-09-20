@@ -69,15 +69,23 @@ def open_cell(db_path: str) -> sqlite3.Connection:
 
 
 def open_cell_readonly(db_path: str | Path) -> sqlite3.Connection:
-    """Open a cell for query reads, falling back to immutable SQLite URI.
+    """Open a cell for query reads without changing its publication bytes.
 
     Some sandboxed agent seats can read a cell file but cannot create SQLite
-    lock/journal side files next to it. Normal ``open_cell`` is still the
-    write-capable runtime opener; this read path tolerates those sandboxes.
+    lock/journal side files next to it. Start with SQLite's ordinary read-only
+    mode so live WAL state remains visible. Fall back to immutable mode only
+    when the environment cannot support the ordinary read-only connection.
+    Normal ``open_cell`` remains the explicitly write-capable runtime opener.
     """
     path = Path(db_path)
     try:
-        return open_cell(str(path))
+        db = sqlite3.connect(
+            f"file:{path}?mode=ro",
+            uri=True,
+            check_same_thread=False,
+            timeout=10,
+        )
+        db.execute("PRAGMA schema_version").fetchone()
     except sqlite3.OperationalError:
         db = sqlite3.connect(
             f"file:{path}?mode=ro&immutable=1",
@@ -86,12 +94,12 @@ def open_cell_readonly(db_path: str | Path) -> sqlite3.Connection:
             timeout=10,
         )
         db.execute("PRAGMA schema_version").fetchone()
-        db.row_factory = sqlite3.Row
-        _register_relational_udfs(db)
-        db.execute("PRAGMA query_only=ON")
-        db.execute("PRAGMA cache_size=-20000")
-        db.execute("PRAGMA temp_store=MEMORY")
-        return db
+    db.row_factory = sqlite3.Row
+    _register_relational_udfs(db)
+    db.execute("PRAGMA query_only=ON")
+    db.execute("PRAGMA cache_size=-20000")
+    db.execute("PRAGMA temp_store=MEMORY")
+    return db
 
 
 def run_sql(db: sqlite3.Connection, query: str,

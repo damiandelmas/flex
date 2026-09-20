@@ -142,6 +142,10 @@ flex init --module filesystem --path /path/to/vault --obsidian
 # Keep the same source structure but omit semantic vectors
 flex init --module filesystem --path /path/to/folder --no-embed
 
+# Compile several roots as one persisted structural/no-embed world
+flex init --module filesystem --path /path/to/root --structural \
+  --selection /path/to/other-root
+
 # Build once instead of watching the folder
 flex init --module filesystem --path /path/to/folder --no-watch
 ```
@@ -152,6 +156,7 @@ Matryoshka query surface. No embedding API key is required. Structural
 publication is independent: objects, metadata, relationships, and FTS become
 queryable as one committed generation, while NULL vectors converge afterward.
 Semantic backlog never makes exact SQL or keyword retrieval stale.
+The no-embed and structural paths do not probe or download the embedding model.
 
 Refresh is atomic per file: a failed or unreadable update preserves the last good
 indexed version. Filesystem events provide low-latency updates; reconciliation
@@ -299,9 +304,10 @@ Stable sources:
 | [`filesystem`](flex/modules/fs) | mixed Markdown, code, and text folders; optional Obsidian semantics |
 | [`tools`](flex/modules/skills/README.md) | skills, MCP servers, frameworks, and agent tools |
 
-`instant`, `markdown`, `obsidian`, `codegraph`, and `code` remain compatibility
-aliases for earlier narrow workflows. New folder workflows should use
-`filesystem` with `--obsidian` or `--no-embed` where needed.
+`markdown`, `obsidian`, `codegraph`, and `code` remain compatibility aliases
+for earlier narrow workflows. New folder workflows should use `filesystem`,
+with `--obsidian`, `--no-embed`, or the recipe-driven `--structural` profile
+where needed.
 
 Beta sources:
 

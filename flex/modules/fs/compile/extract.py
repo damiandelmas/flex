@@ -3,9 +3,12 @@
 from __future__ import annotations
 
 import ast
+import base64
 import hashlib
+import json
+import math
 from dataclasses import dataclass
-from datetime import datetime, timezone
+from datetime import date, datetime, timezone
 from pathlib import Path
 
 from flex.modules.fs.compile.walker import FileEntry
@@ -46,6 +49,13 @@ class ExtractedField:
 
 
 @dataclass(frozen=True)
+class ExtractedFrontmatter:
+    key: str
+    value: str
+    position: int
+
+
+@dataclass(frozen=True)
 class MarkdownMetadata:
     folder: str
     tags: tuple[str, ...]
@@ -71,6 +81,7 @@ class ExtractionResult:
     imports: tuple[tuple[str, str | None], ...] = ()
     markdown: MarkdownMetadata | None = None
     fields: tuple[ExtractedField, ...] = ()
+    frontmatter: tuple[ExtractedFrontmatter, ...] = ()
     wikilinks: tuple[str, ...] = ()
     error: str | None = None
 
@@ -87,6 +98,59 @@ def _chunk(source_id: str, content: str, position: int, *, chunk_kind: str,
         container_id=parent, content_hash=hashlib.sha256(content.encode()).hexdigest(),
         language=language,
     )
+
+
+def _jsonable(value):
+    if isinstance(value, (date, datetime)):
+        return value.isoformat()
+    if isinstance(value, bytes):
+        return {"$bytes_base64": base64.b64encode(value).decode("ascii")}
+    if isinstance(value, float) and not math.isfinite(value):
+        return {"$float": str(value).lower()}
+    if value is None or isinstance(value, (bool, int, float, str)):
+        return value
+    if isinstance(value, dict):
+        return {str(key): _jsonable(item) for key, item in value.items()}
+    if isinstance(value, (list, tuple)):
+        return [_jsonable(item) for item in value]
+    if isinstance(value, (set, frozenset)):
+        items = [_jsonable(item) for item in value]
+        return sorted(
+            items,
+            key=lambda item: json.dumps(
+                item, ensure_ascii=False, sort_keys=True, separators=(",", ":"),
+                allow_nan=False,
+            ),
+        )
+    raise TypeError(f"unsupported frontmatter value: {type(value).__name__}")
+
+
+def _frontmatter_rows(frontmatter: dict) -> tuple[ExtractedFrontmatter, ...]:
+    """Preserve every top-level YAML field as canonical, valid JSON.
+
+    Scalars and mappings use position ``-1``.  Sequence members use their
+    zero-based position so order is relationally queryable.  Empty sequences
+    use the reserved ``-2`` position, preserving the distinction between an
+    absent field, an empty list, and a singleton list whose member is itself
+    an empty list.
+    """
+    rows: list[ExtractedFrontmatter] = []
+    for raw_key, raw_value in frontmatter.items():
+        key = str(raw_key)
+        if isinstance(raw_value, list):
+            values = enumerate(raw_value) if raw_value else [(-2, [])]
+        else:
+            values = [(-1, raw_value)]
+        for position, value in values:
+            rows.append(ExtractedFrontmatter(
+                key=key,
+                value=json.dumps(
+                    _jsonable(value), ensure_ascii=False, sort_keys=True,
+                    separators=(",", ":"), allow_nan=False,
+                ),
+                position=position,
+            ))
+    return tuple(rows)
 
 
 def _markdown(entry: FileEntry, text: str, digest: str) -> ExtractionResult:
@@ -138,7 +202,8 @@ def _markdown(entry: FileEntry, text: str, digest: str) -> ExtractionResult:
     return ExtractionResult(
         entry.source_id, str(entry.path), entry.path.stem, "markdown", "indexed", "ok",
         digest, entry.size_bytes, entry.mtime_ns, tuple(chunks), markdown=meta,
-        fields=tuple(fields), wikilinks=tuple(extract_raw_wikilinks(body)),
+        fields=tuple(fields), frontmatter=_frontmatter_rows(fm),
+        wikilinks=tuple(extract_raw_wikilinks(body)),
     )
 
 

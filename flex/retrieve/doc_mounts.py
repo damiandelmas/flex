@@ -117,7 +117,12 @@ def _packaged_instruction_paths(
         root = Path(spec["_module_root"]) if spec and spec.get("_module_root") else (
             Path(__file__).resolve().parents[1] / "modules" / module_name
         )
-        path = root / "stock" / "instructions.md"
+        # Most legacy modules keep this document under stock/.  A source
+        # module may declare its one authored instruction contract elsewhere
+        # (for example WooCommerce's lighting/instructions.md) without
+        # creating a second profile or a generic asset hierarchy.
+        instruction_rel = spec.get("instructions_path") if spec else None
+        path = root / str(instruction_rel or "stock/instructions.md")
         # Embed-off cells mount the structural-surface instructions when the module ships
         # one, so cell_docs never advertises vec_ops/semantic scoring the cell can't back.
         if no_embed:

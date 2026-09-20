@@ -1,8 +1,8 @@
 """claude-code install hook.
 
 Called by the CLI dispatcher when `flex init --module claude-code` runs.
-Responsibilities: Claude assets → cell bootstrap → enrichment stubs →
-initial backfill → enrichment pipeline → services → MCP wiring → panel.
+Responsibilities: Claude assets → cell bootstrap → structural backfill →
+semantic-debt publication → services → MCP wiring → panel.
 """
 
 import contextlib
@@ -68,8 +68,6 @@ def run(args, console) -> None:
         return
 
     jsonls = list(CLAUDE_PROJECTS.rglob("*.jsonl"))
-    _enrich_failures: list[str] = []
-
     cell_path = bootstrap_claude_code_cell()
 
     # Install enrichment stubs + views on every init (even empty cells)
@@ -90,10 +88,26 @@ def run(args, console) -> None:
             _validate_presets(_stub_conn, 'claude-code')
         except Exception:
             pass
+        _semantic_debt = _stub_conn.execute(
+            "SELECT COUNT(*) FROM _raw_chunks "
+            "WHERE embedding IS NULL AND content IS NOT NULL"
+        ).fetchone()[0]
+        _stub_conn.execute(
+            "INSERT OR REPLACE INTO _meta(key,value) VALUES('semantic_status',?)",
+            (
+                "ready" if not _semantic_debt
+                else "pending" if _model_ok
+                else "unavailable",
+            ),
+        )
+        _stub_conn.execute(
+            "INSERT OR REPLACE INTO _meta(key,value) VALUES('semantic_pending',?)",
+            ('1' if _semantic_debt else '0',),
+        )
+        _stub_conn.commit()
     finally:
         _stub_conn.close()
 
-    n_clusters = 0
     stats: dict = {'sessions': 0, 'chunks': 0, 'elapsed': 0, 'embed_ok': True}
 
     if not jsonls:
@@ -148,8 +162,8 @@ def run(args, console) -> None:
             ) as progress:
                 t_read  = progress.add_task("Scanning sessions", total=len(jsonls), info="",
                                             completed=_already)
-                t_index = progress.add_task("Building vectors",  total=None,        info="", visible=False)
-                t_graph = progress.add_task("Building graph",    total=None,        info="", visible=False)
+                t_index = progress.add_task("Queueing vectors",  total=None,        info="", visible=False)
+                t_graph = progress.add_task("Queueing enrichment", total=None,      info="", visible=False)
 
                 _scan_start = [None]
 
@@ -202,9 +216,19 @@ def run(args, console) -> None:
                 buf2 = io.StringIO()
                 with contextlib.redirect_stderr(buf2):
                     try:
-                        stats = initial_backfill(conn, progress_cb=_progress, phase2_cb=_phase2,
-                                                 quiet_embed=True, embed_progress_cb=_embed_progress,
-                                                 skip_embed=not _model_ok)
+                        # Installation publishes the structural cell first.
+                        # Embeddings and graph enrichment are durable semantic
+                        # debt owned by the supervised worker lane after the
+                        # services start; the installer never pins an ONNX
+                        # model while also running graph/fingerprint work.
+                        stats = initial_backfill(
+                            conn,
+                            progress_cb=_progress,
+                            phase2_cb=_phase2,
+                            quiet_embed=True,
+                            embed_progress_cb=_embed_progress,
+                            skip_embed=True,
+                        )
                     except Exception as e:
                         console.print(f"  [yellow]Backfill error: {e}[/yellow]")
                         _warnings.append(f"Backfill: {e}")
@@ -212,41 +236,45 @@ def run(args, console) -> None:
                                  'chunks': _phase.get('chunks', 0),
                                  'elapsed': 0, 'embed_ok': False}
 
-                if not stats.get('embed_ok', True):
-                    _warnings.append("Embedding incomplete — vec_ops disabled until re-embedded")
-                    progress.update(t_index, completed=stats['chunks'], total=stats['chunks'],
-                                    info=f"{stats['chunks']:,} chunks (embedding skipped)")
-                else:
-                    progress.update(t_index, completed=stats['chunks'], total=stats['chunks'],
-                                    info=f"{stats['chunks']:,} chunks embedded")
+                progress.update(
+                    t_index,
+                    completed=stats['chunks'],
+                    total=stats['chunks'],
+                    info=(
+                        f"{stats['chunks']:,} chunks queued"
+                        if _model_ok else
+                        f"{stats['chunks']:,} chunks (model unavailable)"
+                    ),
+                )
 
-                progress.update(t_graph, visible=True, info="analyzing")
-                def _graph_cb(label):
-                    progress.update(t_graph, info=label)
-                try:
-                    n_clusters, _enrich_failures = _run_enrichment_quiet(conn, progress_cb=_graph_cb)
-                except Exception as e:
-                    console.print(f"  [yellow]Enrichment error: {e}[/yellow]")
-                    _warnings.append(f"Enrichment: {e}")
-                    n_clusters, _enrich_failures = 0, []
-                cluster_info = f"{n_clusters} topic clusters found" if n_clusters else "done"
-                progress.update(t_graph, total=1, completed=1, info=cluster_info)
+                progress.update(
+                    t_graph, visible=True, total=1, completed=1,
+                    info="queued for background convergence",
+                )
 
             console.print()
             console.print(
                 f"  [bold]{stats['sessions']:,} sessions[/bold] · "
                 f"[bold]{stats['chunks']:,} chunks[/bold]"
-                + (f" · [bold]{n_clusters}[/bold] topic clusters" if n_clusters else "")
             )
-            if _enrich_failures:
-                for _f in _enrich_failures:
-                    _warnings.append(f"Enrichment: {_f} skipped")
             console.print()
             try:
                 from flex.core import log_op
                 log_op(conn, 'init_complete', 'claude_code', rows_affected=stats['chunks'])
             except Exception as e:
                 print(f"[init] log_op: {e}", file=sys.stderr)
+
+            semantic_status = (
+                "pending" if _model_ok and stats['chunks'] else "unavailable"
+            )
+            conn.execute(
+                "INSERT OR REPLACE INTO _meta(key,value) VALUES('semantic_status',?)",
+                (semantic_status,),
+            )
+            conn.execute(
+                "INSERT OR REPLACE INTO _meta(key,value) VALUES('semantic_pending',?)",
+                ('1' if stats['chunks'] else '0',),
+            )
 
             try:
                 from tzlocal import get_localzone

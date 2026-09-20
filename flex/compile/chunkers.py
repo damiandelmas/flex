@@ -233,23 +233,67 @@ def _build_code_tree(abs_path: str, text: str) -> list[dict]:
         # decorator text belongs to its owning node instead of an unassigned gap.
         return min([d.lineno for d in getattr(n, 'decorator_list', [])] + [n.lineno])
 
-    def _emit(node, depth, parent_id):
+    def _inline_header(line):
+        """Return a one-line Python declaration without its inline body."""
+        import io as _io
+        import tokenize as _tokenize
+
+        try:
+            indent = len(line) - len(line.lstrip())
+            code = line[indent:]
+            depth = 0
+            for token in _tokenize.generate_tokens(_io.StringIO(code).readline):
+                if token.type != _tokenize.OP:
+                    continue
+                if token.string in "([{":
+                    depth += 1
+                elif token.string in ")]}":
+                    depth = max(0, depth - 1)
+                elif token.string == ":" and depth == 0:
+                    return line[:indent + token.end[1]].rstrip()
+        except (IndentationError, _tokenize.TokenError):
+            pass
+        return line.rstrip()
+
+    def _signature(node):
+        start = node.lineno - 1
+        body = getattr(node, "body", ()) or ()
+        if body:
+            first = body[0]
+            first_line = min(
+                _def_start(first) if isinstance(first, DEF) else first.lineno,
+                node.end_lineno or node.lineno,
+            ) - 1
+            if first_line > start:
+                return "\n".join(lines[start:first_line]).strip()
+        return _inline_header(lines[start])
+
+    def _emit(node, depth, parent_id, parent_kind=None):
         kids = [c for c in _ast.iter_child_nodes(node) if isinstance(c, DEF)]
-        start = _def_start(node) - 1
-        end = (_def_start(kids[0]) - 1) if kids else (node.end_lineno or node.lineno)
+        start_line = _def_start(node)
+        start = start_line - 1
+        end_line = node.end_lineno or node.lineno
+        end = (_def_start(kids[0]) - 1) if kids else end_line
         own = "\n".join(lines[start:end]).rstrip() or \
-            "\n".join(lines[start:(node.end_lineno or node.lineno)])
+            "\n".join(lines[start:end_line])
         cid = _make_chunk_id(abs_path, len(nodes), own)
+        kind = "class" if isinstance(node, _ast.ClassDef) else \
+            ("method" if parent_kind == "class" else "function")
         nodes.append({"id": cid, "content": own, "section_title": node.name,
+                      "section_type": kind, "signature": _signature(node),
+                      "start_line": start_line, "end_line": end_line,
                       "position": len(nodes), "depth": depth, "container_id": parent_id,
                       "_calls": _own_call_names(node)})
         for c in kids:
-            _emit(c, depth + 1, cid)
+            _emit(c, depth + 1, cid, kind)
 
-    preamble = "\n".join(lines[:_def_start(top_defs[0]) - 1]).strip()
+    preamble_end = _def_start(top_defs[0]) - 1
+    preamble = "\n".join(lines[:preamble_end]).strip()
     if preamble:
         nodes.append({"id": _make_chunk_id(abs_path, len(nodes), preamble),
                       "content": preamble, "section_title": "(module)",
+                      "section_type": "module", "signature": "(module)",
+                      "start_line": 1, "end_line": preamble_end,
                       "position": len(nodes), "depth": 1, "container_id": abs_path})
     for node in top_defs:
         _emit(node, 1, abs_path)
@@ -353,9 +397,36 @@ def _build_code_tree_ts(abs_path: str, text: str, ext: str) -> list[dict]:
         while p is not None and p.type == "decorator":
             s = p.start_byte
             p = p.prev_sibling
+        # `export` wraps declarations in a separate export_statement node. The
+        # declaration is what _child_defs returns, but the export keyword is
+        # part of its source span and signature, not module preamble.
+        parent = n.parent
+        declaration_boundary = {
+            "class_declaration", "abstract_class_declaration",
+            "function_declaration", "generator_function_declaration",
+            "method_definition", "arrow_function", "function_expression",
+        }
+        while parent is not None and parent.type != "program":
+            if parent.type == "export_statement":
+                s = min(s, parent.start_byte)
+                break
+            if parent.type in declaration_boundary:
+                break
+            parent = parent.parent
         return s
 
     nodes: list[dict] = []
+
+    def _header_end(n, kids):
+        body = n.child_by_field_name("body")
+        if body is not None:
+            return body.start_byte
+        value = n.child_by_field_name("value")
+        if value is not None:
+            value_body = value.child_by_field_name("body")
+            if value_body is not None:
+                return value_body.start_byte
+        return _def_start(kids[0]) if kids else n.end_byte
 
     def _emit(n, depth, parent_id):
         kids = _child_defs(n)
@@ -363,8 +434,21 @@ def _build_code_tree_ts(abs_path: str, text: str, ext: str) -> list[dict]:
         own_end = _def_start(kids[0]) if kids else n.end_byte
         own = src[start:own_end].decode("utf-8", "ignore").rstrip() or \
             src[start:n.end_byte].decode("utf-8", "ignore")
+        header = src[start:_header_end(n, kids)].decode("utf-8", "ignore").strip()
+        if not header:
+            header = own.splitlines()[0].strip() if own.splitlines() else ""
+        if n.type in ("class_declaration", "abstract_class_declaration"):
+            kind = "class"
+        elif n.type == "method_definition":
+            kind = "method"
+        else:
+            kind = "function"
+        start_line = src[:start].count(b"\n") + 1
+        end_line = n.end_point[0] + 1
         cid = _make_chunk_id(abs_path, len(nodes), own)
         nodes.append({"id": cid, "content": own, "section_title": _name(n) or "",
+                      "section_type": kind, "signature": header,
+                      "start_line": start_line, "end_line": end_line,
                       "position": len(nodes), "depth": depth, "container_id": parent_id,
                       "_calls": _own_calls(n, kids)})
         for c in kids:
@@ -373,10 +457,14 @@ def _build_code_tree_ts(abs_path: str, text: str, ext: str) -> list[dict]:
     top = _child_defs(root)
     if not top:
         return _flat_nodes(abs_path, text)
-    preamble = src[:_def_start(top[0])].decode("utf-8", "ignore").strip()
+    preamble_start = _def_start(top[0])
+    preamble = src[:preamble_start].decode("utf-8", "ignore").strip()
     if preamble:
         nodes.append({"id": _make_chunk_id(abs_path, len(nodes), preamble),
                       "content": preamble, "section_title": "(module)",
+                      "section_type": "module", "signature": "(module)",
+                      "start_line": 1,
+                      "end_line": max(1, src[:preamble_start].count(b"\n")),
                       "position": len(nodes), "depth": 1, "container_id": abs_path})
     for n in top:
         _emit(n, 1, abs_path)

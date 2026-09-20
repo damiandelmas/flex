@@ -79,7 +79,17 @@ LEFT JOIN _raw_sources src ON s.source_id = src.source_id
 LEFT JOIN _edges_tool_ops t ON r.id = t.chunk_id
 LEFT JOIN _types_message tp ON r.id = tp.chunk_id
 LEFT JOIN _enrich_chunk_rollup cr ON r.id = cr.chunk_id
-WHERE NOT EXISTS (
+WHERE EXISTS (
+    SELECT 1 FROM _coding_agent_source_visibility vis
+    WHERE vis.source_id = s.source_id
+      AND vis.visible = 1
+)
+AND NOT EXISTS (
+    SELECT 1 FROM _edges_source ves
+    LEFT JOIN _coding_agent_source_visibility vvis ON vvis.source_id=ves.source_id
+    WHERE ves.chunk_id=r.id AND COALESCE(vvis.visible, 0)=0
+)
+AND NOT EXISTS (
     SELECT 1 FROM _meta m, json_each(m.value) j
     WHERE m.key = 'exclude_paths'
       AND t.target_file LIKE '%' || j.value || '%'

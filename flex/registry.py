@@ -42,6 +42,21 @@ def get_hook(name: str):
     return _hooks.get(name)
 
 
+def query_target_opener(name: str):
+    """Return an optional deployment-owned query target opener.
+
+    Named SQLite cells remain the default and public query contract.  A local
+    deployment may expose a composed, query-local target through the optional
+    registry extension without teaching the core registry its product names or
+    source membership.
+    """
+    try:
+        from flex.modules.registry_ext import query_target_opener as _opener
+    except ImportError:
+        return None
+    return _opener(name)
+
+
 _plugins_loaded = False
 
 # H4 — plugin module names must match ^flex(\.[a-zA-Z0-9_]+)+$.
@@ -127,8 +142,10 @@ _MIGRATIONS = [
     # watched yet declare active_append, events, or signature reconciliation.
     "ALTER TABLE cells ADD COLUMN detector TEXT",
     "ALTER TABLE cells ADD COLUMN detector_config TEXT",
-    # Active/inactive: active cells get VectorCache at startup, inactive are lazy-loaded on first query
+    # Active/inactive is query and lifecycle availability, not residency policy.
     "ALTER TABLE cells ADD COLUMN active INTEGER DEFAULT 1",
+    # Eager cache residency is resource policy, not authorization.
+    "ALTER TABLE cells ADD COLUMN prewarm INTEGER DEFAULT 0",
     # Explicit opt-in for a sovereign database whose authoritative location is
     # outside FLEX_HOME. The permission is stored on the exact registry row;
     # ordinary external paths remain rejected.
@@ -280,6 +297,7 @@ def register_cell(
     corpus_path: str | Path | None = None,
     unlisted: bool | int | None = None,
     active: bool | int | None = None,
+    prewarm: bool | int | None = None,
     source_url: str | None = None,
     checksum: str | None = None,
     origin: str | None = None,
@@ -343,11 +361,11 @@ def register_cell(
 
     db.execute("""
         INSERT INTO cells (id, name, path, corpus_path, cell_type, description,
-                           unlisted, active, source_url, checksum, origin,
+                           unlisted, active, prewarm, source_url, checksum, origin,
                            lifecycle, refresh_interval, refresh_script, refresh_module,
                            watch_path, watch_pattern, detector, detector_config,
                            allow_external, created_at, updated_at)
-        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
         ON CONFLICT(name) DO UPDATE SET
             id = COALESCE(cells.id, excluded.id),
             path = excluded.path,
@@ -356,6 +374,7 @@ def register_cell(
             description = COALESCE(excluded.description, cells.description),
             unlisted = COALESCE(excluded.unlisted, cells.unlisted),
             active = COALESCE(excluded.active, cells.active),
+            prewarm = COALESCE(excluded.prewarm, cells.prewarm),
             source_url = COALESCE(excluded.source_url, cells.source_url),
             checksum = COALESCE(excluded.checksum, cells.checksum),
             origin = COALESCE(excluded.origin, cells.origin),
@@ -379,6 +398,7 @@ def register_cell(
     """, (cell_id, name, path_str, corpus_str, cell_type, description,
           None if unlisted is None else int(bool(unlisted)),
           None if active is None else int(bool(active)),
+          None if prewarm is None else int(bool(prewarm)),
           source_url, checksum, origin,
           lifecycle, refresh_interval, refresh_script, refresh_module,
           watch_str, watch_pattern, detector, detector_config,
@@ -448,6 +468,8 @@ def get_cell_metadata(name: str) -> dict | None:
     """
     try:
         db = _open_registry_readonly()
+        columns = {row[1] for row in db.execute("PRAGMA table_info(cells)")}
+        prewarm_expr = "COALESCE(prewarm, 0)" if "prewarm" in columns else "0"
         row = db.execute(
             "SELECT id, name, path, corpus_path, cell_type, description, "
             "source_url, checksum, origin, "
@@ -460,7 +482,8 @@ def get_cell_metadata(name: str) -> dict | None:
             "watch_path, watch_pattern, detector, detector_config, "
             "created_at, updated_at, COALESCE(unlisted, 0) as unlisted, "
             "COALESCE(allow_external,0) AS allow_external, "
-            "COALESCE(active, 1) as active "
+            "COALESCE(active, 1) as active, "
+            f"{prewarm_expr} as prewarm "
             "FROM cells WHERE name = ?",
             (name,),
         ).fetchone()
@@ -499,6 +522,8 @@ def list_cells() -> list[dict]:
     """List all registered cells with metadata."""
     try:
         db = _open_registry_readonly()
+        columns = {row[1] for row in db.execute("PRAGMA table_info(cells)")}
+        prewarm_expr = "COALESCE(prewarm, 0)" if "prewarm" in columns else "0"
         rows = db.execute(
             "SELECT id, name, path, corpus_path, cell_type, description, "
             "source_url, checksum, "
@@ -511,7 +536,8 @@ def list_cells() -> list[dict]:
             "watch_path, watch_pattern, detector, detector_config, "
             "created_at, updated_at, COALESCE(unlisted, 0) as unlisted, "
             "COALESCE(allow_external,0) AS allow_external, "
-            "COALESCE(active, 1) as active "
+            "COALESCE(active, 1) as active, "
+            f"{prewarm_expr} as prewarm "
             "FROM cells ORDER BY name"
         ).fetchall()
         db.close()
@@ -542,24 +568,45 @@ def discover_cells() -> list[str]:
 
 
 def discover_active_cells() -> list[str]:
-    """Discover active listed cells that should be warmed at startup.
+    """Compatibility alias for callable, discoverable cells.
 
-    Returns sorted list of cell names. Skips unlisted and inactive cells.
+    Startup resource policy is owned by :func:`discover_prewarm_cells`.
     """
     return discover_cells()
 
 
-def set_active(name: str, active: bool) -> bool:
-    """Set a cell's active flag. Returns True if cell existed.
+def discover_prewarm_cells() -> list[str]:
+    """Return callable cells explicitly selected for eager vector warmup."""
+    names = []
+    for cell in list_cells():
+        if not cell.get('active', 1) or not cell.get('prewarm', 0):
+            continue
+        if Path(cell['path']).exists():
+            names.append(cell['name'])
+    return sorted(names)
 
-    Active cells get VectorCache warmed at startup (instant queries).
-    Inactive cells are lazy-loaded on first query.
-    """
+
+def set_active(name: str, active: bool) -> bool:
+    """Set query/lifecycle availability. Returns True if cell existed."""
     db = _open_registry()
     now = datetime.now(timezone.utc).isoformat()
     cursor = db.execute(
         "UPDATE cells SET active = ?, updated_at = ? WHERE name = ?",
         (1 if active else 0, now, name)
+    )
+    db.commit()
+    updated = cursor.rowcount > 0
+    db.close()
+    return updated
+
+
+def set_prewarm(name: str, prewarm: bool) -> bool:
+    """Set eager startup cache policy without changing cell availability."""
+    db = _open_registry()
+    now = datetime.now(timezone.utc).isoformat()
+    cursor = db.execute(
+        "UPDATE cells SET prewarm = ?, updated_at = ? WHERE name = ?",
+        (1 if prewarm else 0, now, name),
     )
     db.commit()
     updated = cursor.rowcount > 0

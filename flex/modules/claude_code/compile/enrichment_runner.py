@@ -40,6 +40,15 @@ def run(cell_path: str, graph_threshold: int = 50) -> int:
             if refresh_corpus_graphs is not None:
                 refresh_corpus_graphs()
             set_meta(conn, "last_enrichment_ts", str(time.time()))
+            try:
+                remaining = conn.execute(
+                    "SELECT COUNT(*) FROM _raw_chunks "
+                    "WHERE embedding IS NULL AND content IS NOT NULL"
+                ).fetchone()[0]
+            except sqlite3.OperationalError:
+                remaining = 0
+            set_meta(conn, "semantic_pending", "1" if remaining else "0")
+            set_meta(conn, "semantic_status", "ready" if remaining == 0 else "pending")
             conn.commit()
         finally:
             conn.close()

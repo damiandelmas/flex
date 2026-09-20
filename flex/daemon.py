@@ -144,6 +144,20 @@ def _codex_structural_tick_loop(interval: float = 2.0) -> None:
         time.sleep(max(0.1, interval - elapsed))
 
 
+def _filesystem_debt_tick_loop(queue, interval: float = 0.5) -> None:
+    """Settle publication/delete debt independently of session workloads."""
+    from flex.modules.fs.compile.worker import drain_reconciliation_debt
+
+    while True:
+        started = time.monotonic()
+        try:
+            drain_reconciliation_debt(queue)
+        except Exception as exc:
+            print(f"[flex-daemon] Filesystem debt error: {exc}", file=sys.stderr)
+        elapsed = time.monotonic() - started
+        time.sleep(max(0.1, interval - elapsed))
+
+
 def _build_claude_watcher():
     """Phase 1 composition: build the Claude Code filesystem observer.
 
@@ -216,7 +230,11 @@ def _build_local_watchers():
         if root.is_dir() and not any(
             r.cell_name == "claude_code" and r.root == root for r in registrations
         ):
-            registrations.append(WatchRegistration(
+            publication_count = sum(
+                1 for registration in registrations
+                if registration.reconcile_only
+            )
+            registrations.insert(publication_count, WatchRegistration(
                 "claude_code", root, "**/*.jsonl", recursive=True,
             ))
     except (ImportError, OSError):
@@ -260,7 +278,7 @@ def _run_local_worker(*, interval, queue, watcher, reconcile_interval):
     )
 
 
-def main():
+def _main():
     _load_secrets()
     from flex.registry import load_plugins
     load_plugins()
@@ -339,6 +357,14 @@ def main():
     # Typed local observers are built before the worker loop and stopped on
     # every exit path, including signal-driven shutdown.
     queue, watcher, _watch_config = _build_local_watchers()
+    if queue is not None:
+        t = threading.Thread(
+            target=_filesystem_debt_tick_loop,
+            args=(queue,),
+            name="filesystem-debt-tick",
+            daemon=True,
+        )
+        t.start()
 
     def _shutdown_watcher(signum=None, frame=None):
         if watcher is not None:
@@ -367,6 +393,21 @@ def main():
             time.sleep(60)
     finally:
         _shutdown_watcher()
+
+
+def main():
+    """Run the daemon with a process-scoped single-model-owner contract."""
+    previous = os.environ.get("FLEX_EMBED_SERVICE_ONLY")
+    # Set this before plugins import compiler modules so no worker-local model
+    # singleton can form. Restore only if the daemon exits (mainly test seams).
+    os.environ["FLEX_EMBED_SERVICE_ONLY"] = "1"
+    try:
+        return _main()
+    finally:
+        if previous is None:
+            os.environ.pop("FLEX_EMBED_SERVICE_ONLY", None)
+        else:
+            os.environ["FLEX_EMBED_SERVICE_ONLY"] = previous
 
 
 if __name__ == "__main__":

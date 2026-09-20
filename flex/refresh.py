@@ -269,11 +269,9 @@ def run_due_refreshes(force: bool = False) -> dict:
 def run_due_watches() -> dict:
     """Poll lifecycle='watch' cells; regen only when the source signature changed.
 
-    discover_watched() returns instant cells that carry a refresh_module. A cheap
-    dry-run probes the msize signature (selection size + count + newest mtime); a
-    real regen runs only on change, so this is safe to call every refresh tick.
-    Fixes the wiring gap: discover_watched() existed but had no caller, so watched
-    cells never auto-refreshed.
+    discover_watched() returns lifecycle-owned cells that carry a refresh module.
+    A cheap dry-run probes the source signature; real provider work runs only on
+    change, so this is safe to call every refresh tick.
     """
     from flex.lifecycle import coordinator
     return coordinator(refresh_cell).local_watch_pass()

@@ -15,6 +15,7 @@ import subprocess
 import time
 import sys
 import struct
+import threading
 from pathlib import Path
 from datetime import datetime
 
@@ -22,7 +23,7 @@ import uuid as _uuid
 from flex.registry import resolve_cell, register_cell, FLEX_HOME
 from flex.core import log_op
 from flex.views import install_views
-from flex.onnx.embed import get_model, encode
+from flex.onnx.embed import STORE_DIM, get_model, encode
 from flex.modules.claude_code.compile.soft_detect import detect_file_ops
 from flex.modules.claude_code.compile.scope import excluded_tool as _excluded_tool
 from flex.compile.edges_schema import ensure_edges_source, ensure_edges_delegations
@@ -198,6 +199,19 @@ _TARGET_FILE_KEYS = {
 _embedder = None
 
 
+def _daemon_encode(texts, **kwargs):
+    """Legacy/default encoder honoring the daemon's single-owner boundary."""
+    from flex.semantic_client import encode_via_service, service_only_enabled
+    if service_only_enabled():
+        return encode_via_service(
+            texts,
+            model="minilm",
+            mode="document",
+            dim=STORE_DIM,
+        )
+    return encode(texts, **kwargs)
+
+
 def get_embedder():
     """Lazy-load ONNX embedding model."""
     global _embedder
@@ -223,11 +237,30 @@ def _encode_for_cell(conn: sqlite3.Connection, texts):
     the legacy fast path for untagged/MiniLM cells, but resolve every explicit
     Nomic tag through the same fail-closed ingest resolver as ``embed_new``.
     """
-    from flex.compile.embed import ensure_initial_vector_contract, _resolve_ingest_target
+    from flex.compile.embed import ensure_initial_vector_contract
 
     tag = ensure_initial_vector_contract(conn)
+    from flex.semantic_client import service_only_enabled
+    if service_only_enabled():
+        # The installed HTTP service is the single fp32 model owner.  Capture
+        # remains structurally complete if it is unavailable; the durable NULL
+        # backlog is retried on a later semantic sweep.
+        from flex.semantic_client import encode_via_service
+
+        return encode_via_service(
+            texts,
+            model=tag or "minilm",
+            mode="document",
+            dim=768 if tag in {"nomic-v1.5", "nomic-v1.5-fp32"} else STORE_DIM,
+        )
+
     if tag in (None, 'minilm'):
         return encode(texts)
+
+    # Explicit compiler/maintenance calls retain the historical in-process
+    # path.  This is not a daemon fallback: service-only mode never reaches it.
+    from flex.compile.embed import _resolve_ingest_target
+
     embed_doc = _resolve_ingest_target(conn)[0]
     return embed_doc(texts, batch_size=64)
 
@@ -306,6 +339,8 @@ def ensure_source_exists(conn: sqlite3.Connection, session_id: str, cwd: str = N
                 WHERE source_id = ?
                   AND (primary_cwd IS NULL OR primary_cwd = '')
             """, (cwd, session_id))
+        from flex.modules.claude_code.source_visibility import refresh_source_visibility_for_source
+        refresh_source_visibility_for_source(conn, session_id)
         return
 
     git_root = _git_root(cwd)
@@ -316,6 +351,8 @@ def ensure_source_exists(conn: sqlite3.Connection, session_id: str, cwd: str = N
         (source_id, source, project, git_root, start_time, primary_cwd, message_count, episode_count, title)
         VALUES (?, ?, ?, ?, NULL, ?, 0, 0, ?)
     """, (session_id, f"claude_code:{session_id}", project, git_root, cwd, title))
+    from flex.modules.claude_code.source_visibility import refresh_source_visibility_for_source
+    refresh_source_visibility_for_source(conn, session_id)
 
 
 def update_source_stats(conn: sqlite3.Connection, session_id: str, chunk: dict):
@@ -470,6 +507,12 @@ def _ensure_core_tables(conn: sqlite3.Connection):
             sql TEXT
         );
 
+        CREATE TABLE IF NOT EXISTS _vector_generations (
+            relation TEXT PRIMARY KEY,
+            generation INTEGER NOT NULL DEFAULT 0,
+            updated_at INTEGER NOT NULL DEFAULT (strftime('%s','now'))
+        );
+
         CREATE VIRTUAL TABLE IF NOT EXISTS chunks_fts USING fts5(
             content,
             content='_raw_chunks',
@@ -523,6 +566,10 @@ def _ensure_core_tables(conn: sqlite3.Connection):
     ensure_rollup_schema(conn)
     from flex.modules.claude_code.manage.observations import ensure_observation_schema
     ensure_observation_schema(conn)
+    from flex.modules.claude_code.source_visibility import ensure_source_visibility_schema
+    ensure_source_visibility_schema(conn)
+    from flex.retrieve.vector_generation import ensure_vector_generations
+    ensure_vector_generations(conn)
     conn.commit()
 
 
@@ -1529,6 +1576,22 @@ def sync_session_messages(session_id: str, conn: sqlite3.Connection,
             WHERE source_id = ? AND message_count = 0
         """, (session_id,))
 
+    from flex.modules.claude_code.source_visibility import refresh_source_visibility_for_source
+    refresh_source_visibility_for_source(conn, session_id)
+
+    if (inserted and skip_embed) or fb_items:
+        try:
+            cur.execute(
+                "INSERT OR REPLACE INTO _meta(key,value) "
+                "VALUES('semantic_status','pending')"
+            )
+            cur.execute(
+                "INSERT OR REPLACE INTO _meta(key,value) "
+                "VALUES('semantic_pending','1')"
+            )
+        except sqlite3.OperationalError:
+            pass  # minimal legacy/test cells may not carry metadata
+
     return inserted
 
 
@@ -1927,6 +1990,8 @@ def _batch_embed_chunks(conn, batch_size: int = 500, quiet: bool = False,
             "UPDATE _raw_chunks SET embedding = ? WHERE id = ?",
             [(serialize_f32(emb), r[0]) for emb, r in zip(embeddings, rows)]
         )
+        from flex.retrieve.vector_generation import bump_vector_generation
+        bump_vector_generation(conn, "_raw_chunks")
         conn.commit()
         done += len(rows)
 
@@ -1976,7 +2041,8 @@ def initial_backfill(conn, progress_cb=None, phase2_cb=None,
         commit_every: Commit after this many sessions (default 50). Higher = fewer fsyncs,
                       faster on overlay2/Docker. All inserts use INSERT OR IGNORE so
                       re-parsing uncommitted sessions on crash is safe.
-        skip_embed: If True, skip Phase 2 entirely (model unavailable).
+        skip_embed: If True, publish structural rows and leave Phase 2 as
+                    durable semantic debt (or because the model is unavailable).
 
     Returns:
         dict with sessions, chunks, elapsed, embed_ok.
@@ -2455,10 +2521,15 @@ def _launch_enrichment_child(cell_path: str | Path, graph_threshold: int) -> boo
     global _enrichment_child
     if _enrichment_child is not None:
         return False
-    _enrichment_child = subprocess.Popen([
-        sys.executable, "-m", "flex.modules.claude_code.compile.enrichment_runner",
-        "--cell-path", str(cell_path), "--graph-threshold", str(graph_threshold),
-    ])
+    child_env = os.environ.copy()
+    child_env["FLEX_EMBED_SERVICE_ONLY"] = "1"
+    _enrichment_child = subprocess.Popen(
+        [
+            sys.executable, "-m", "flex.modules.claude_code.compile.enrichment_runner",
+            "--cell-path", str(cell_path), "--graph-threshold", str(graph_threshold),
+        ],
+        env=child_env,
+    )
     return True
 
 
@@ -2537,7 +2608,7 @@ def _drain_ready_invalidations(conn, invalidation_queue, size_cache, error_cache
                     detail="claude worker semantic event drain",
                 ) as _event_lease:
                     event_stats = corpus_event_drainer(
-                        corpus_events, encode_fn=encode,
+                        corpus_events, encode_fn=_daemon_encode,
                         deadline=_t0 + _EVENT_DRAIN_BUDGET_S,
                         semantic_allowed=_event_lease.acquired,
                     )
@@ -2614,7 +2685,8 @@ def _reconciliation_succeeded(invalidation_queue, stats: dict,
 
 
 def _drain_corpus_reconciliation_debt(invalidation_queue, corpus_drainer,
-                                      *, encode_fn, semantic_allowed: bool) -> None:
+                                      *, encode_fn, semantic_allowed: bool,
+                                      filesystem_allowed: bool = True) -> None:
     """Run corpus reconciliation and acknowledge only proven scoped receipts.
 
     The aggregate corpus drainer does not return a cell receipt. Its registry
@@ -2635,7 +2707,11 @@ def _drain_corpus_reconciliation_debt(invalidation_queue, corpus_drainer,
         for name in debt_cells
     }
 
-    corpus_drainer(encode_fn=encode_fn, semantic_allowed=semantic_allowed)
+    corpus_drainer(
+        encode_fn=encode_fn,
+        semantic_allowed=semantic_allowed,
+        filesystem_allowed=filesystem_allowed,
+    )
 
     after = {cell['name']: cell for cell in list_cells()}
     for name, debt_generation in debt_generations.items():
@@ -2724,6 +2800,7 @@ def daemon_loop(interval=2, invalidation_queue=None, watcher=None,
 
     last_soma_heal = time.time()
     last_filesystem_reconcile = 0.0
+    corpus_thread = None
     worker_start = time.time()
     SEMANTIC_STARTUP_GRACE = 120  # capture/events must run + prove stable first
 
@@ -2924,21 +3001,47 @@ def daemon_loop(interval=2, invalidation_queue=None, watcher=None,
         elif time.time() - worker_start > SEMANTIC_STARTUP_GRACE:
             print("[worker] semantic sweep deferred: semantic work already active",
                   file=sys.stderr)
+        # The local worker owns capture and structural freshness. Release the
+        # semantic lane before aggregate corpus reconciliation so a slow
+        # provider cannot make source publication wait behind inline vectors;
+        # dedicated refresh/enrichment work drains that durable semantic debt.
+        _semantic_lease.close()
 
-        # Corpus scan (document indexing)
+        # Corpus reconciliation is a correctness backstop across independent
+        # providers and may legitimately take minutes. Run at most one in a
+        # daemon thread so it cannot freeze the main capture/event loop. This
+        # worker excludes Filesystem from that aggregate job: named filesystem
+        # events and debt are settled synchronously above by their exact owner.
         if _corpus_drainer:
-            try:
-                _cd0 = time.time()
-                if use_events:
-                    _drain_corpus_reconciliation_debt(
-                        invalidation_queue, _corpus_drainer,
-                        encode_fn=encode, semantic_allowed=_semantic_allowed,
-                    )
-                else:
-                    _corpus_drainer(encode_fn=encode, semantic_allowed=_semantic_allowed)
-                _phase_durations['corpus_drain_s'] = time.time() - _cd0
-            except Exception as e:
-                print(f"[worker] Corpus drain error: {e}", file=sys.stderr)
+            if corpus_thread is None or not corpus_thread.is_alive():
+                def _run_corpus_reconciliation():
+                    try:
+                        from flex.admission import try_heavy_lease
+                        with try_heavy_lease(
+                            detail="corpus reconciliation",
+                        ) as corpus_lease:
+                            if use_events:
+                                _drain_corpus_reconciliation_debt(
+                                    invalidation_queue, _corpus_drainer,
+                                    encode_fn=_daemon_encode,
+                                    semantic_allowed=corpus_lease.acquired,
+                                    filesystem_allowed=False,
+                                )
+                            else:
+                                _corpus_drainer(
+                                    encode_fn=_daemon_encode,
+                                    semantic_allowed=corpus_lease.acquired,
+                                    filesystem_allowed=False,
+                                )
+                    except Exception as exc:
+                        print(f"[worker] Corpus drain error: {exc}", file=sys.stderr)
+
+                corpus_thread = threading.Thread(
+                    target=_run_corpus_reconciliation,
+                    name="corpus-reconciliation",
+                    daemon=True,
+                )
+                corpus_thread.start()
         elif (_filesystem_scanner
               and time.monotonic() - last_filesystem_reconcile
               >= FILESYSTEM_RECONCILE_INTERVAL):
@@ -2949,8 +3052,6 @@ def daemon_loop(interval=2, invalidation_queue=None, watcher=None,
                 _phase_durations['filesystem_scan_s'] = time.time() - _fs0
             except Exception as e:
                 print(f"[worker] Filesystem drain error: {e}", file=sys.stderr)
-        _semantic_lease.close()
-
         # Secondary local cells (e.g. chat exports)
         if _secondary_cell_drainer:
             try:
@@ -2997,9 +3098,14 @@ def daemon_loop(interval=2, invalidation_queue=None, watcher=None,
         # restarts). Startup grace keeps the heavy pass off the first ticks:
         # capture runs first and the worker proves it survives, so a kill
         # mid-cycle cannot instantly re-trigger it on the next start.
+        try:
+            _semantic_pending = get_meta(conn, 'semantic_pending') == '1'
+        except Exception:
+            _semantic_pending = False
         if (time.time() - worker_start > SEMANTIC_STARTUP_GRACE
                 and time.time() >= _enrichment_retry_after
-                and time.time() - last_enrichment > ENRICHMENT_INTERVAL):
+                and (_semantic_pending
+                     or time.time() - last_enrichment > ENRICHMENT_INTERVAL)):
             try:
                 _overdue = (time.time() - last_enrichment) / 60.0
                 if _launch_enrichment_child(cell_path, GRAPH_STALENESS_THRESHOLD):

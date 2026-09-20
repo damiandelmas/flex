@@ -58,6 +58,11 @@ def regenerate_views(db: sqlite3.Connection, views: dict = None):
     }
     if "position" not in tree_columns:
         db.execute("ALTER TABLE _edges_tree ADD COLUMN position INTEGER")
+    try:
+        from flex.modules.claude_code.source_visibility import refresh_source_visibility
+        refresh_source_visibility(db)
+    except sqlite3.OperationalError:
+        pass
 
     all_tables = (
         _discover_tables(db, '_edges_%') +
@@ -198,6 +203,8 @@ def _provider_for_acp(db: sqlite3.Connection) -> str:
     # _types_message, so the generic table must be checked last.
     providers = [
         ("codex", "_types_codex_turn"),
+        ("deepseek", "_types_deepseek_session"),
+        ("pi", "_types_pi_session"),
         ("opencode", "_types_opencode_session"),
         ("goose", "_types_goose_session"),
         ("aider", "_types_aider_session"),
@@ -216,6 +223,8 @@ def _is_coding_agent_cell(db: sqlite3.Connection) -> bool:
             "_types_message",
             "_edges_tool_ops",
             "_types_codex_turn",
+            "_types_deepseek_session",
+            "_types_pi_session",
             "_types_opencode_session",
             "_types_goose_session",
             "_types_aider_session",
@@ -267,6 +276,22 @@ def _install_acp_views(db: sqlite3.Connection) -> None:
         if _has_table(db, "_edges_tool_ops")
         else ""
     )
+    from flex.modules.claude_code.source_visibility import (
+        VISIBILITY_TABLE, refresh_source_visibility,
+    )
+    has_visibility = _has_table(db, VISIBILITY_TABLE)
+    if has_visibility:
+        refresh_source_visibility(db)
+    session_visibility_join = (
+        f"JOIN {VISIBILITY_TABLE} vis ON vis.source_id = src.source_id "
+        "AND vis.visible = 1"
+        if has_visibility else ""
+    )
+    event_visibility_join = (
+        f"JOIN {VISIBILITY_TABLE} vis ON vis.source_id = s.source_id "
+        "AND vis.visible = 1"
+        if has_visibility else ""
+    )
 
     db.execute(f"""
 CREATE VIEW acp_sessions AS
@@ -289,6 +314,7 @@ SELECT
     NULL AS target_file,
     MIN(r.timestamp) AS timestamp
 FROM _raw_sources src
+{session_visibility_join}
 LEFT JOIN _edges_source s ON src.source_id = s.source_id
 LEFT JOIN _raw_chunks r ON s.chunk_id = r.id
 GROUP BY src.source_id
@@ -328,6 +354,7 @@ SELECT
     {chunk_timestamp} AS timestamp
 FROM _raw_chunks r
 LEFT JOIN _edges_source s ON r.id = s.chunk_id
+{event_visibility_join}
 LEFT JOIN _raw_sources src ON s.source_id = src.source_id
 {message_join}
 {tool_join}
@@ -433,12 +460,24 @@ def _build_chunk_view(view_name: str, db: sqlite3.Connection,
 
     select_str = ",\n    ".join(selects)
     join_str = "\n".join(joins)
+    where = ""
+    from flex.modules.claude_code.source_visibility import VISIBILITY_TABLE
+    if has_bridge and _has_table(db, VISIBILITY_TABLE):
+        where = (
+            f"\nWHERE (s.source_id IS NULL OR EXISTS ("
+            f"SELECT 1 FROM {VISIBILITY_TABLE} vis "
+            f"WHERE vis.source_id = s.source_id AND vis.visible = 1)) "
+            f"AND NOT EXISTS ("
+            f"SELECT 1 FROM _edges_source ves "
+            f"LEFT JOIN {VISIBILITY_TABLE} vvis ON vvis.source_id=ves.source_id "
+            f"WHERE ves.chunk_id=r.id AND COALESCE(vvis.visible, 0)=0)"
+        )
 
     return f"""CREATE VIEW [{view_name}] AS
 SELECT
     {select_str}
 FROM _raw_chunks r
-{join_str}"""
+{join_str}{where}"""
 
 
 def _build_source_view(view_name: str, db: sqlite3.Connection,
@@ -493,12 +532,20 @@ def _build_source_view(view_name: str, db: sqlite3.Connection,
     select_str = ",\n    ".join(selects)
     join_str = "\n".join(joins)
     group_by = "\nGROUP BY src.source_id" if has_bridge else ""
+    where = ""
+    from flex.modules.claude_code.source_visibility import VISIBILITY_TABLE
+    if _has_table(db, VISIBILITY_TABLE):
+        where = (
+            f"\nWHERE EXISTS ("
+            f"SELECT 1 FROM {VISIBILITY_TABLE} vis "
+            f"WHERE vis.source_id = src.source_id AND vis.visible = 1)"
+        )
 
     return f"""CREATE VIEW [{view_name}] AS
 SELECT
     {select_str}
 FROM _raw_sources src
-{join_str}{group_by}"""
+{join_str}{where}{group_by}"""
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
@@ -702,6 +749,12 @@ def install_views(
         try:
             from flex.manage.chunk_type import ensure_chunk_type_fresh
             ensure_chunk_type_fresh(db)
+        except sqlite3.OperationalError:
+            pass
+    if prepare_provider_state:
+        try:
+            from flex.modules.claude_code.source_visibility import refresh_source_visibility
+            refresh_source_visibility(db)
         except sqlite3.OperationalError:
             pass
 

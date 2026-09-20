@@ -42,6 +42,10 @@ def register_args(parser) -> None:
              help="Build a static cell instead of keeping it current")
     _add_arg(parser, "--no-mcp", action="store_true",
              help="Do not install Claude MCP configuration or Flex skills")
+    _add_arg(parser, "--structural", action="store_true",
+             help="No-embed structural profile with a persisted multi-root recipe")
+    _add_arg(parser, "--selection", action="append", default=[], metavar="PATH",
+             help="Additional root for --structural (repeatable)")
 
 
 def _slug(value: str) -> str:
@@ -67,10 +71,12 @@ def run(args, console) -> None:
     """Create, populate, register, and teach one mixed filesystem cell."""
     from flex.cli import (
         _install_claude_assets, _install_launchd, _install_systemd,
-        _patch_claude_json, _runtime_setup_enabled,
-        _start_services_direct, _verify_services,
+        _patch_claude_json, _runtime_setup_enabled, _start_services_direct, _verify_services,
     )
-    from flex.modules.fs.compile.schema import FILESYSTEM_SCHEMA_DDL
+    from flex.modules.fs.compile.schema import (
+        FILESYSTEM_SCHEMA_DDL, ensure_document_vector_contract,
+        validate_document_profile,
+    )
     from flex.modules.fs.compile.worker import reconcile_cell
     from flex.registry import resolve_cell
     from flex.retrieve.embeddings import set_active_model
@@ -101,6 +107,28 @@ def run(args, console) -> None:
         )
 
     root = _resolve_root(args)
+    structural = bool(getattr(args, "structural", False))
+    if structural:
+        from flex.modules.fs.compile.structural import install_cell
+
+        selections = [root, *[Path(value).expanduser().resolve()
+                              for value in getattr(args, "selection", ())]]
+        name = getattr(args, "name", None) or _slug(root.name)
+        if resolve_cell(name) is not None:
+            raise SystemExit(
+                f"filesystem: cell {name!r} already exists; choose --name for a new cell"
+            )
+        lifecycle = "static" if getattr(args, "no_watch", False) else "watch"
+        description = (getattr(args, "description", None)
+                       or f"{name} — structural filesystem union of {len(selections)} root(s)")
+        indexed, _deleted = install_cell(
+            name, description, selections, lifecycle=lifecycle,
+            exclude=list(getattr(args, "exclude", None) or ()),
+        )
+        console.print(f"  filesystem structural  [green]{indexed} files[/green]")
+        console.print("  embeddings              [yellow]off[/yellow]")
+        configure_runtime(name)
+        return
     if getattr(args, "embed", False) and getattr(args, "no_embed", False):
         raise SystemExit("filesystem: --embed and --no-embed conflict")
     embed_enabled = not bool(getattr(args, "no_embed", False))
@@ -146,11 +174,22 @@ def run(args, console) -> None:
                 ("nomic-embed-text-v1.5-fp32",),
             )
             db.execute("INSERT OR REPLACE INTO _meta VALUES('embedding_dim','768')")
+            ensure_document_vector_contract(db)
         db.commit()
 
         stats = reconcile_cell(
             db, root, obsidian=obsidian, exclude=exclude, file_kinds=file_kinds,
-            process_cache={},
+            process_cache={}, defer_wikilinks=True,
+        )
+        validate_document_profile(
+            db,
+            require_embeddings=embed_enabled,
+            expected_model="nomic-v1.5-fp32" if embed_enabled else None,
+            expected_model_fingerprint=(
+                "nomic-embed-text-v1.5-fp32" if embed_enabled else None
+            ),
+            expected_storage_dim=768 if embed_enabled else None,
+            expected_serve_dim=256 if embed_enabled else None,
         )
         sources = db.execute("SELECT COUNT(*) FROM _raw_sources").fetchone()[0]
         chunks = db.execute("SELECT COUNT(*) FROM _raw_chunks").fetchone()[0]
@@ -181,5 +220,4 @@ def run(args, console) -> None:
     )
     if obsidian:
         console.print("  Obsidian            [green]enabled for Markdown files[/green]")
-
     configure_runtime(name)
