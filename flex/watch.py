@@ -133,6 +133,7 @@ class WatchRegistration:
     root: Path
     pattern: str
     recursive: bool = True
+    reconcile_only: bool = False
 
     def matches(self, path: Path) -> bool:
         """True if `path` falls under `root` (after resolution — a
@@ -216,15 +217,45 @@ def registrations_for_cells(cells) -> list[WatchRegistration]:
             registrations.append(WatchRegistration(
                 cell_name=cell["name"], root=root, pattern=root_pattern, recursive=True,
             ))
-    # Session runtimes are the latency-sensitive source plane: install those
-    # observers before large repository/context trees. All registrations still
-    # participate; this ordering only determines how soon live conversations
-    # begin feeding the shared queue during asynchronous startup.
+            # Git publication is a tiny, lossless wake-up surface for a large
+            # authored tree. A branch-ref change does not identify the complete
+            # changed path set, so it never enters the per-file writer; it marks
+            # this exact cell as owing a full reconciliation instead.
+            git_refs = root / ".git" / "refs"
+            if cell.get("cell_type") == "filesystem" and git_refs.is_dir():
+                git_key = (cell["name"], git_refs, "**/*", True)
+                if git_key not in seen:
+                    seen.add(git_key)
+                    registrations.append(WatchRegistration(
+                        cell_name=cell["name"],
+                        root=git_refs,
+                        pattern="**/*",
+                        recursive=True,
+                        reconcile_only=True,
+                    ))
+    # Session runtimes are the latency-sensitive source plane. After them,
+    # install native filesystem authorities in coverage order: one accepted
+    # event at a broad authority root can keep the complete authored world
+    # current while narrower and derived observers are still initializing.
     session_cells = {"claude_code", "codex", "goose"}
+    cell_types = {cell.get("name"): cell.get("cell_type") for cell in cells}
+
+    def coverage(registration):
+        return sum(
+            1 for candidate in registrations
+            if candidate.root == registration.root
+            or candidate.root.is_relative_to(registration.root)
+        )
+
     return sorted(
         registrations,
         key=lambda r: (
-            0 if r.cell_name in session_cells else 1,
+            -1 if r.reconcile_only
+            else 0 if r.cell_name in session_cells
+            else 1 if cell_types.get(r.cell_name) == "filesystem"
+            else 2,
+            -coverage(r),
+            len(r.root.parts),
             r.cell_name,
             str(r.root),
         ),
@@ -497,6 +528,13 @@ def _make_handler(registration: WatchRegistration, queue: InvalidationQueue):
                 canonical = path.resolve()
             except OSError:
                 canonical = path
+            if registration.reconcile_only:
+                queue.mark_reconciliation_required(registration.cell_name)
+                print(
+                    f"[watch] publication changed: {registration.cell_name}",
+                    file=sys.stderr,
+                )
+                return
             queue.put(Invalidation(registration.cell_name, canonical, time.monotonic(), kind))
 
         def on_created(self, event):
@@ -578,6 +616,12 @@ class Watcher:
         self.backend = type(observer).__name__
         self.healthy = True
         self.last_error = None
+        if self.registration.reconcile_only:
+            print(
+                f"[watch] publication observer ready: "
+                f"{self.registration.cell_name} ({self.registration.root})",
+                file=sys.stderr,
+            )
         return True
 
     def is_alive(self) -> bool:
