@@ -8,6 +8,7 @@ on:
       - "tests/docker/run_windows_container.py"
       - "tests/docker/harness.py"
       - "tests/test_external_runtime.py"
+      - "tests/test_codex_active_append.py"
       - ".github/workflows/container-publish.yml"
       - "flex/**"
       - "pyproject.toml"
@@ -21,6 +22,7 @@ on:
       - "tests/docker/run_windows_container.py"
       - "tests/docker/harness.py"
       - "tests/test_external_runtime.py"
+      - "tests/test_codex_active_append.py"
       - ".github/workflows/container-publish.yml"
       - "flex/**"
       - "pyproject.toml"
@@ -95,8 +97,8 @@ jobs:
           path: ${{ steps.wheel.outputs.path }}
           if-no-files-found: error
 
-      - name: Focused runtime-owner tests
-        run: python -m pytest -q tests/test_external_runtime.py
+      - name: Focused runtime-owner and Codex append tests
+        run: python -m pytest -q tests/test_external_runtime.py tests/test_codex_active_append.py
 
       - name: Build local image
         shell: bash

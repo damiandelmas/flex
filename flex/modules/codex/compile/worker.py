@@ -2266,6 +2266,71 @@ def _record_codex_rollout_completion(
 _CODEX_SCAN_LOCK = threading.Lock()
 
 
+def drain_codex_paths(invalidations, *, deadline: float | None = None) -> dict:
+    """Publish watcher-selected Codex rollouts in the public worker fallback.
+
+    The private aggregate engine has a general provider path drainer. Public
+    wheels deliberately omit that integration, so Codex needs this narrow
+    provider-owned adapter rather than sending Codex events to the Filesystem
+    handler (which correctly ignores non-Filesystem cells).
+    """
+    from flex.registry import list_cells
+    from flex.modules.codex.sources import resolve_sources
+
+    grouped: dict[str, list] = {}
+    for invalidation in invalidations:
+        grouped.setdefault(str(invalidation.cell_name), []).append(invalidation)
+    cells = {
+        str(cell["name"]): cell for cell in list_cells()
+        if cell.get("cell_type") == "codex"
+        and cell.get("lifecycle") == "watch"
+        and cell.get("active", 1)
+    }
+    stats = {"indexed": 0, "skipped": 0, "failed": 0, "deferred": []}
+    with _CODEX_SCAN_LOCK:
+        for name, events in grouped.items():
+            if deadline is not None and time.time() >= deadline:
+                stats["deferred"].extend(events)
+                continue
+            cell = cells.get(name)
+            if cell is None:
+                stats["skipped"] += len(events)
+                continue
+            conn = sqlite3.connect(cell["path"], timeout=30)
+            try:
+                conn.execute("PRAGMA journal_mode=WAL")
+                conn.execute("PRAGMA busy_timeout=30000")
+                ensure_codex_tables(conn)
+                sources = [source for source in resolve_sources(conn) if source.usable]
+                for event in events:
+                    if deadline is not None and time.time() >= deadline:
+                        stats["deferred"].append(event)
+                        continue
+                    path = Path(event.source_path).resolve()
+                    source = next(
+                        (item for item in sources if path.is_relative_to(item.sessions_dir.resolve())),
+                        None,
+                    )
+                    if source is None or not path.match("rollout-*.jsonl"):
+                        stats["skipped"] += 1
+                        continue
+                    source_meta = {
+                        "source_kind": source.source_kind,
+                        "codex_home": str(source.codex_home),
+                        "sessions_dir": str(source.sessions_dir),
+                        "state_db": str(source.state_db),
+                        "rollout_path": str(path),
+                    }
+                    stats["indexed"] += sync_rollout_path(
+                        conn, path, state_db=source.state_db,
+                        source_meta=source_meta, deadline=deadline,
+                        allow_reconcile=True, ensure_schema=False,
+                    )
+            finally:
+                conn.close()
+    return stats
+
+
 def scan_codex_cells(
     deadline: float | None = None,
     *,
@@ -2523,10 +2588,44 @@ def transpile(
 
     for i, jsonl in enumerate(files, 1):
         try:
+            # The initial full transpile is also the baseline for the
+            # active-append detector. Persist the parser state and exact stable
+            # byte prefix alongside the rows it just wrote; otherwise the
+            # worker's discovery-free two-second lane has no receipt to follow
+            # and future appends to this rollout are invisible.
+            before = jsonl.stat()
+            parser_state: dict = {}
             added = _sync_session_jsonl(
                 jsonl, conn, thread_meta, spawn_edges,
                 session_memories, job_items, source_meta=source_meta,
+                parser_state=parser_state,
             )
+            after = jsonl.stat()
+            committed_offset = _stable_jsonl_end(jsonl, 0)
+            if (
+                (before.st_size, before.st_mtime_ns)
+                == (after.st_size, after.st_mtime_ns)
+                and committed_offset == after.st_size
+                and parser_state.get("session_id")
+            ):
+                conn.execute(
+                    """INSERT INTO _codex_source_state(
+                           source_path,size_bytes,mtime_ns,committed_offset,
+                           committed_lines,source_generation,session_id,parser_state
+                       ) VALUES(?,?,?,?,?,?,?,?)
+                       ON CONFLICT(source_path) DO UPDATE SET
+                         size_bytes=excluded.size_bytes,
+                         mtime_ns=excluded.mtime_ns,
+                         committed_offset=excluded.committed_offset,
+                         committed_lines=excluded.committed_lines,
+                         source_generation=excluded.source_generation,
+                         session_id=excluded.session_id,
+                         parser_state=excluded.parser_state""",
+                    (str(jsonl.resolve()), after.st_size, after.st_mtime_ns,
+                     committed_offset, _count_jsonl_lines(jsonl, 0, committed_offset),
+                     _rollout_generation(after), parser_state["session_id"],
+                     json.dumps(parser_state, separators=(",", ":"))),
+                )
             n_chunks += added
             if added > 0:
                 n_sessions += 1

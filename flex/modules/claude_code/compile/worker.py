@@ -2599,21 +2599,44 @@ def _drain_ready_invalidations(conn, invalidation_queue, size_cache, error_cache
                     file=sys.stderr,
                 )
         corpus_events = [inv for inv in ready if inv.cell_name != 'claude_code']
-        corpus_event_drainer = _corpus_path_drainer or _filesystem_path_drainer
-        if corpus_events and corpus_event_drainer:
+        if corpus_events:
             _t0 = time.time()
             if _corpus_path_drainer:
                 from flex.admission import try_heavy_lease
                 with try_heavy_lease(
                     detail="claude worker semantic event drain",
                 ) as _event_lease:
-                    event_stats = corpus_event_drainer(
+                    event_stats = _corpus_path_drainer(
                         corpus_events, encode_fn=_daemon_encode,
                         deadline=_t0 + _EVENT_DRAIN_BUDGET_S,
                         semantic_allowed=_event_lease.acquired,
                     )
             else:
-                event_stats = corpus_event_drainer(corpus_events)
+                # The public wheel intentionally excludes the private aggregate
+                # engine adapter. Route Codex through its provider-native path
+                # reconciler instead of the Filesystem fallback, which must not
+                # mutate a coding-agent cell.
+                codex_events = [inv for inv in corpus_events if inv.cell_name == 'codex']
+                other_events = [inv for inv in corpus_events if inv.cell_name != 'codex']
+                event_stats = {'indexed': 0, 'failed': 0, 'deferred': []}
+                if codex_events:
+                    from flex.modules.codex.compile.worker import drain_codex_paths
+                    codex_stats = drain_codex_paths(
+                        codex_events, deadline=_t0 + _EVENT_DRAIN_BUDGET_S,
+                    )
+                    event_stats['indexed'] += codex_stats.get('indexed', 0)
+                    event_stats['failed'] += codex_stats.get('failed', 0)
+                    event_stats['deferred'].extend(codex_stats.get('deferred') or ())
+                if other_events and _filesystem_path_drainer:
+                    fallback_stats = _filesystem_path_drainer(other_events)
+                    event_stats['indexed'] += fallback_stats.get('indexed', 0)
+                    event_stats['failed'] += fallback_stats.get('failed', 0)
+                    event_stats['deferred'].extend(fallback_stats.get('deferred') or ())
+                elif other_events:
+                    invalidation_queue.requeue(other_events)
+                    invalidation_queue.mark_reconciliation_required(
+                        {inv.cell_name for inv in other_events}
+                    )
             phase_durations['corpus_targeted_sync_s'] = time.time() - _t0
             if event_stats.get('failed', 0):
                 raise RuntimeError(

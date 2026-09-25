@@ -23,6 +23,13 @@ Public changes to **flex** ([getflex.dev](https://getflex.dev)).
 - `flex search` reuses the local query service by default, avoiding a second
   short-lived cache/model owner. An ambiguous timeout is not retried.
 
+### Live Codex capture
+
+- Initial Codex indexing now records the stable per-rollout cursor required by
+  the bounded append worker. The public worker also routes Codex file events
+  through the provider-native reconciliation path, so new and growing rollouts
+  become searchable and remain available after worker restarts.
+
 ### Fast, faithful coding-agent orientation
 
 - Coding-agent `@orient` retains instructions, query surfaces, graph guidance,
