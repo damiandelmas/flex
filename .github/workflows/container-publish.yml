@@ -97,6 +97,9 @@ jobs:
           path: ${{ steps.wheel.outputs.path }}
           if-no-files-found: error
 
+      - name: Install candidate wheel for focused tests
+        run: python -m pip install --no-cache-dir "${{ steps.wheel.outputs.path }}"
+
       - name: Focused runtime-owner and Codex append tests
         run: python -m pytest -q tests/test_external_runtime.py tests/test_codex_active_append.py
 
