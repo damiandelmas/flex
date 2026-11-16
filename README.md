@@ -40,7 +40,7 @@ curl -sSL https://getflex.dev/install.sh | bash -s -- codex
 ```
 
 The installer creates a cell from your existing session history, configures the
-MCP server, and starts background refresh. Session transcripts can contain prompts,
+MCP server, and starts one background worker that keeps your cells current. Session transcripts can contain prompts,
 tool output, and local paths; Flex stores the resulting cell locally under
 `~/.flex/`. Start a new client session so it loads the new MCP configuration, then
 ask:
@@ -102,10 +102,13 @@ docker compose -f compose.yaml -f compose.sources.yaml down      # retain cells
 docker compose -f compose.yaml -f compose.sources.yaml down -v   # explicit purge
 ```
 
-Flex 0.55.0 ships this as an experimental beta after clean-Windows live-source,
-Docker Desktop restart, Compose recreation, MCP, and volume-retention receipts passed.
-A full Windows OS reboot and cross-version container upgrade remain required before
-stable Windows support is claimed.
+The container distribution shipped as an experimental beta in 0.55.0 after
+clean-Windows live-source, Docker Desktop restart, Compose recreation, MCP, and
+volume-retention receipts passed. Since 0.56.0 the disposable initializers set
+`FLEX_RUNTIME_OWNER=external`, so they compile cells without registering services,
+stopping running ones, or wiring MCP clients. A full Windows OS reboot and
+cross-version container upgrade remain required before stable Windows support is
+claimed.
 
 ### let your coding agent install it
 
@@ -132,7 +135,7 @@ flex init --module filesystem --path /path/to/folder
 ```
 
 The filesystem compiler understands Markdown headings and metadata, Python and
-JS/TS symbols, calls and imports, and readable text. These coexist in one cell and
+JS/TS symbols, calls and imports, SQL files, and readable text. These coexist in one cell and
 remain distinguishable by file kind and source path.
 
 ```bash
@@ -156,11 +159,16 @@ Matryoshka query surface. No embedding API key is required. Structural
 publication is independent: objects, metadata, relationships, and FTS become
 queryable as one committed generation, while NULL vectors converge afterward.
 Semantic backlog never makes exact SQL or keyword retrieval stale.
+Embedding runs on its own lane of the worker, one bounded job at a time after
+structural work, so it never holds up capture, and queries are served ahead of it.
 The no-embed and structural paths do not probe or download the embedding model.
 
 Refresh is atomic per file: a failed or unreadable update preserves the last good
-indexed version. Filesystem events provide low-latency updates; reconciliation
-catches missed events, restarts, deletions, and edits made while flex was stopped.
+indexed version. One registry-driven scheduler in the worker keeps every local cell
+current: filesystem events provide low-latency updates, and startup and periodic
+reconciliation catch missed events, restarts, deletions, and edits made while flex
+was stopped. Jobs run bounded and retry with backoff, and new cells are picked up
+within about 15 seconds without a restart.
 
 After creating a cell, start here:
 
@@ -178,7 +186,8 @@ generated for the cell you are actually querying.
 
 Claude Code and Codex sessions retain prompts, replies, tool calls, file reads and
 edits, repositories, projects, and sub-agent traces. flex indexes history that
-already exists and keeps it current as you work.
+already exists and keeps it current as you work. Codex rollouts are followed live as they grow, so a
+running session becomes searchable without a restart.
 
 Ask questions such as:
 
@@ -200,6 +209,11 @@ files. Recover the source turns for every major claim.
 Search results are entry points, not the final evidence. Session cells ship
 presets such as `@full`, `@observed-file`, and `@file-history` for moving from a
 matching chunk to the complete turn, file observation, or ordered lineage.
+
+flex Ledger, a small writable cell created on first use, lets an agent annotate an
+exact message, or a range of messages, in any session cell and read those landmarks
+back later with `@hydrate`. It writes only its own cell and leaves the cell it
+points at unchanged.
 
 ### one folder, several retrieval modes
 
@@ -337,7 +351,11 @@ the shared cell shape.
 
 Cells share the same conventions at every level — chunks with edges, types,
 enrichments, and views. A registry at `~/.flex/registry.db` catalogs them by UUID,
-so names resolve to paths and renaming is a single update. Adding a new source adds
+so names resolve to paths and renaming is a single update. Registering a cell does
+not publish it: a new cell is listed to agents only when it is registered with
+`publish=True` (every installer and `flex.sdk` does this) and carries `_meta`;
+otherwise it stays unlisted but is still queryable by exact name. File identity
+comes from SOMA by default, so a moved or renamed file keeps its UUID. Adding a new source adds
 a new cell behind the same query surface — never a new search tool.
 
 ### the cell shape
@@ -398,7 +416,7 @@ external source.
 
 MCP is transport, not topology. The agent sees one universal query tool — `flex`
 against a named cell — and retrieval happens inside the cell (see
-[retrieval is a composition](#retrieval-is-a-composition)). The `flex core` CLI is
+[retrieval is a composition](#retrieval-is-a-composition)). The `flex` CLI is
 for installation and operations: initialize sources, inspect cells, and diagnose
 health. The durable artifact is the cell itself — one local SQLite file, normally
 under `~/.flex/cells/`. Installations with the optional relay dependency may also
