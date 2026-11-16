@@ -39,6 +39,8 @@ DEFAULT_QUIET_WINDOW_S = 0.5
 DEFAULT_MAX_LATENCY_S = 2.0
 DEFAULT_RECONCILE_INTERVAL_S = 60.0
 DEFAULT_QUEUE_MAX = 10_000
+REBUILD_BACKOFF_MIN_S = 30.0
+REBUILD_BACKOFF_MAX_S = 600.0
 _UNKNOWN_DEBT_CELL = "__unknown__"
 
 ENV_QUIET_WINDOW_MS = "FLEX_WATCH_QUIET_WINDOW_MS"
@@ -134,6 +136,42 @@ class WatchRegistration:
     pattern: str
     recursive: bool = True
     reconcile_only: bool = False
+    # Root resolved once at construction; excluded from equality/hash so the
+    # registration signature is unchanged. None means resolution failed.
+    _root_resolved: Optional[Path] = field(
+        default=None, init=False, repr=False, compare=False)
+    _root_prefixes: tuple = field(
+        default=(), init=False, repr=False, compare=False)
+
+    def __post_init__(self):
+        try:
+            resolved = Path(self.root).resolve()
+        except OSError:
+            resolved = None
+        object.__setattr__(self, "_root_resolved", resolved)
+        prefixes = {str(self.root)}
+        if resolved is not None:
+            prefixes.add(str(resolved))
+        object.__setattr__(
+            self, "_root_prefixes", tuple(p.rstrip(os.sep) + os.sep for p in prefixes))
+
+    def prefilter(self, path_str: str) -> bool:
+        """Cheap, syscall-free rejection test on the raw event path string.
+
+        Observer paths are rooted at the scheduled root, so a path that is
+        not lexically under the root (raw or resolved spelling) or whose
+        root-relative name fails the pattern cannot match. Passing this is
+        necessary, not sufficient: confirm with `matches_resolved`.
+        """
+        if self._root_resolved is None:
+            return False
+        for prefix in self._root_prefixes:
+            if path_str.startswith(prefix):
+                rel_str = path_str[len(prefix):]
+                if os.sep != "/":
+                    rel_str = rel_str.replace(os.sep, "/")
+                return self._pattern_ok(rel_str)
+        return False
 
     def matches(self, path: Path) -> bool:
         """True if `path` falls under `root` (after resolution — a
@@ -141,18 +179,23 @@ class WatchRegistration:
         the root-relative path, not the basename.
         """
         try:
-            root = Path(self.root).resolve()
-        except OSError:
-            return False
-        try:
             candidate = Path(path).resolve()
         except OSError:
             candidate = Path(path)
+        return self.matches_resolved(candidate)
+
+    def matches_resolved(self, candidate: Path) -> bool:
+        """`matches` for a path the caller has already resolved."""
+        root = self._root_resolved
+        if root is None:
+            return False
         try:
             rel = candidate.relative_to(root)
         except ValueError:
             return False
-        rel_str = rel.as_posix()
+        return self._pattern_ok(rel.as_posix())
+
+    def _pattern_ok(self, rel_str: str) -> bool:
         if fnmatch.fnmatch(rel_str, self.pattern):
             return True
         # fnmatch's translation of a leading '**/' requires a literal '/',
@@ -174,7 +217,8 @@ def registrations_for_cells(cells) -> list[WatchRegistration]:
     registrations = []
     seen = set()
     for cell in cells:
-        if cell.get("lifecycle") != "watch" or not cell.get("active", 1):
+        if (cell.get("lifecycle") != "watch" or not cell.get("active", 1)
+                or cell.get("detector") == "poll"):
             continue
         roots = []
         path = cell.get("path")
@@ -198,7 +242,9 @@ def registrations_for_cells(cells) -> list[WatchRegistration]:
             root_pattern = pattern
             try:
                 root = Path(raw_root).expanduser().resolve()
-            except OSError:
+            except (OSError, TypeError, ValueError):
+                # A malformed declaration is provider reconciliation debt,
+                # not permission to crash detection for every other cell.
                 continue
             # A registered singleton SQLite source historically used the file
             # itself as watch_path.  Watchdog schedules directories, and WAL
@@ -237,7 +283,7 @@ def registrations_for_cells(cells) -> list[WatchRegistration]:
     # install native filesystem authorities in coverage order: one accepted
     # event at a broad authority root can keep the complete authored world
     # current while narrower and derived observers are still initializing.
-    session_cells = {"claude_code", "codex", "goose"}
+    session_cells = {"claude_code", "codex", "goose", "pi"}
     cell_types = {cell.get("name"): cell.get("cell_type") for cell in cells}
 
     def coverage(registration):
@@ -521,13 +567,17 @@ def _make_handler(registration: WatchRegistration, queue: InvalidationQueue):
         def _enqueue(self, path_str, kind):
             if not path_str:
                 return
-            path = Path(path_str)
-            if not registration.matches(path):
+            # Observer thread: reject by string/pattern first, then resolve
+            # exactly once for events that survive.
+            if not registration.prefilter(str(path_str)):
                 return
+            path = Path(path_str)
             try:
                 canonical = path.resolve()
             except OSError:
                 canonical = path
+            if not registration.matches_resolved(canonical):
+                return
             if registration.reconcile_only:
                 queue.mark_reconciliation_required(registration.cell_name)
                 print(
@@ -679,8 +729,17 @@ class Watcher:
 class WatcherSet:
     """Small lifecycle facade over several root observers sharing one queue."""
 
-    def __init__(self, registrations, queue: InvalidationQueue):
+    def __init__(self, registrations, queue: InvalidationQueue, *,
+                 now=time.monotonic,
+                 rebuild_min_s: float = REBUILD_BACKOFF_MIN_S,
+                 rebuild_max_s: float = REBUILD_BACKOFF_MAX_S):
         self.queue = queue
+        self._now = now
+        self._rebuild_min = rebuild_min_s
+        self._rebuild_max = rebuild_max_s
+        # Per-registration rebuild state: delay, retry_at, started.
+        self._rebuild: dict = {}
+        self._rebuild_thread = None
         self.watchers = [Watcher(reg, queue) for reg in registrations]
         self.backend = None
         self.healthy = False
@@ -710,6 +769,12 @@ class WatcherSet:
             return self.healthy
         finally:
             self._starting = False
+            print(
+                f"[watch] initialization complete: "
+                f"{sum(w.healthy for w in self.watchers)}/{len(self.watchers)} roots ready"
+                + (f"; {self.last_error}" if self.last_error else ""),
+                file=sys.stderr,
+            )
 
     def start_background(self) -> None:
         """Initialize recursive observers without blocking structural capture."""
@@ -737,10 +802,76 @@ class WatcherSet:
             self.last_error = "; ".join(
                 f"{w.registration.root}: {w.last_error or 'unhealthy'}" for w in dead
             )
-            self.queue.mark_reconciliation_required(
-                watcher.registration.cell_name for watcher in dead
-            )
+            # Debt is marked once, on each watcher's healthy->dead transition
+            # (Watcher.check_health), and once more after a successful
+            # rebuild. Re-marking here every step would bump the debt epoch
+            # forever and no reconcile could ever clear it.
+            self._schedule_rebuilds(dead)
         return self.healthy
+
+    def _schedule_rebuilds(self, dead) -> None:
+        if self._stop_requested:
+            return
+        now = self._now()
+        due = []
+        for w in dead:
+            st = self._rebuild.setdefault(
+                w.registration,
+                {"delay": self._rebuild_min, "retry_at": None, "started": None},
+            )
+            if st["retry_at"] is None:
+                if st["started"] is not None and now - st["started"] >= self._rebuild_max:
+                    st["delay"] = self._rebuild_min  # it ran long enough; reset
+                st["retry_at"] = now + st["delay"]
+                print(
+                    f"[watch] unhealthy root {w.registration.root} "
+                    f"({w.last_error or 'unhealthy'}); rebuild in {st['delay']:.0f}s",
+                    file=sys.stderr,
+                )
+            if now >= st["retry_at"]:
+                due.append(w)
+        if due and (self._rebuild_thread is None or not self._rebuild_thread.is_alive()):
+            self._rebuild_thread = threading.Thread(
+                target=self._rebuild_watchers, args=(due,),
+                name="flex-watch-rebuild", daemon=True,
+            )
+            self._rebuild_thread.start()
+
+    def _rebuild_watchers(self, due) -> None:
+        for old in due:
+            if self._stop_requested:
+                return
+            reg = old.registration
+            st = self._rebuild[reg]
+            try:
+                old.stop(timeout=2.0)
+            except Exception:
+                pass
+            new = Watcher(reg, self.queue)
+            ok = new.start()
+            if self._stop_requested:
+                new.stop()
+                return
+            try:
+                self.watchers[self.watchers.index(old)] = new
+            except ValueError:
+                new.stop()
+                return
+            now = self._now()
+            st["delay"] = min(st["delay"] * 2, self._rebuild_max)
+            if ok:
+                st["started"] = now
+                st["retry_at"] = None
+                # Events between death and rebuild were lost: owe exactly one
+                # reconcile, which clears normally now that debt is stable.
+                self.queue.mark_reconciliation_required(reg.cell_name)
+                print(f"[watch] rebuilt observer: {reg.cell_name} ({reg.root})",
+                      file=sys.stderr)
+            else:
+                st["retry_at"] = now + st["delay"]
+                print(f"[watch] rebuild failed: {reg.cell_name} ({reg.root}): "
+                      f"{new.last_error}; next attempt in {st['delay']:.0f}s",
+                      file=sys.stderr)
 
     def mark_unhealthy(self, reason: str) -> None:
         self.healthy = False
@@ -757,8 +888,9 @@ class WatcherSet:
         for watcher in self.watchers:
             watcher.request_stop()
         deadline = time.monotonic() + max(0.0, timeout)
-        if self._start_thread is not None:
-            self._start_thread.join(timeout=max(0.0, deadline - time.monotonic()))
-        for watcher in self.watchers:
+        for thread in (self._start_thread, self._rebuild_thread):
+            if thread is not None:
+                thread.join(timeout=max(0.0, deadline - time.monotonic()))
+        for watcher in list(self.watchers):
             watcher.join(timeout=max(0.0, deadline - time.monotonic()))
         self.healthy = False
