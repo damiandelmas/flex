@@ -485,6 +485,7 @@ def main():
         cell_type='reddit',
         description=args.description or f'r/{subreddit} posts and comments',
         corpus_path=str(corpus_dir),
+        publish=True,
     )
     print(f"  Registered as '{cell_name}'")
 

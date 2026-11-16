@@ -948,6 +948,7 @@ def main():
         lifecycle='refresh',
         refresh_interval=6 * 60 * 60,
         refresh_module='flex.modules.skills.compile.refresh',
+        publish=True,
     )
 
     elapsed = time.time() - t0

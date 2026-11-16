@@ -124,7 +124,7 @@ def _packaged_instruction_paths(
         instruction_rel = spec.get("instructions_path") if spec else None
         path = root / str(instruction_rel or "stock/instructions.md")
         # Embed-off cells mount the structural-surface instructions when the module ships
-        # one, so cell_docs never advertises vec_ops/semantic scoring the cell can't back.
+        # one, so the mounted docs never advertise vec_ops/semantic scoring the cell can't back.
         if no_embed:
             no_embed_path = root / "stock" / "instructions-noembed.md"
             if no_embed_path.exists():

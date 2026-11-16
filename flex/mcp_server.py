@@ -88,6 +88,47 @@ _vec_locks_guard = threading.Lock()  # protects _vec_locks dict creation only
 # much less often. Only rebuild if mtime is stale by more than this threshold.
 _VEC_REBUILD_DEBOUNCE_S = 60
 
+
+def _vec_rebuild_min_s() -> float:
+    """Minimum age of a warm cache before generation drift alone rebuilds it."""
+    try:
+        return max(0.0, float(os.environ.get("FLEX_VEC_REBUILD_MIN_S", "300")))
+    except ValueError:
+        return 300.0
+
+
+def _vec_drift_within_floor(state, db, now: float | None = None) -> bool:
+    """True when a warm cache is behind ONLY on vector generation and was
+    built/loaded less than FLEX_VEC_REBUILD_MIN_S ago.
+
+    A generation-aware cache rebuilds in full (not append) on any generation
+    move, so a cell embedding continuously would rebuild back to back. Serving
+    the slightly stale matrix inside the floor bounds that cost. Config, model
+    and serve_dim drift are not covered: they make the cache invalid, not merely
+    behind, and still rebuild immediately.
+    """
+    if not (HAS_ENGINE and state):
+        return False
+    try:
+        built = max(
+            (c.loaded_at for c in (state.get('caches') or {}).values()
+             if getattr(c, 'loaded_at', None)),
+            default=None,
+        )
+        recorded = state.get('vector_generations')
+        if built is None or not isinstance(recorded, dict) or not recorded:
+            return False
+        if ((time.time() if now is None else now) - built) >= _vec_rebuild_min_s():
+            return False
+        from flex.retrieve.vector_generation import vector_generation
+        probe = dict(state)
+        probe['vector_generations'] = {
+            t: vector_generation(db, t) for t in recorded
+        }
+        return _engine_vector_state_is_current(probe, db) is True
+    except Exception:
+        return False
+
 def _effective_memory_mb() -> int:
     values = []
     try:
@@ -211,6 +252,8 @@ def _schedule_vec_refresh(name: str, cell_lock: threading.Lock) -> None:
                     ):
                         state['mtime'] = cur_mtime
                         return  # already fresh
+                    if generation_current is False and _vec_drift_within_floor(state, bgdb):
+                        return  # warm, generation-only drift: floor not elapsed
                     refreshed = None
                     if state:
                         try:
@@ -282,6 +325,9 @@ def discover_cells() -> list[str]:
     ]
 
 
+_unresolvable_logged: set[str] = set()
+
+
 def _db_path(name: str) -> Path:
     p = registry_resolve(name)
     if p is None:
@@ -326,7 +372,17 @@ def get_cell(name: str, warm_vec: bool = True):
         yield None
         return
 
-    p = _db_path(name)
+    # An active cell whose path the registry will not resolve (outside
+    # FLEX_HOME without allow_external, or missing) is unavailable, not fatal:
+    # it must not take down schema generation for every other cell.
+    p = registry_resolve(name)
+    if p is None:
+        if name not in _unresolvable_logged:
+            _unresolvable_logged.add(name)
+            print(f"[flex-mcp] Skipping cell '{name}': path does not resolve "
+                  f"to a trusted location", file=sys.stderr)
+        yield None
+        return
     if not p.exists():
         yield None
         return
@@ -375,8 +431,12 @@ def get_cell(name: str, warm_vec: bool = True):
             # rows but doesn't return wrong results. First warmup (state None) always runs.
             if (
                 state
-                and generation_current is not False
-                and (current_mtime - state['mtime']) < _VEC_REBUILD_DEBOUNCE_S
+                and (
+                    (generation_current is not False
+                     and (current_mtime - state['mtime']) < _VEC_REBUILD_DEBOUNCE_S)
+                    or (generation_current is False
+                        and _vec_drift_within_floor(state, db))
+                )
             ):
                 state['last_used'] = time.time()
                 register_vec_udf(db, state)

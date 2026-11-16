@@ -1,20 +1,9 @@
 -- @name: orient
--- @description: Hacker News cell orientation — docs, views, presets, samples
+-- @description: Hacker News cell orientation — views, presets, samples
 -- @multi: true
 
 -- @query: about
 SELECT value AS description FROM _meta WHERE key = 'description';
-
--- @query: cell_docs
-SELECT scope, name, path, mtime, chars, content
-FROM _flex_docs
-ORDER BY
-    CASE scope
-        WHEN 'cell_instructions' THEN 0
-        WHEN 'local_notes' THEN 1
-        ELSE 2
-    END,
-    name;
 
 -- @query: shape
 SELECT 'chunks' AS what, COUNT(*) AS n FROM _raw_chunks
@@ -30,16 +19,25 @@ ORDER BY m.name;
 
 -- @query: query_surface
 SELECT 'chunks' AS surface,
-       'chunk-level rows; type is story or comment; join keyword search results on chunks.id' AS use
+       'chunk-level rows; type is story or comment; join retrieval results on chunks.id' AS use
 UNION ALL
 SELECT 'threads',
        'one row per HN story thread with score, comment count, URL, and graph columns'
 UNION ALL
 SELECT 'keyword search',
        'use the keyword table function in FROM or JOIN, then join chunks on id'
+WHERE NOT EXISTS (SELECT 1 FROM pragma_function_list WHERE name = 'vec_distance_cosine')
 UNION ALL
 SELECT 'semantic search',
-       'use the semantic table function in FROM or JOIN, then join chunks on id';
+       'use the vec_ops table function in FROM or JOIN, then join chunks on id'
+WHERE NOT EXISTS (SELECT 1 FROM pragma_function_list WHERE name = 'vec_distance_cosine')
+UNION ALL
+SELECT 'keyword search',
+       'chunks_fts MATCH ''term'' or ''"exact phrase"'' (FTS5); bm25(chunks_fts) ascending is best; bridge to chunks via _raw_chunks.rowid = chunks_fts.rowid'
+UNION ALL
+SELECT 'semantic search',
+       'embed the question once in a MATERIALIZED CTE: vec_slice(llm_embed_generate(''search_query: '' || :q), 0, 256); score _raw_chunks.embedding with 1 - vec_distance_cosine(vec_slice(embedding, 0, 256), q), then join chunks on id'
+WHERE EXISTS (SELECT 1 FROM pragma_function_list WHERE name = 'vec_distance_cosine');
 
 -- @query: presets
 SELECT name, description, params FROM _presets ORDER BY name;

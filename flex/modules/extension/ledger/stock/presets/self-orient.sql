@@ -76,10 +76,10 @@ SELECT 'add' AS operation,
        'INSERT INTO annotations(annotation_id,note,target_cell_id,target_chunk_id,wing,hall,room,weight,author_provider,author_session_id,author_source) VALUES(:annotation_id,:note,:target_cell_id,:target_chunk_id,:wing,:hall,:room,:weight,:author_provider,:author_session_id,:author_source) RETURNING annotation_id,target_cell_id,target_chunk_id' AS sql
 UNION ALL
 SELECT 'revise',
-       'UPDATE annotations SET note=:note,wing=:wing,hall=:hall,room=:room,weight=:weight,author_provider=:author_provider,author_session_id=:author_session_id,author_source=:author_source WHERE target_cell_id=:target_cell_id AND target_chunk_id=:target_chunk_id RETURNING annotation_id'
+       'UPDATE annotations SET note=:note,wing=:wing,hall=:hall,room=:room,weight=:weight,author_provider=:author_provider,author_session_id=:author_session_id,author_source=:author_source WHERE target_cell_id=:target_cell_id AND target_chunk_id=:target_chunk_id AND target_end_chunk_id IS NULL RETURNING annotation_id'
 UNION ALL
 SELECT 'remove',
-       'DELETE FROM annotations WHERE target_cell_id=:target_cell_id AND target_chunk_id=:target_chunk_id RETURNING annotation_id,target_cell_id,target_chunk_id';
+       'DELETE FROM annotations WHERE target_cell_id=:target_cell_id AND target_chunk_id=:target_chunk_id AND target_end_chunk_id IS NULL RETURNING annotation_id,target_cell_id,target_chunk_id';
 
 -- @query: limitations
 SELECT 'persistence' AS boundary,

@@ -265,6 +265,33 @@ def _code(entry: FileEntry, text: str, digest: str) -> ExtractionResult:
     )
 
 
+def _sql(entry: FileEntry, text: str, digest: str) -> ExtractionResult:
+    """One chunk per `-- @query: name` block (multi-query presets), else one per file.
+
+    Lines before the first block (the preset's @name/@description/@params
+    header) belong to the first chunk, so each chunk reads on its own.
+    """
+    lines = text.splitlines(keepends=True)
+    starts = [i for i, line in enumerate(lines) if line.lstrip().startswith("-- @query:")]
+    if len(starts) < 2:
+        blocks = [(entry.path.name, text)]
+    else:
+        bounds = [0, *starts[1:], len(lines)]
+        blocks = []
+        for n, (a, b) in enumerate(zip(bounds, bounds[1:])):
+            name = lines[starts[n]].split("-- @query:", 1)[1].strip() or entry.path.name
+            blocks.append((f"{entry.path.name} > {name}", "".join(lines[a:b])))
+    chunks = tuple(
+        _chunk(entry.source_id, body, position, chunk_kind="sql", title=title,
+               section_type="sql", language="sql")
+        for position, (title, body) in enumerate(blocks) if body.strip()
+    )
+    return ExtractionResult(
+        entry.source_id, str(entry.path), entry.path.name, "sql", "indexed", "ok",
+        digest, entry.size_bytes, entry.mtime_ns, chunks,
+    )
+
+
 def extract_file(entry: FileEntry) -> ExtractionResult:
     """Extract one discovered file without touching SQLite or embedding state."""
     try:
@@ -291,6 +318,8 @@ def extract_file(entry: FileEntry) -> ExtractionResult:
         return _markdown(entry, text, digest)
     if entry.file_kind == "code":
         return _code(entry, text, digest)
+    if entry.file_kind == "sql":
+        return _sql(entry, text, digest)
     chunk = _chunk(
         entry.source_id, text, 0, chunk_kind="text", title=entry.path.name,
         section_type="text", language=entry.path.suffix.lower().lstrip(".") or None,

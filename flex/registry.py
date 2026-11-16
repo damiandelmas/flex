@@ -311,8 +311,14 @@ def register_cell(
     detector_config: str | None = None,
     allow_external: bool | int | None = None,
     cell_id: str | None = None,
+    publish: bool = False,
 ) -> str:
     """Register or update a cell in the registry.
+
+    Registration does not publish. A new cell is unlisted (hidden from the
+    flex tool and other discovery surfaces) unless ``publish=True`` or an
+    explicit ``unlisted`` is given. ``publish`` affects only a new row, so
+    re-registering an existing cell never re-publishes one that was hidden.
 
     Auto-detects cell_type and description from cell's schema if not provided.
     Lifecycle params control how the daemon keeps the cell fresh:
@@ -348,6 +354,19 @@ def register_cell(
             cell_type = detected_type
         if description is None:
             description = detected_desc
+
+    if existing is None and unlisted is None:
+        unlisted = not publish
+
+    # Publishing is checked: a cell reaches the flex tool only if it is a
+    # self-describing flex cell. A failing cell is still registered (services
+    # can resolve it by name) but stays hidden, with the reason on stderr.
+    if unlisted is not None and not unlisted:
+        reason = _publish_refusal(Path(path_str))
+        if reason:
+            print(f"[registry] {name}: not published ({reason}); registered unlisted",
+                  file=sys.stderr)
+            unlisted = True if existing is None else None
 
     # Check if cell already has an id
     if existing and existing['id']:
@@ -417,6 +436,33 @@ def unregister_cell(name: str) -> bool:
     deleted = cursor.rowcount > 0
     db.close()
     return deleted
+
+
+def _publish_refusal(p: Path) -> str | None:
+    """Why the cell at ``p`` cannot be published, or None if it can.
+
+    A publishable cell exists, opens read-only and carries ``_meta`` (a table
+    or a view), which every self-describing flex cell has. A cell that is only
+    busy (locked by a writer) is given the benefit of the doubt.
+    """
+    if not p.exists():
+        return "file not found"
+    try:
+        db = sqlite3.connect(f"file:{p}?mode=ro", uri=True, timeout=2)
+        try:
+            row = db.execute(
+                "SELECT 1 FROM sqlite_master "
+                "WHERE type IN ('table', 'view') AND name = '_meta'"
+            ).fetchone()
+        finally:
+            db.close()
+    except sqlite3.OperationalError as e:
+        if "locked" in str(e) or "busy" in str(e):
+            return None
+        return f"cannot open: {e}"
+    except sqlite3.Error as e:
+        return f"cannot open: {e}"
+    return None if row else "no _meta; not a flex cell"
 
 
 def _is_safe_cell_path(p: Path) -> bool:

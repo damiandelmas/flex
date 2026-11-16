@@ -85,5 +85,5 @@ You can add local instruction notes without editing the package:
 ~/.flex/instructions/obsidian.md
 ```
 
-Those files appear in the `cell_docs` block of `@orient` along with this
-module's packaged instructions.
+Those files are local notes about the vault; `@orient` does not list them.
+This module's packaged instructions are installed with the cell.

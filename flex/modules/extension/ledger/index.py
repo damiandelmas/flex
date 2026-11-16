@@ -7,12 +7,16 @@ import re
 import sqlite3
 
 from flex.retrieve.flexpresets import _strip_sql
+from .graph import (
+    NODES as GRAPH_NODES, EDGES as GRAPH_EDGES, VERTICES, EDGE_TABLE,
+    clear_graph, install_graph,
+)
 
 
 CARDS = "_ledger_index_cards"
 RELATIONS = "_ledger_index_relations"
 STATE = "_ledger_index_state"
-_MARKERS = (CARDS, RELATIONS)
+_MARKERS = (CARDS, RELATIONS, GRAPH_NODES, GRAPH_EDGES, VERTICES, EDGE_TABLE)
 
 
 def _references_index(sql: str) -> bool:
@@ -76,7 +80,7 @@ def _install_cards(db: sqlite3.Connection, signature: str) -> None:
             0
         FROM _flex_self_objects s
         JOIN annotations a
-          ON s.target_object_type='object'
+          ON s.target_object_type IN ('object','session')
          AND a.target_cell_id=s.target_cell_id
          AND a.target_chunk_id=s.target_object_id
         WHERE NOT EXISTS (
@@ -98,6 +102,7 @@ def _install_cards(db: sqlite3.Connection, signature: str) -> None:
             target_cell_id TEXT,
             target_cell_name TEXT,
             target_chunk_id TEXT,
+            target_end_chunk_id TEXT,
             annotation_id TEXT,
             revision INTEGER,
             source_order INTEGER,
@@ -175,14 +180,14 @@ def _install_cards(db: sqlite3.Connection, signature: str) -> None:
         FROM _flex_self_objects s
         LEFT JOIN _flex_self_content c ON c.selection_id=s.selection_id
         LEFT JOIN annotations a
-          ON a.target_cell_id=c.target_cell_id
-         AND a.target_chunk_id=c.target_object_id
+          ON a.target_cell_id=s.target_cell_id
+         AND (a.target_chunk_id=c.target_object_id OR a.target_chunk_id=s.target_object_id)
         GROUP BY s.selection_id;
 
         INSERT OR IGNORE INTO {CARDS}(
             address,parent_address,position,label,index_kind,captured_role,
             summary,native_source_address,target_cell_id,target_cell_name,
-            target_chunk_id,annotation_id,revision,source_order,created_at,
+            target_chunk_id,target_end_chunk_id,annotation_id,revision,source_order,created_at,
             author_provider,author_session_id,wing,hall,room,weight,
             target_readable,tree_depth
         )
@@ -221,6 +226,7 @@ def _install_cards(db: sqlite3.Connection, signature: str) -> None:
             target_cell_id,
             target_cell_name,
             target_chunk_id,
+            target_end_chunk_id,
             annotation_id,
             current_revision,
             source_order,
@@ -236,7 +242,7 @@ def _install_cards(db: sqlite3.Connection, signature: str) -> None:
         INSERT OR IGNORE INTO {CARDS}(
             address,parent_address,position,label,index_kind,captured_role,
             summary,native_source_address,target_cell_id,target_cell_name,
-            target_chunk_id,annotation_id,revision,source_order,created_at,
+            target_chunk_id,target_end_chunk_id,annotation_id,revision,source_order,created_at,
             author_provider,author_session_id,wing,hall,room,weight,
             target_readable,tree_depth
         )
@@ -252,6 +258,7 @@ def _install_cards(db: sqlite3.Connection, signature: str) -> None:
             h.target_cell_id,
             parent.target_cell_name,
             h.target_chunk_id,
+            h.target_end_chunk_id,
             h.annotation_id,
             h.revision,
             parent.source_order,
@@ -340,13 +347,19 @@ def materialize_ledger_index(db: sqlite3.Connection, sql: str) -> str:
         return json.dumps({"error": "Ledger Index requires the Ledger cell as primary"})
     if not _relation_exists(db, "temp", "_flex_self_objects"):
         return json.dumps({"error": "Ledger Index requires a materialized self() scope"})
+    skeleton = _strip_sql(sql)
+    graph_requested = any(
+        re.search(rf"(?<![A-Za-z0-9_]){name}(?![A-Za-z0-9_])", skeleton)
+        for name in (GRAPH_NODES, GRAPH_EDGES, VERTICES, EDGE_TABLE)
+    )
     try:
-        signature = _scope_signature(db)
-        prior = None
-        if _relation_exists(db, "temp", STATE):
-            prior = db.execute(f"SELECT signature FROM {STATE}").fetchone()
-        if not _relation_exists(db, "temp", CARDS) or not prior or prior[0] != signature:
-            _install_cards(db, signature)
-    except sqlite3.DatabaseError as exc:
+        # Roots alone do not capture changed annotation revisions or source state.
+        _install_cards(db, _scope_signature(db))
+        if graph_requested:
+            install_graph(db)
+    except (sqlite3.DatabaseError, ValueError, TypeError) as exc:
+        if graph_requested:
+            # A failed refresh must not leave a previous or partial graph serving.
+            clear_graph(db)
         return json.dumps({"error": f"Ledger Index materialization failed: {exc}"})
     return sql

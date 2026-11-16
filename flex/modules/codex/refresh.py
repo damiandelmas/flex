@@ -138,7 +138,8 @@ def _embed_and_enrich(conn: sqlite3.Connection) -> None:
     conn.commit()
 
 
-def refresh(cell_path: str, graph: bool = False, dry_run: bool = False) -> dict:
+def refresh(cell_path: str, graph: bool = False, dry_run: bool = False,
+            *, semantic: bool = True) -> dict:
     if dry_run:
         uri = f"file:{Path(cell_path)}?mode=ro"
         conn = sqlite3.connect(uri, uri=True, timeout=30.0)
@@ -205,7 +206,7 @@ def refresh(cell_path: str, graph: bool = False, dry_run: bool = False) -> dict:
 
             _record_meta(conn, primary_source, sources, signature)
 
-        if semantic_debt > 0 or total_chunks > 0 or graph:
+        if semantic and (semantic_debt > 0 or total_chunks > 0 or graph):
             _embed_and_enrich(conn)
 
         result = {

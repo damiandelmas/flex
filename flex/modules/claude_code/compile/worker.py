@@ -228,6 +228,29 @@ def serialize_f32(vector) -> bytes:
     return struct.pack(f'{len(vector)}f', *vector)
 
 
+def _peek_vector_contract(conn: sqlite3.Connection):
+    """The tag ``ensure_initial_vector_contract`` would yield, without writing.
+
+    The encode below can sit in an HTTP call for up to its 120 s timeout. The
+    real ensure may write ``_meta``, so it runs right before the UPDATE/INSERT
+    that needs it (see ``_batch_embed_chunks``), never across the call.
+    """
+    from flex.compile.embed import _cell_tag, _has_table
+
+    tag = _cell_tag(conn)
+    if tag is not None:
+        return tag
+    tables = [t for t in ("_raw_chunks", "_raw_sources") if _has_table(conn, t)]
+    if not tables:
+        return None
+    for table in tables:
+        if conn.execute(
+            f"SELECT EXISTS(SELECT 1 FROM {table} WHERE embedding IS NOT NULL)"
+        ).fetchone()[0]:
+            return None
+    return "nomic-v1.5-fp32"
+
+
 def _encode_for_cell(conn: sqlite3.Connection, texts):
     """Embed documents in the vector space declared by this cell's tag.
 
@@ -236,10 +259,11 @@ def _encode_for_cell(conn: sqlite3.Connection, texts):
     silently creates a mixed-width cell on every subsequent watch tick. Keep
     the legacy fast path for untagged/MiniLM cells, but resolve every explicit
     Nomic tag through the same fail-closed ingest resolver as ``embed_new``.
-    """
-    from flex.compile.embed import ensure_initial_vector_contract
 
-    tag = ensure_initial_vector_contract(conn)
+    This only reads the tag. Callers stamp the contract with
+    ``ensure_initial_vector_contract`` immediately before they write vectors.
+    """
+    tag = _peek_vector_contract(conn)
     from flex.semantic_client import service_only_enabled
     if service_only_enabled():
         # The installed HTTP service is the single fp32 model owner.  Capture
@@ -259,8 +283,13 @@ def _encode_for_cell(conn: sqlite3.Connection, texts):
 
     # Explicit compiler/maintenance calls retain the historical in-process
     # path.  This is not a daemon fallback: service-only mode never reaches it.
-    from flex.compile.embed import _resolve_ingest_target
+    from flex.compile.embed import _cell_tag, _resolve_ingest_target
 
+    if tag != _cell_tag(conn):
+        # Fresh cell: the resolver reads the stamped tag. No HTTP call is held
+        # open on this in-process path, so stamping here is safe.
+        from flex.compile.embed import ensure_initial_vector_contract
+        ensure_initial_vector_contract(conn)
     embed_doc = _resolve_ingest_target(conn)[0]
     return embed_doc(texts, batch_size=64)
 
@@ -1452,6 +1481,8 @@ def sync_session_messages(session_id: str, conn: sqlite3.Connection,
         else:
             texts = [c['content'] for c in new_chunks]
             embeddings = _encode_for_cell(conn, texts)
+            from flex.compile.embed import ensure_initial_vector_contract
+            ensure_initial_vector_contract(conn)
 
             for chunk, emb in zip(new_chunks, embeddings):
                 try:
@@ -1860,7 +1891,7 @@ def bootstrap_claude_code_cell(
     conn.commit()
     conn.close()
 
-    register_cell(name, str(db_path), cell_type=cell_type, description=desc)
+    register_cell(name, str(db_path), cell_type=cell_type, description=desc, publish=True)
     return db_path
 
 
@@ -1911,14 +1942,18 @@ def _batch_embed_chunks(conn, batch_size: int = 500, quiet: bool = False,
     t0 = time.time()
     _rate: float | None = None   # measured chunks/s (EMA); sizes batches to the deadline
 
-    total = conn.execute(
-        "SELECT count(*) FROM _raw_chunks WHERE embedding IS NULL AND content IS NOT NULL"
-    ).fetchone()[0]
-    # Bounded calls report against the selected work allowance, not the
-    # global backlog — a capped sweep must never claim it will finish the
-    # whole backlog in this call.
-    if max_chunks is not None:
-        total = min(total, max_chunks)
+    # The full count scans every NULL row; only pay for it when someone reports it.
+    total = 0
+    if progress_cb or not quiet:
+        total = conn.execute(
+            "SELECT count(*) FROM _raw_chunks WHERE embedding IS NULL AND content IS NOT NULL"
+        ).fetchone()[0]
+        # Bounded calls report against the selected work allowance, not the
+        # global backlog — a capped sweep must never claim it will finish the
+        # whole backlog in this call.
+        if max_chunks is not None:
+            total = min(total, max_chunks)
+    batches = 0
 
     if progress_cb:
         progress_cb(0, total)
@@ -1964,19 +1999,24 @@ def _batch_embed_chunks(conn, batch_size: int = 500, quiet: bool = False,
                     break      # not even one chunk fits: yield, resume next tick
                 limit = min(limit, _fits)
 
-        # Newest first. A chunk id is "{source_id}:{position}:{sha256[:12]}", so
+        # Newest first on even batches, oldest first on odd ones, so a long
+        # backlog is reached from both ends within one budget. A chunk id is "{source_id}:{position}:{sha256[:12]}", so
         # ORDER BY id is a content hash — effectively random with respect to time,
         # which left a ten-minute-old session queued behind days of stale backlog.
         # Recency is what an agent actually searches; drain the useful end first and
         # let the tail trickle. (Dimension is not a lever here: Nomic is Matryoshka,
         # truncating after the full 768d forward pass, so a narrower vector costs the
         # same to produce. Priority is the only axis that buys anything.)
-        rows = conn.execute("""
+        # The WHERE must match idx_raw_chunks_null_embedding exactly (see
+        # lifecycle_jobs._semantic) for the planner to use the partial index.
+        order = "DESC" if batches % 2 == 0 else "ASC"
+        rows = conn.execute(f"""
             SELECT id, content FROM _raw_chunks
             WHERE embedding IS NULL AND content IS NOT NULL
-            ORDER BY timestamp DESC
+            ORDER BY timestamp {order}
             LIMIT ?
         """, (limit,)).fetchall()
+        batches += 1
 
         if not rows:
             break
@@ -1986,14 +2026,21 @@ def _batch_embed_chunks(conn, batch_size: int = 500, quiet: bool = False,
         embeddings = _enc(texts) if _enc is not None else _encode_for_cell(conn, texts)
         _batch_s = time.time() - _batch_t0
 
-        conn.executemany(
-            "UPDATE _raw_chunks SET embedding = ? WHERE id = ?",
-            [(serialize_f32(emb), r[0]) for emb, r in zip(embeddings, rows)]
-        )
+        if _enc is None:
+            # Stamp the contract after the encode, in the write transaction only.
+            from flex.compile.embed import ensure_initial_vector_contract
+            ensure_initial_vector_contract(conn)
+        # Publish only into the row as selected: one replaced or embedded by
+        # another writer during the encode keeps its own state.
+        _written = conn.executemany(
+            "UPDATE _raw_chunks SET embedding = ? "
+            "WHERE id = ? AND embedding IS NULL AND content = ?",
+            [(serialize_f32(emb), r[0], r[1]) for emb, r in zip(embeddings, rows)]
+        ).rowcount
         from flex.retrieve.vector_generation import bump_vector_generation
         bump_vector_generation(conn, "_raw_chunks")
         conn.commit()
-        done += len(rows)
+        done += _written if _written is not None and _written >= 0 else len(rows)
 
         # Track throughput so the NEXT batch can be sized to the time left. EMA,
         # not last-batch: one atypically long chunk should bias the estimate, not
@@ -2612,8 +2659,8 @@ def _drain_ready_invalidations(conn, invalidation_queue, size_cache, error_cache
                         semantic_allowed=_event_lease.acquired,
                     )
             else:
-                # The public wheel intentionally excludes the private aggregate
-                # engine adapter. Route Codex through its provider-native path
+                # Without a general provider path drainer,
+                # route Codex through its provider-native path
                 # reconciler instead of the Filesystem fallback, which must not
                 # mutate a coding-agent cell.
                 codex_events = [inv for inv in corpus_events if inv.cell_name == 'codex']
@@ -2639,8 +2686,14 @@ def _drain_ready_invalidations(conn, invalidation_queue, size_cache, error_cache
                     )
             phase_durations['corpus_targeted_sync_s'] = time.time() - _t0
             if event_stats.get('failed', 0):
-                raise RuntimeError(
-                    f"corpus event drain reported {event_stats['failed']} failed path(s)"
+                failed_events = event_stats.get('failed_events')
+                if failed_events is None:
+                    raise RuntimeError(
+                        f"corpus event drain reported {event_stats['failed']} failed path(s)"
+                    )
+                invalidation_queue.requeue(failed_events, reason="handler_failure")
+                invalidation_queue.mark_reconciliation_required(
+                    inv.cell_name for inv in failed_events
                 )
             # Park, don't drop: an event that ran out of budget goes back
             # on the queue with its original observed_at, so it is already
@@ -3190,16 +3243,18 @@ if __name__ == "__main__":
     args = parser.parse_args()
 
     if args.daemon:
-        daemon_loop(interval=args.interval)
+        # Retired provider daemon spelling delegates to the single owner and
+        # its FLEX_HOME instance lock; it cannot launch a second aggregate loop.
+        from flex.daemon import main
+        sys.argv = [sys.argv[0], "--no-refresh", "--no-background",
+                    "--interval", str(args.interval)]
+        main()
     else:
-        cell_path = resolve_cell('claude_code')
-        if not cell_path:
-            print("[worker] FATAL: claude_code cell not found", file=sys.stderr)
+        from flex.lifecycle_jobs import execute_job
+        try:
+            stats = execute_job('claude_code')
+        except Exception as exc:
+            print(f"[worker] {exc}", file=sys.stderr)
             sys.exit(1)
-        conn = sqlite3.connect(str(cell_path), timeout=30.0)
-        conn.execute("PRAGMA journal_mode=WAL")
-        conn.execute("PRAGMA busy_timeout=30000")
-        _ensure_content_tables(conn)
-        stats = scan_primary_cell(conn)
-        conn.close()
         print(f"[worker] Done: {stats}")
+        sys.exit(75 if stats.get('deferred') else 0)

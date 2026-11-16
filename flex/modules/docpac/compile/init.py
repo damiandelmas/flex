@@ -326,8 +326,8 @@ def _mint_batch_identity(db, entries) -> int:
             pairs.append((rp, sid))
         if not pairs:
             return 0
-        from flex.modules.soma.lib.identity.file_identity import get_instance
-        uuids = get_instance().assign_batch([rp for rp, _ in pairs])
+        from flex.modules.identity import get_instance
+        uuids = get_instance(db).assign_batch([rp for rp, _ in pairs])
         db.execute(_FS_IDENTITY_DDL)
         rows = [(sid, uuids.get(rp)) for rp, sid in pairs if uuids.get(rp)]
         if rows:

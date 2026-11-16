@@ -71,7 +71,8 @@ def run(args, console) -> None:
     """Create, populate, register, and teach one mixed filesystem cell."""
     from flex.cli import (
         _install_claude_assets, _install_launchd, _install_systemd,
-        _patch_claude_json, _runtime_setup_enabled, _start_services_direct, _verify_services,
+        _patch_claude_json, _runtime_setup_enabled,
+        _start_services_direct, _verify_services,
     )
     from flex.modules.fs.compile.schema import (
         FILESYSTEM_SCHEMA_DDL, ensure_document_vector_contract,

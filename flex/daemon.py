@@ -262,20 +262,20 @@ def _build_local_watchers():
     return queue, watchers, config
 
 
-def _run_local_worker(*, interval, queue, watcher, reconcile_interval):
-    """Choose the coding-session owner when present, otherwise filesystem-only."""
-    from flex.registry import resolve_cell
+def _lifecycle_workers() -> int:
+    """Child slots for the local lifecycle. A semantic job needs one slot free
+    beyond the rest, so with the former 4 a slow reconcile or two plus a burst
+    of events left embedding with no turn at all."""
+    return max(2, int(os.environ.get("FLEX_LIFECYCLE_WORKERS", "6")))
 
-    if resolve_cell("claude_code"):
-        from flex.modules.claude_code.compile.worker import daemon_loop
-    else:
-        from flex.modules.fs.compile.worker import daemon_loop
-    daemon_loop(
-        interval=interval,
-        invalidation_queue=queue,
-        watcher=watcher,
-        reconcile_interval=reconcile_interval,
-    )
+
+def _run_local_worker(*, interval, queue, watcher, reconcile_interval):
+    """Compatibility entrypoint; provider daemons are no longer schedulers."""
+    from flex.lifecycle_worker import LocalLifecycle
+    owner = LocalLifecycle(queue, reconcile_interval=reconcile_interval or 60,
+                           workers=_lifecycle_workers())
+    owner.watcher = watcher
+    owner.run(interval)
 
 
 def _main():
@@ -333,66 +333,25 @@ def _main():
         )
         t.start()
 
-    # Watch reconciliation is distinct from lifecycle='refresh' pulls.  Keep
-    # it alive for the installed ``--no-refresh`` local worker, but make its
-    # thread a subprocess-only supervisor so it never imports refresh modules.
-    from flex.watch import load_watch_config
-    _watch_config = load_watch_config()
-    t = threading.Thread(
-        target=_module_watch_loop,
-        kwargs={"interval": _watch_config.reconcile_interval},
-        daemon=True,
+    # One local owner for every provider. Detection may be disabled or still
+    # initializing; startup/offline reconciliation never depends on it.
+    from flex.watch import InvalidationQueue, load_watch_config
+    from flex.lifecycle_worker import LocalLifecycle
+    config = load_watch_config()
+    queue = InvalidationQueue(
+        quiet_window=config.quiet_window, max_latency=config.max_latency,
+        max_size=config.queue_max,
     )
-    t.start()
+    owner = LocalLifecycle(queue, reconcile_interval=config.reconcile_interval,
+                           workers=_lifecycle_workers())
 
-    # Structural coding-session capture is independent of general corpus and
-    # semantic scheduling. It opens its own provider connections each tick.
-    t = threading.Thread(
-        target=_codex_structural_tick_loop,
-        name="codex-structural-tick",
-        daemon=True,
-    )
-    t.start()
-
-    # Typed local observers are built before the worker loop and stopped on
-    # every exit path, including signal-driven shutdown.
-    queue, watcher, _watch_config = _build_local_watchers()
-    if queue is not None:
-        t = threading.Thread(
-            target=_filesystem_debt_tick_loop,
-            args=(queue,),
-            name="filesystem-debt-tick",
-            daemon=True,
-        )
-        t.start()
-
-    def _shutdown_watcher(signum=None, frame=None):
-        if watcher is not None:
-            watcher.stop()
-        if signum is not None:
-            sys.exit(0)
+    def _shutdown(signum=None, frame=None):
+        owner.stopping.set()
 
     import signal
-    signal.signal(signal.SIGTERM, _shutdown_watcher)
-    signal.signal(signal.SIGINT, _shutdown_watcher)
-
-    # Main thread: local cell scan (blocks if module available)
-    try:
-        _run_local_worker(
-            interval=args.interval,
-            queue=queue,
-            watcher=watcher,
-            reconcile_interval=_watch_config.reconcile_interval if queue else None,
-        )
-    except ImportError:
-        print("[flex-daemon] no local worker installed — running background services only",
-              file=sys.stderr)
-        # Block main thread so daemon stays alive for background services
-        import time
-        while True:
-            time.sleep(60)
-    finally:
-        _shutdown_watcher()
+    signal.signal(signal.SIGTERM, _shutdown)
+    signal.signal(signal.SIGINT, _shutdown)
+    owner.run(args.interval)
 
 
 def main():

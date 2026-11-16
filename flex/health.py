@@ -295,6 +295,25 @@ def claude_watch_state(cell_name: str = 'claude_code', *, cell_path=None) -> dic
     """
     from flex.core import get_meta, open_cell_readonly
 
+    # The shared lifecycle owner supersedes provider-local daemon telemetry.
+    # Exact paths prevent a scratch-cell query from inheriting live health.
+    status_path = Path(os.environ.get("FLEX_HOME", Path.home() / ".flex")) / "lifecycle-status.json"
+    try:
+        status = json.loads(status_path.read_text())
+        scoped = status.get("cells", {}).get(cell_name)
+        if scoped and (cell_path is None or Path(scoped["path"]).resolve() == Path(cell_path).resolve()):
+            result = dict(_UNKNOWN_WATCH_STATE)
+            result.update({k: v for k, v in status.items() if k != "cells"})
+            result.update(known=True, last_reconcile_ts=scoped.get("last_reconcile_ts"))
+            if time.time() - float(status.get("updated_at") or 0) > 30:
+                result.update(healthy=False, last_error="local lifecycle heartbeat stale")
+            elif status.get("initializing"):
+                result.update(healthy=False, last_error="event detector initializing; reconciliation independent")
+            result["reconciliation_required"] = bool(scoped.get("retry_at"))
+            return result
+    except (OSError, ValueError, TypeError, KeyError):
+        pass
+
     path = cell_path
     if path is None:
         from flex.registry import resolve_cell

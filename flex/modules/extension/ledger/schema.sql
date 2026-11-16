@@ -30,6 +30,7 @@ CREATE TABLE IF NOT EXISTS _types_annotation (
     author_provider   TEXT,
     author_session_id TEXT,
     author_source     TEXT,
+    metadata          TEXT CHECK (metadata IS NULL OR json_valid(metadata)),
     updated_at  INTEGER NOT NULL
 );
 
@@ -37,8 +38,14 @@ CREATE TABLE IF NOT EXISTS _edges_annotation_target (
     chunk_id        TEXT PRIMARY KEY REFERENCES _raw_chunks(id),
     target_cell_id  TEXT NOT NULL,
     target_chunk_id TEXT NOT NULL,
-    UNIQUE (target_cell_id, target_chunk_id)
+    target_end_chunk_id TEXT CHECK (
+        target_end_chunk_id IS NULL OR
+        (length(target_end_chunk_id) > 0 AND target_end_chunk_id <> target_chunk_id)
+    )
 );
+
+CREATE UNIQUE INDEX IF NOT EXISTS annotation_exact_target
+    ON _edges_annotation_target(target_cell_id, target_chunk_id, COALESCE(target_end_chunk_id, ''));
 
 CREATE INDEX IF NOT EXISTS annotation_target_cell
     ON _edges_annotation_target(target_cell_id);
@@ -62,9 +69,11 @@ CREATE TABLE IF NOT EXISTS annotation_revisions (
     author_provider   TEXT,
     author_session_id TEXT,
     author_source     TEXT,
+    metadata          TEXT CHECK (metadata IS NULL OR json_valid(metadata)),
     created_at        INTEGER NOT NULL,
     preserved_at      INTEGER NOT NULL,
     operation         TEXT NOT NULL CHECK (operation IN ('superseded','removed')),
+    target_end_chunk_id TEXT,
     PRIMARY KEY (annotation_id, revision)
 );
 
@@ -112,7 +121,9 @@ SELECT
         SELECT MAX(r.revision) + 1
         FROM annotation_revisions r
         WHERE r.annotation_id = c.id
-    ), 1) AS current_revision
+    ), 1) AS current_revision,
+    t.metadata,
+    e.target_end_chunk_id
 FROM _raw_chunks c
 JOIN _types_annotation t ON t.chunk_id = c.id
 JOIN _edges_annotation_target e ON e.chunk_id = c.id;
@@ -134,7 +145,9 @@ SELECT
     created_at,
     preserved_at,
     operation,
-    0 AS is_current
+    0 AS is_current,
+    metadata,
+    target_end_chunk_id
 FROM annotation_revisions
 UNION ALL
 SELECT
@@ -153,7 +166,9 @@ SELECT
     updated_at AS created_at,
     NULL AS preserved_at,
     'current' AS operation,
-    1 AS is_current
+    1 AS is_current,
+    metadata,
+    target_end_chunk_id
 FROM annotations;
 
 -- `annotations` is the authored SQL contract. The physical envelope remains
@@ -161,8 +176,6 @@ FROM annotations;
 CREATE TRIGGER IF NOT EXISTS annotations_insert
 INSTEAD OF INSERT ON annotations BEGIN
     SELECT CASE
-        WHEN NEW.annotation_id IS NULL
-        THEN RAISE(ABORT, 'annotation identity is required')
         WHEN NEW.target_cell_id IS NULL OR NEW.target_chunk_id IS NULL
         THEN RAISE(ABORT, 'annotation target identity is required')
         WHEN NEW.note IS NULL
@@ -170,15 +183,25 @@ INSTEAD OF INSERT ON annotations BEGIN
     END;
     INSERT INTO _raw_chunks(id, content, timestamp)
     VALUES (
-        NEW.annotation_id,
+        COALESCE(NEW.annotation_id,
+            (SELECT r.annotation_id FROM annotation_revisions r
+             WHERE r.target_cell_id=NEW.target_cell_id AND r.target_chunk_id=NEW.target_chunk_id
+               AND r.target_end_chunk_id IS NEW.target_end_chunk_id
+             ORDER BY r.preserved_at DESC, r.revision DESC LIMIT 1),
+            json_array(NEW.target_cell_id, NEW.target_chunk_id, NEW.target_end_chunk_id)),
         NEW.note,
         COALESCE(NEW.created_at, CAST(strftime('%s','now') AS INTEGER))
     );
     INSERT INTO _types_annotation(
         chunk_id, wing, hall, room, weight,
-        author_provider, author_session_id, author_source, updated_at
+        author_provider, author_session_id, author_source, updated_at, metadata
     ) VALUES (
-        NEW.annotation_id,
+        COALESCE(NEW.annotation_id,
+            (SELECT r.annotation_id FROM annotation_revisions r
+             WHERE r.target_cell_id=NEW.target_cell_id AND r.target_chunk_id=NEW.target_chunk_id
+               AND r.target_end_chunk_id IS NEW.target_end_chunk_id
+             ORDER BY r.preserved_at DESC, r.revision DESC LIMIT 1),
+            json_array(NEW.target_cell_id, NEW.target_chunk_id, NEW.target_end_chunk_id)),
         NEW.wing,
         COALESCE(NEW.hall, 'discoveries'),
         NEW.room,
@@ -186,20 +209,31 @@ INSTEAD OF INSERT ON annotations BEGIN
         NEW.author_provider,
         NEW.author_session_id,
         NEW.author_source,
-        COALESCE(NEW.updated_at, CAST(strftime('%s','now') AS INTEGER))
+        COALESCE(NEW.updated_at, CAST(strftime('%s','now') AS INTEGER)),
+        NEW.metadata
     );
     INSERT INTO _edges_annotation_target(
-        chunk_id, target_cell_id, target_chunk_id
+        chunk_id, target_cell_id, target_chunk_id, target_end_chunk_id
     ) VALUES (
-        NEW.annotation_id,
+        COALESCE(NEW.annotation_id,
+            (SELECT r.annotation_id FROM annotation_revisions r
+             WHERE r.target_cell_id=NEW.target_cell_id AND r.target_chunk_id=NEW.target_chunk_id
+               AND r.target_end_chunk_id IS NEW.target_end_chunk_id
+             ORDER BY r.preserved_at DESC, r.revision DESC LIMIT 1),
+            json_array(NEW.target_cell_id, NEW.target_chunk_id, NEW.target_end_chunk_id)),
         NEW.target_cell_id,
-        NEW.target_chunk_id
+        NEW.target_chunk_id,
+        NEW.target_end_chunk_id
     );
 END;
 
 CREATE TRIGGER IF NOT EXISTS annotations_update
 INSTEAD OF UPDATE ON annotations
-WHEN NEW.note IS NOT OLD.note
+WHEN NEW.annotation_id IS NOT OLD.annotation_id
+  OR NEW.target_cell_id IS NOT OLD.target_cell_id
+  OR NEW.target_chunk_id IS NOT OLD.target_chunk_id
+  OR NEW.target_end_chunk_id IS NOT OLD.target_end_chunk_id
+  OR NEW.note IS NOT OLD.note
   OR NEW.wing IS NOT OLD.wing
   OR NEW.hall IS NOT OLD.hall
   OR NEW.room IS NOT OLD.room
@@ -207,11 +241,13 @@ WHEN NEW.note IS NOT OLD.note
   OR NEW.author_provider IS NOT OLD.author_provider
   OR NEW.author_session_id IS NOT OLD.author_session_id
   OR NEW.author_source IS NOT OLD.author_source
+  OR NEW.metadata IS NOT OLD.metadata
 BEGIN
     SELECT CASE
         WHEN NEW.annotation_id IS NOT OLD.annotation_id
           OR NEW.target_cell_id IS NOT OLD.target_cell_id
           OR NEW.target_chunk_id IS NOT OLD.target_chunk_id
+          OR NEW.target_end_chunk_id IS NOT OLD.target_end_chunk_id
         THEN RAISE(ABORT, 'annotation identity and target are immutable')
         WHEN NEW.note IS NULL
         THEN RAISE(ABORT, 'annotation note is required')
@@ -219,13 +255,14 @@ BEGIN
     INSERT INTO annotation_revisions(
         annotation_id, revision, target_cell_id, target_chunk_id, note,
         wing, hall, room, weight, author_provider, author_session_id,
-        author_source, created_at, preserved_at, operation
+        author_source, created_at, preserved_at, operation, metadata, target_end_chunk_id
     ) VALUES (
         OLD.annotation_id, OLD.current_revision,
         OLD.target_cell_id, OLD.target_chunk_id, OLD.note,
         OLD.wing, OLD.hall, OLD.room, OLD.weight,
         OLD.author_provider, OLD.author_session_id, OLD.author_source,
-        OLD.updated_at, CAST(strftime('%s','now') AS INTEGER), 'superseded'
+        OLD.updated_at, CAST(strftime('%s','now') AS INTEGER), 'superseded',
+        OLD.metadata, OLD.target_end_chunk_id
     );
     UPDATE _raw_chunks
        SET content = NEW.note
@@ -239,6 +276,7 @@ BEGIN
            author_provider = NEW.author_provider,
            author_session_id = NEW.author_session_id,
            author_source = NEW.author_source,
+           metadata = NEW.metadata,
            updated_at = CASE
                WHEN NEW.updated_at IS OLD.updated_at
                THEN CAST(strftime('%s','now') AS INTEGER)
@@ -252,13 +290,14 @@ INSTEAD OF DELETE ON annotations BEGIN
     INSERT INTO annotation_revisions(
         annotation_id, revision, target_cell_id, target_chunk_id, note,
         wing, hall, room, weight, author_provider, author_session_id,
-        author_source, created_at, preserved_at, operation
+        author_source, created_at, preserved_at, operation, metadata, target_end_chunk_id
     ) VALUES (
         OLD.annotation_id, OLD.current_revision,
         OLD.target_cell_id, OLD.target_chunk_id, OLD.note,
         OLD.wing, OLD.hall, OLD.room, OLD.weight,
         OLD.author_provider, OLD.author_session_id, OLD.author_source,
-        OLD.updated_at, CAST(strftime('%s','now') AS INTEGER), 'removed'
+        OLD.updated_at, CAST(strftime('%s','now') AS INTEGER), 'removed',
+        OLD.metadata, OLD.target_end_chunk_id
     );
     DELETE FROM _edges_annotation_target WHERE chunk_id = OLD.annotation_id;
     DELETE FROM _types_annotation WHERE chunk_id = OLD.annotation_id;

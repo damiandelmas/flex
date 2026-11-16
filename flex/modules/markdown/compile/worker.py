@@ -223,7 +223,8 @@ def _cleanup_stale(db, vault_root: Path, current_paths: set):
     return removed
 
 
-def scan_markdown_cells(embed_fn=None, deadline: float | None = None) -> dict:
+def scan_markdown_cells(embed_fn=None, deadline: float | None = None,
+                        *, cell_names=None) -> dict:
     """Called by the daemon on the 2-second tick.
 
     For each registered markdown/obsidian cell with lifecycle='watch':
@@ -244,10 +245,10 @@ def scan_markdown_cells(embed_fn=None, deadline: float | None = None) -> dict:
     # not the freshness path — see _VAULT_RECONCILE_INTERVAL_S. Running it on every
     # 2s tick put a multi-minute rglob in the middle of the daemon's serial loop.
     now_mono = time.monotonic()
-    if _last_vault_scan is None:
+    if cell_names is None and _last_vault_scan is None:
         _last_vault_scan = now_mono   # start the clock; do not walk on the first tick
         return stats
-    if now_mono - _last_vault_scan < _VAULT_RECONCILE_INTERVAL_S:
+    if cell_names is None and now_mono - _last_vault_scan < _VAULT_RECONCILE_INTERVAL_S:
         return stats
     _last_vault_scan = now_mono
 
@@ -257,7 +258,8 @@ def scan_markdown_cells(embed_fn=None, deadline: float | None = None) -> dict:
     md_cells = [c for c in watched
                 if c.get('cell_type') in ('markdown', 'obsidian', 'docpac')
                 and profile_name_for_cell(c) in ('markdown', 'obsidian')
-                and c.get('watch_path')]
+                and c.get('watch_path')
+                and (cell_names is None or c.get('name') in cell_names)]
 
     for cell in md_cells:
         cell_name = cell['name']

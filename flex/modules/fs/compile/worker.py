@@ -50,6 +50,20 @@ DEFAULT_CANDIDATE_EMBED_CHUNKS = 512
 _process_cache: dict[str, dict[str, str]] = {}
 
 
+FULL_VERIFY_KEY = "fs:last_full_verify"
+FULL_VERIFY_INTERVAL_S = 24 * 3600
+
+
+def _full_verify_due(conn, now: float | None = None) -> bool:
+    row = conn.execute("SELECT value FROM _meta WHERE key=?", (FULL_VERIFY_KEY,)).fetchone()
+    try:
+        last = float(row[0])
+    except (TypeError, ValueError, IndexError):
+        return True
+    now = time.time() if now is None else now
+    return not (0 <= now - last < FULL_VERIFY_INTERVAL_S)
+
+
 def _bool_meta(conn, key: str, default: bool = False) -> bool:
     row = conn.execute("SELECT value FROM _meta WHERE key=?", (key,)).fetchone()
     if not row:
@@ -109,8 +123,13 @@ def reconcile_cell(conn: sqlite3.Connection, root: Path, *, embed_fn=None,
                    obsidian: bool | None = None, exclude=(),
                    file_kinds: tuple[str, ...] | None = None,
                    sidecar_callback: SidecarCallback | None = None,
-                   defer_wikilinks: bool = False) -> dict[str, int]:
-    """Converge one cell with disk; durable source state outranks process caches."""
+                   defer_wikilinks: bool = False,
+                   embed_enabled: bool | None = None) -> dict[str, int]:
+    """Converge one cell with disk; durable source state outranks process caches.
+
+    ``embed_enabled=False`` publishes structure only and leaves new chunks'
+    vectors as NULL debt for the semantic drain, as the event path does.
+    """
     ensure_schema(conn)
     conn.commit()
     root = Path(root).expanduser().resolve()
@@ -119,7 +138,9 @@ def reconcile_cell(conn: sqlite3.Connection, root: Path, *, embed_fn=None,
     cache = process_cache if process_cache is not None else {}
     use_obsidian = _bool_meta(conn, "obsidian") if obsidian is None else obsidian
     entries = [
-        entry for entry in walk_files(root, exclude=tuple(exclude))
+        entry for entry in walk_files(
+            root, exclude=tuple(exclude), file_kinds=file_kinds,
+        )
         if file_kinds is None or entry.file_kind in file_kinds
     ]
     latch_adapter = _latch_adapter(conn)
@@ -142,16 +163,30 @@ def reconcile_cell(conn: sqlite3.Connection, root: Path, *, embed_fn=None,
     }
     stats = _empty_stats()
     failures = []
+    full_verify = _full_verify_due(conn)
+    if full_verify:
+        # Stamp the attempt first: on a large cell the full verify can outlast
+        # the lifecycle child's timeout, and an unstamped killed verify would
+        # repeat on every pass and never converge. A cut-short verify waits
+        # its interval like a completed one.
+        conn.execute(
+            "INSERT OR REPLACE INTO _meta(key,value) VALUES(?,?)",
+            (FULL_VERIFY_KEY, str(int(time.time()))),
+        )
+        conn.commit()
     batch_wikilinks = defer_wikilinks and sidecar_callback is None
     wikilinks_dirty = False
 
     for entry in entries:
         sig = _signature(entry)
-        # A missing process cache entry means process restart: hash through the
-        # writer even when size/mtime equals durable state, so offline edits are
-        # never blessed as a new in-memory baseline.
+        # Default passes trust durable state: a file whose (size, mtime,
+        # profile_version) match its state row is skipped, in any process.
+        # That cannot see an offline edit that preserves size and mtime, so
+        # the same hash-through-the-writer check runs as a bounded periodic
+        # full verify (``fs:last_full_verify`` older than FULL_VERIFY_INTERVAL_S
+        # or missing), after which the timestamp is recorded.
         if (sidecar_callback is None
-                and cache.get(entry.source_id) == sig
+                and not full_verify
                 and durable.get(entry.source_id, ())[:3] == (
                     entry.size_bytes, entry.mtime_ns, DOCUMENT_PROFILE_VERSION,
                 )):
@@ -159,8 +194,8 @@ def reconcile_cell(conn: sqlite3.Connection, root: Path, *, embed_fn=None,
             continue
         try:
             outcome = index_file(
-                conn, entry, embed_fn=embed_fn, obsidian=use_obsidian,
-                sidecar_callback=sidecar_callback,
+                conn, entry, embed_fn=embed_fn, embed_enabled=embed_enabled,
+                obsidian=use_obsidian, sidecar_callback=sidecar_callback,
                 _defer_wikilinks=batch_wikilinks,
             )
             stats[outcome.status] += 1
@@ -617,9 +652,16 @@ def scan_filesystem_cells(cell_names=None) -> dict[str, int]:
                 kinds_value = _json_meta(conn, "file_kinds", None)
                 file_kinds = tuple(kinds_value) if isinstance(kinds_value, list) else None
                 cache = _process_cache.setdefault(name, {})
+                # Lifecycle reconcile publishes structure only: inline embedding
+                # of new files (a large transcript is many chunks at ~10/s) used
+                # the whole 300 s child budget, so recall recorded no new file
+                # and restarted on the same ones every pass.
                 stats = reconcile_cell(
                     conn, Path(root_value), process_cache=cache, exclude=exclude,
-                    file_kinds=file_kinds,
+                    file_kinds=file_kinds, embed_enabled=False,
+                    # Resolve wikilinks once per pass, not per new file: each
+                    # per-file resolution read a whole table (~30 s on recall).
+                    defer_wikilinks=True,
                 )
             signature, high_water = _state_signature(conn)
             mark_refresh_committed(

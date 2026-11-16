@@ -11,10 +11,13 @@ from pathlib import Path
 
 MARKDOWN_EXTENSIONS = {".md", ".markdown"}
 CODE_EXTENSIONS = {".py", ".js", ".jsx", ".ts", ".tsx", ".mjs", ".cjs"}
+# SQL is its own kind so a cell can index saved queries without enabling the
+# broad `text` kind (which would also take .env, .json, .yaml, ...).
+SQL_EXTENSIONS = {".sql"}
 TEXT_EXTENSIONS = {
     ".txt", ".rst", ".mdx", ".json", ".jsonl", ".yaml", ".yml", ".toml",
     ".ini", ".cfg", ".conf", ".csv", ".tsv", ".xml", ".html", ".htm",
-    ".css", ".scss", ".sql", ".sh", ".bash", ".zsh", ".fish", ".env",
+    ".css", ".scss", ".sh", ".bash", ".zsh", ".fish", ".env",
     ".properties", ".graphql", ".gql", ".proto", ".dockerfile",
 }
 
@@ -51,6 +54,8 @@ def _kind_for(path: Path, size: int, max_file_bytes: int) -> str | None:
         return "markdown"
     if suffix in CODE_EXTENSIONS:
         return "code"
+    if suffix in SQL_EXTENSIONS:
+        return "sql"
     if suffix in TEXT_EXTENSIONS or path.name.lower() in {"dockerfile", "makefile"}:
         return "text"
     try:
@@ -134,9 +139,25 @@ def entries_for_paths(root: Path, paths, *, exclude: tuple[str, ...] = (),
     return tuple(entries[source_id] for source_id in sorted(entries))
 
 
+def _extension_rejected(name: str, file_kinds) -> bool:
+    """Cheaply reject names whose kind cannot be in ``file_kinds`` (no stat)."""
+    suffix = os.path.splitext(name)[1].lower()
+    if suffix in MARKDOWN_EXTENSIONS:
+        return "markdown" not in file_kinds
+    if suffix in CODE_EXTENSIONS:
+        return "code" not in file_kinds
+    if suffix in SQL_EXTENSIONS:
+        return "sql" not in file_kinds
+    return "text" not in file_kinds
+
+
 def walk_files(root: Path, *, exclude: tuple[str, ...] = (),
-               max_file_bytes: int = DEFAULT_MAX_FILE_BYTES):
-    """Yield supported files in stable root-relative order without following links."""
+               max_file_bytes: int = DEFAULT_MAX_FILE_BYTES,
+               file_kinds: tuple[str, ...] | None = None):
+    """Yield supported files in stable root-relative order without following links.
+
+    ``file_kinds`` rejects non-matching names by extension before any stat.
+    """
     root = Path(root).expanduser().resolve()
     if not root.is_dir():
         raise ValueError(f"filesystem root is not a readable directory: {root}")
@@ -147,6 +168,8 @@ def walk_files(root: Path, *, exclude: tuple[str, ...] = (),
             if name not in DEFAULT_PRUNE_DIRS and not (base / name).is_symlink()
         )
         for name in sorted(filenames):
+            if file_kinds is not None and _extension_rejected(name, file_kinds):
+                continue
             entry = entry_for_path(
                 root, base / name, exclude=tuple(exclude), max_file_bytes=max_file_bytes,
             )

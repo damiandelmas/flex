@@ -4,6 +4,100 @@ Public changes to **flex** ([getflex.dev](https://getflex.dev)).
 
 ---
 
+## 0.56.0 — November 11, 2026
+
+This release gives local capture one scheduler, moves embedding onto its own
+bounded lane, adds an sd-store file-identity provider, and tightens what stock
+cells teach agents about themselves.
+
+### One owner for local updates
+
+- The worker runs a single registry-driven scheduler. Every enrolled local cell
+  gets startup reconciliation, periodic reconciliation and exact-path events.
+  Jobs run as bounded, disposable process groups with retry backoff, and
+  membership is reread every 15 seconds, so a new or changed declaration is
+  picked up without a restart.
+- Events are an optimization, not the correctness path. A watcher that dies is
+  rebuilt with backoff and its debt is recorded once; events are filtered before
+  paths are resolved; a failed corpus event can no longer stall live session
+  capture.
+- A partial reconciliation resumes within 15 seconds and leaves the cell free in
+  between. A pending append check no longer postpones the reconciliation that
+  would clear its debt. The worker sends a systemd watchdog heartbeat after every
+  step, so a stalled loop is restarted.
+- Pi refreshes through targeted structural transactions on a poll-owned entry
+  point, and its watcher starts earlier. Codex preserves indexed history when
+  rollouts share a session ID and skips colliding rollouts. Filesystem
+  reconciliation skips files whose durable state is unchanged.
+
+### Embedding on its own lane
+
+- Semantic work runs as one job at a time in a slot of its own, after structural
+  work, rotating between session cells and tagged document cells under a fixed
+  time budget. A turn that ends with debt pending comes back shortly.
+- Drains continue while debt remains, reach old rows, and cover documents.
+  Oversized texts are clipped, client payloads stay within the service limits,
+  and write-back is guarded by object and content generation. Queries are served
+  ahead of drain slices.
+- Vector-generation triggers are idempotent, and the engine's vector cache
+  rebuilds at most every five minutes on generation drift. Session enrichment
+  runs at most once a day, after the backlog is drained.
+
+### File identity
+
+- A public install keeps SOMA as its identity provider. A selectable sd-store
+  provider is used only where an sd-store helper (`sd-seam`) is also present;
+  `FLEX_IDENTITY=soma` or `sd-store` selects one explicitly, and a cell can pin
+  its own provider in its metadata. Existing SOMA uuids keep resolving.
+- SOMA treats copies as new entities, never mints ephemeral paths, and tolerates
+  an ALTER race on open.
+
+### Filesystem compiler
+
+- `.sql` files are a new indexed file kind.
+
+### Presets and orientation
+
+- Stock presets are seeded only where their queries compile against the
+  database, and a retired-names list keeps retired presets retired, including in
+  Ledger.
+- Coding-agent and document `@orient` presets drop the documentation mount and
+  derive their retrieval operations per path. `@delegation-tree` is fixed for
+  deep chains, and the shared coding-agent views build only from the columns and
+  joins a cell actually has.
+
+### Ledger
+
+- Annotations gain range targets and metadata, a query-local graph projection
+  and session targets. Annotations are keyed on their target, and an insert
+  trigger assigns the ID.
+
+### MCP
+
+- Tool descriptions skip a cell that cannot be resolved instead of failing the
+  whole list.
+
+### Registry
+
+- Registering a cell no longer publishes it. A new cell is listed only when it
+  is registered with `publish=True`, which every installer and `flex.sdk`'s
+  `register` do, and publishing first checks that the database exists and has
+  `_meta`. A script that calls `register_cell` directly now gets an unlisted
+  cell, still queryable by exact name. Cells registered by earlier versions keep
+  their visibility.
+
+### Containers and live Codex capture
+
+- `FLEX_RUNTIME_OWNER=external` lets a container initializer compile cells
+  without registering services, stopping running ones or wiring MCP clients;
+  the default behaviour is unchanged. This is the seam the Windows container
+  distribution uses.
+- The public worker follows live Codex rollout appends: the first full index
+  records the append receipt, and watcher events for Codex files go through the
+  provider's own reconciliation instead of the Filesystem fallback.
+
+---
+
 ## 0.55.1 — September 19, 2026
 
 ### Bounded local memory

@@ -101,6 +101,38 @@ def try_heavy_lease(*, detail: str | None = None,
     return HeavyWorkLease(fd, metadata_path, True)
 
 
+@dataclass
+class CellWorkLease:
+    """Serialize source work on a physical database, independent of its aliases."""
+
+    fd: Any | None
+    acquired: bool
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, *_unused):
+        if self.fd is not None:
+            fcntl.flock(self.fd.fileno(), fcntl.LOCK_UN)
+            self.fd.close()
+            self.fd = None
+
+
+def try_cell_lease(database: str | Path) -> CellWorkLease:
+    import hashlib
+
+    key = hashlib.sha256(str(Path(database).resolve()).encode()).hexdigest()
+    directory = flex_home() / "locks" / "cells"
+    directory.mkdir(parents=True, exist_ok=True)
+    fd = (directory / f"{key}.lock").open("a+")
+    try:
+        fcntl.flock(fd.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+    except BlockingIOError:
+        fd.close()
+        return CellWorkLease(None, False)
+    return CellWorkLease(fd, True)
+
+
 def heavy_work_active() -> dict[str, Any]:
     """Return diagnostic state; only ``active`` comes from the OS lock.
 

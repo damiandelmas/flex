@@ -30,6 +30,10 @@ SELECT 'revisions', 'available',
 UNION ALL
 SELECT 'index', 'available',
        '@index derives a compact map, node, lineage, neighborhood, and relations over a materialized self.'
+WHERE EXISTS (SELECT 1 FROM _presets WHERE name = 'index')
+UNION ALL
+SELECT 'graph', 'available',
+       'Flex Python materialization exposes _ledger_graph_vertices(vertex_id,label,properties_json) and _ledger_graph_edge_table(edge_id,source_vertex_id,destination_vertex_id,relation,ordinal,properties_json,inverse_edge_id): SQL/PGQ-style data-model shapes, not SQL/PGQ query syntax. Existing _ledger_graph_nodes/_ledger_graph_edges remain available to graph consumers. Canonical edges are stored once; a view derives reverse traversal using the destination index. The snapshot includes current annotations plus their prior revisions. Removed annotations remain in annotation_history. Pi ranges retain validated membership; unresolved or unsupported ranges are explicit. Properties contain labelled 1200-character previews; hydrate exact source coordinates for complete bodies. Inverse arcs reference the same canonical occurrence. Re-prepare with self() for a fresh observation; no standalone SQL function or graph writes.'
 UNION ALL
 SELECT 'mutations', 'available',
        'INSERT, UPDATE, and DELETE the annotations relation directly; Ledger preserves revisions and FTS.';
@@ -161,19 +165,21 @@ SELECT 'exact target coordinate',
 UNION ALL
 SELECT 'navigate current self',
        '@index'
+WHERE EXISTS (SELECT 1 FROM _presets WHERE name = 'index')
 UNION ALL
 SELECT 'continuity recovery',
-       '@hydrate returns complete compact lineage plus budgeted newest full evidence; its terminal row carries the receipt and executable next query for optional older bodies';
+       '@hydrate returns complete compact lineage plus budgeted newest full evidence; its terminal row carries the receipt and executable next query for optional older bodies'
+WHERE EXISTS (SELECT 1 FROM _presets WHERE name = 'hydrate');
 
 -- @query: mutation_contract
 SELECT 'add' AS operation,
        'INSERT INTO annotations(annotation_id,note,target_cell_id,target_chunk_id,wing,hall,room,weight,author_provider,author_session_id,author_source) VALUES(:annotation_id,:note,:target_cell_id,:target_chunk_id,:wing,:hall,:room,:weight,:author_provider,:author_session_id,:author_source) RETURNING annotation_id,target_cell_id,target_chunk_id' AS sql
 UNION ALL
 SELECT 'revise',
-       'UPDATE annotations SET note=:note,wing=:wing,hall=:hall,room=:room,weight=:weight,author_provider=:author_provider,author_session_id=:author_session_id,author_source=:author_source WHERE target_cell_id=:target_cell_id AND target_chunk_id=:target_chunk_id RETURNING annotation_id'
+       'UPDATE annotations SET note=:note,wing=:wing,hall=:hall,room=:room,weight=:weight,author_provider=:author_provider,author_session_id=:author_session_id,author_source=:author_source WHERE target_cell_id=:target_cell_id AND target_chunk_id=:target_chunk_id AND target_end_chunk_id IS NULL RETURNING annotation_id'
 UNION ALL
 SELECT 'remove',
-       'DELETE FROM annotations WHERE target_cell_id=:target_cell_id AND target_chunk_id=:target_chunk_id RETURNING annotation_id,target_cell_id,target_chunk_id';
+       'DELETE FROM annotations WHERE target_cell_id=:target_cell_id AND target_chunk_id=:target_chunk_id AND target_end_chunk_id IS NULL RETURNING annotation_id,target_cell_id,target_chunk_id';
 
 -- @query: operations
 SELECT

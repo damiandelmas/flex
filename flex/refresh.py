@@ -317,13 +317,34 @@ def discover_cells():
 
 
 def refresh_cell(cell_name, graph=False, dry_run=False, since_days=None, quiet=False,
-                 scheduled: bool = False, _heavy_admitted: bool = False):
+                 scheduled: bool = False, _heavy_admitted: bool = False,
+                 _cell_admitted: bool = False):
     """Refresh one cell, deferring real work when semantic admission is busy.
 
     A command which owns the lease passes ``_heavy_admitted`` for each cell so
     its spawned module workers remain covered by the same parent lease.  Dry
     probes intentionally remain lock-free: they do not perform enrichment.
     """
+    if not dry_run and not _cell_admitted:
+        from flex.admission import try_cell_lease
+        cell_path = resolve_cell(cell_name)
+        if not cell_path:
+            return None
+        with try_cell_lease(cell_path) as cell_lease:
+            if not cell_lease.acquired:
+                return {"deferred": True}
+            return refresh_cell(
+                cell_name, graph=graph, dry_run=False, since_days=since_days,
+                quiet=quiet, scheduled=scheduled, _heavy_admitted=_heavy_admitted,
+                _cell_admitted=True,
+            )
+    # Local source adapters do not need a semantic lease to publish structure.
+    # Explicit refresh and the daemon use the same scoped writer boundary.
+    from flex.registry import get_cell_metadata
+    cell = get_cell_metadata(cell_name) or {}
+    if not dry_run and not graph and cell.get("cell_type") == "filesystem":
+        from flex.lifecycle_jobs import execute_job
+        return execute_job(cell_name, admitted=True)
     if dry_run or _heavy_admitted:
         return _refresh_cell(
             cell_name, graph=graph, dry_run=dry_run, since_days=since_days,

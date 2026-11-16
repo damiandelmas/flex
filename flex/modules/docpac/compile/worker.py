@@ -500,7 +500,7 @@ def _mint_file_identity(conn: sqlite3.Connection, source_id: str, file_path: str
     parity contract). Returns True iff a uuid was stamped.
     """
     try:
-        from flex.modules.soma.lib.identity.file_identity import get_instance
+        from flex.modules.identity import get_instance
         from flex.modules.docpac.compile.init import _is_identity_excluded
         rp = str(Path(file_path).resolve())
         # Ephemeral corpora (/tmp,/var/tmp,/dev — soma exclude_paths) never mint, so
@@ -508,7 +508,7 @@ def _mint_file_identity(conn: sqlite3.Connection, source_id: str, file_path: str
         # batch init's _mint_batch_identity (single-sourced exclusion).
         if _is_identity_excluded(rp):
             return False
-        uuid = get_instance().assign_batch([rp]).get(rp)
+        uuid = get_instance(conn).assign_batch([rp]).get(rp)
         if uuid:
             conn.execute(_FS_IDENTITY_DDL)  # idempotent, transactional (no premature commit)
             conn.execute(
@@ -931,7 +931,8 @@ def _ensure_docpac_views(conn) -> bool:
     return True
 
 
-def scan_docpac_cells(embed_fn, size_cache: dict, deadline: float | None = None) -> dict:
+def scan_docpac_cells(embed_fn, size_cache: dict, deadline: float | None = None,
+                      *, cell_names=None) -> dict:
     """Scan registered docpac corpora by stat signature, fairly bounded per tick.
 
     Mirror of claude_code scan_sessions() — Filebeat pattern.
@@ -965,6 +966,7 @@ def scan_docpac_cells(embed_fn, size_cache: dict, deadline: float | None = None)
         and c.get('corpus_path')
         and c.get('lifecycle') == 'watch'
         and c.get('active', 1)
+        and (cell_names is None or c.get('name') in cell_names)
     ]
 
     for cell in cells:

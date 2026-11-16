@@ -1,6 +1,6 @@
 [project]
 name = "getflex"
-version = "0.55.1"
+version = "0.56.0"
 description = "Knowledge engine for AI agents. Compile any data source into a queryable SQLite cell with embeddings, graph intelligence, and full-text search."
 license = "MIT"
 license-files = ["LICENSE"]
@@ -48,12 +48,15 @@ flex = "flex.cli:main"
 
 [tool.setuptools.package-data]
 flex = [
+    "modules/annotations/**/*.sql",
     "modules/arxiv/**/*.sql",
     "modules/arxiv/**/*.md",
     "modules/claude_code/**/*.sql",
     "modules/claude_code/**/*.md",
     "modules/claude_code/assets/*.png",
     "modules/codex/**/*.md",
+    "modules/deepseek/**/*.md",
+    "modules/pi/**/*.md",
     "modules/extension/ledger/**/*.sql",
     "modules/docpac/stock/**/*.sql",
     "modules/docpac/stock/**/*.md",
@@ -68,8 +71,6 @@ flex = [
     "modules/goose/**/*.md",
     "modules/hn/**/*.sql",
     "modules/hn/**/*.md",
-    "modules/instant/stock/**/*.sql",
-    "modules/instant/stock/**/*.md",
     "modules/markdown/**/*.sql",
     "modules/markdown/**/*.md",
     "modules/reddit/**/*.sql",

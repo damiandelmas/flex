@@ -1,25 +1,20 @@
 -- @name: orient
--- @description: Markdown/Obsidian cell orientation with docs, views, presets, and samples
+-- @description: Markdown/Obsidian cell orientation with views, presets, and samples
 -- @multi: true
 
 -- @query: about
 SELECT value AS description FROM _meta WHERE key = 'description';
 
--- @query: cell_docs
-SELECT scope, name, path, mtime, chars, content
-FROM _flex_docs
-ORDER BY
-    CASE scope
-        WHEN 'cell_instructions' THEN 0
-        WHEN 'local_notes' THEN 1
-        ELSE 2
-    END,
-    name;
-
 -- @query: guide
 SELECT 'start' AS topic, 'Use sections for chunk-level reading and notes for file-level metadata.' AS guidance
 UNION ALL
 SELECT 'semantic_search', 'Join vec_ops results to sections; pre-filter with SELECT id FROM sections when scoping by folder or tags.'
+WHERE NOT EXISTS (SELECT 1 FROM pragma_function_list WHERE name = 'vec_distance_cosine')
+UNION ALL
+SELECT 'semantic_search', 'Embed the question once with vec_slice(llm_embed_generate(''search_query: '' || :q), 0, 256) in a MATERIALIZED CTE; score _raw_chunks.embedding with 1 - vec_distance_cosine(vec_slice(embedding, 0, 256), q) and join to sections on id.'
+WHERE EXISTS (SELECT 1 FROM pragma_function_list WHERE name = 'vec_distance_cosine')
+UNION ALL
+SELECT 'keyword_search', 'chunks_fts MATCH ''term'' or ''"exact phrase"'' (FTS5); bm25(chunks_fts) ascending is best. Bridge to sections via _raw_chunks.rowid = chunks_fts.rowid.'
 UNION ALL
 SELECT 'links', 'Use _edges_wikilink for resolved links and _edges_wikilink_unresolved for ghost notes.'
 UNION ALL

@@ -9,17 +9,6 @@ SELECT datetime('now', 'localtime') AS now,
 -- @query: about
 SELECT value AS description FROM _meta WHERE key = 'description';
 
--- @query: cell_docs
-SELECT scope, name, path, mtime, chars, content
-FROM _flex_docs
-ORDER BY
-    CASE scope
-        WHEN 'cell_instructions' THEN 0
-        WHEN 'local_notes' THEN 1
-        ELSE 2
-    END,
-    name;
-
 -- @query: shape
 SELECT 'documents' AS what, COUNT(*) AS n FROM documents
 UNION ALL
@@ -32,7 +21,9 @@ SELECT 'embedded_sections', COUNT(*) FROM _raw_chunks WHERE embedding IS NOT NUL
 -- semantic scoring is unavailable and @orient advertises the structural surface.
 SELECT CASE
     WHEN lower(COALESCE((SELECT value FROM _meta WHERE key='embed'),'true')) IN ('false','0','off','no')
-    THEN 'embed-off — structural surface (keyword() FTS + node tree + declared edges + identity); semantic scoring is unavailable'
+    THEN 'embed-off — structural surface (FTS5 + node tree + declared edges + identity); semantic scoring is unavailable'
+    WHEN EXISTS (SELECT 1 FROM pragma_function_list WHERE name = 'vec_distance_cosine')
+    THEN 'embed-on — semantic + structural surface (llm_embed_generate + vec_distance_cosine + chunks_fts + views)'
     ELSE 'embed-on — semantic + structural surface (vec_ops + keyword() + views)'
 END AS embed_mode;
 
@@ -58,22 +49,36 @@ ORDER BY
 -- cell carries no vectors, so vec_ops/similar/centroid/near_type are unavailable: the row
 -- is replaced by an explicit notice pointing at the structural surface. The
 -- predicate set ('false','0','off','no') matches cell_is_no_embed() verbatim.
+-- Retrieval rows are also derived from the connection: the Flex engine (no sqlite-vec)
+-- offers vec_ops/keyword(); a connection with sqlite-vec and sqlite-ai loaded offers llm_embed_generate/vec_distance_*. Both list chunks_fts.
 SELECT 'scoring' AS kind,
        'vec' || '_ops(''similar:topic diverse pool:100'', ''SELECT id FROM sections'')' AS name,
        'id, score' AS columns,
        'Semantic retrieval over scoped section ids; use after FROM/JOIN.' AS note
 WHERE lower(COALESCE((SELECT value FROM _meta WHERE key='embed'),'true')) NOT IN ('false','0','off','no')
+  AND NOT EXISTS (SELECT 1 FROM pragma_function_list WHERE name = 'vec_distance_cosine')
+UNION ALL
+SELECT 'scoring', 'llm_embed_generate', 'text -> float32[768]',
+       'Embed a question in SQL: vec_slice(llm_embed_generate(''search_query: '' || :q), 0, 256). Compute once in a MATERIALIZED CTE.'
+WHERE lower(COALESCE((SELECT value FROM _meta WHERE key='embed'),'true')) NOT IN ('false','0','off','no')
+  AND EXISTS (SELECT 1 FROM pragma_function_list WHERE name = 'llm_embed_generate')
+UNION ALL
+SELECT 'scoring', 'vec_distance_cosine / vec_distance_l2', 'distance',
+       'Exact semantic scoring over _raw_chunks.embedding (768 float32; score at 256 with vec_slice). score = 1 - vec_distance_cosine(...).'
+WHERE lower(COALESCE((SELECT value FROM _meta WHERE key='embed'),'true')) NOT IN ('false','0','off','no')
+  AND EXISTS (SELECT 1 FROM pragma_function_list WHERE name = 'vec_distance_cosine')
 UNION ALL
 SELECT 'scoring',
        'UNAVAILABLE — no embeddings in this cell',
        '(unavailable)',
-       'Embed-off cell: vec_ops/similar/centroid/near_type do not apply. Use keyword() + structural SQL + the node tree (_edges_tree) instead.'
+       'Embed-off cell: semantic scoring does not apply on either path. Use FTS5 (chunks_fts) + structural SQL + the node tree (_edges_tree) instead.'
 WHERE lower(COALESCE((SELECT value FROM _meta WHERE key='embed'),'true')) IN ('false','0','off','no')
 UNION ALL
 SELECT 'table_function',
        'key' || 'word(''term'', ''SELECT id FROM sections'')',
        'id, rank, snippet',
        'FTS5 exact-term search over scoped section ids; snippets mark hits with >>>term<<< highlighting.'
+WHERE NOT EXISTS (SELECT 1 FROM pragma_function_list WHERE name = 'vec_distance_cosine')
 UNION ALL
 SELECT 'view', 'sections',
        'id, content, source_id, position, title, source_path, file_date, doc_type, temporal, facet, section_title, centrality, is_hub, is_bridge, community_id',
@@ -89,7 +94,7 @@ SELECT 'structural', 'node tree (_edges_tree)',
 UNION ALL
 SELECT 'table', 'chunks_fts',
        'rowid, content',
-       'Raw FTS5 table. Prefer keyword(); bridge manually only for advanced filters.';
+       'FTS5 index over _raw_chunks (rowid = _raw_chunks.rowid). chunks_fts MATCH ''term'' or ''"exact phrase"''; bm25(chunks_fts) ascending is best.';
 
 -- @query: health_defects
 -- Rejected metadata is visible rather than silently entering chronology.
@@ -169,16 +174,28 @@ UNION ALL
 SELECT 'semantic_sections',
        'SELECT v.score, s.source_id, s.title, s.source_path, s.file_date, s.section_title, substr(s.content,1,1200) AS content FROM vec' || '_ops(''similar:YOUR TOPIC diverse pool:100'', ''SELECT id FROM sections'') v JOIN sections s ON s.id = v.id ORDER BY v.score DESC LIMIT 10'
 WHERE lower(COALESCE((SELECT value FROM _meta WHERE key='embed'),'true')) NOT IN ('false','0','off','no')
+  AND NOT EXISTS (SELECT 1 FROM pragma_function_list WHERE name = 'vec_distance_cosine')
 UNION ALL
 SELECT 'semantic_section',
        'SELECT v.score, s.source_id, s.title, s.source_path, s.file_date, s.doc_type, s.section_title, substr(s.content,1,1200) AS content FROM vec' || '_ops(''similar:YOUR TOPIC diverse pool:100'', ''SELECT id FROM sections WHERE section_title = ''''SECTION TITLE'''' '') v JOIN sections s ON s.id = v.id ORDER BY v.score DESC LIMIT 10'
 WHERE lower(COALESCE((SELECT value FROM _meta WHERE key='embed'),'true')) NOT IN ('false','0','off','no')
+  AND NOT EXISTS (SELECT 1 FROM pragma_function_list WHERE name = 'vec_distance_cosine')
+UNION ALL
+SELECT 'semantic_sections',
+       'WITH q AS MATERIALIZED (SELECT vec_slice(llm_embed_generate(''search_query: '' || :q), 0, 256) AS v) SELECT 1 - vec_distance_cosine(vec_slice(c.embedding, 0, 256), q.v) AS score, s.source_id, s.title, s.source_path, s.file_date, s.section_title, substr(s.content,1,1200) AS content FROM q, _raw_chunks c JOIN sections s ON s.id = c.id WHERE c.embedding IS NOT NULL ORDER BY score DESC LIMIT 10'
+WHERE lower(COALESCE((SELECT value FROM _meta WHERE key='embed'),'true')) NOT IN ('false','0','off','no')
+  AND EXISTS (SELECT 1 FROM pragma_function_list WHERE name = 'vec_distance_cosine')
+UNION ALL
+SELECT 'semantic_section',
+       'WITH q AS MATERIALIZED (SELECT vec_slice(llm_embed_generate(''search_query: '' || :q), 0, 256) AS v) SELECT 1 - vec_distance_cosine(vec_slice(c.embedding, 0, 256), q.v) AS score, s.source_id, s.title, s.source_path, s.file_date, s.doc_type, s.section_title, substr(s.content,1,1200) AS content FROM q, _raw_chunks c JOIN sections s ON s.id = c.id WHERE s.section_title = ''SECTION TITLE'' AND c.embedding IS NOT NULL ORDER BY score DESC LIMIT 10'
+WHERE lower(COALESCE((SELECT value FROM _meta WHERE key='embed'),'true')) NOT IN ('false','0','off','no')
+  AND EXISTS (SELECT 1 FROM pragma_function_list WHERE name = 'vec_distance_cosine')
 UNION ALL
 SELECT 'tree_subtree',
        'WITH RECURSIVE subtree(id, depth) AS (SELECT id, 0 FROM sections WHERE id = ''ROOT_SECTION_ID'' UNION ALL SELECT e.id, subtree.depth + 1 FROM _edges_tree e JOIN subtree ON e.parent_id = subtree.id) SELECT subtree.depth, s.section_title, substr(s.content,1,800) AS content FROM subtree JOIN sections s ON s.id = subtree.id ORDER BY subtree.depth, s.position'
 UNION ALL
 SELECT 'exact_term',
-       'SELECT k.rank, k.snippet, s.source_id, s.title, s.source_path, s.section_title, substr(s.content,1,1000) AS content FROM key' || 'word(''TERM'', ''SELECT id FROM sections'') k JOIN sections s ON s.id = k.id ORDER BY k.rank DESC LIMIT 10'
+       'SELECT bm25(chunks_fts) AS rank, s.source_id, s.title, s.source_path, s.section_title, substr(s.content,1,1000) AS content FROM chunks_fts f JOIN _raw_chunks c ON c.rowid = f.rowid JOIN sections s ON s.id = c.id WHERE chunks_fts MATCH ''TERM'' ORDER BY rank LIMIT 10'
 UNION ALL
 SELECT 'type_recent',
        'SELECT source_id, title, source_path, file_date, doc_type, section_title, substr(content,1,1200) AS content FROM sections WHERE doc_type = ''DOC TYPE'' ORDER BY file_date DESC LIMIT 10'

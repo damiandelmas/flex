@@ -31,13 +31,23 @@ from flex.modules.claude_code.compile.worker import (
 
 try:
     from flex.modules.soma.coding_agent import enrich_operation as soma_enrich_operation
+    from flex.modules.soma.compile import ensure_tables as soma_ensure_tables
 except ImportError:  # pragma: no cover - SOMA is optional in minimal installs
     soma_enrich_operation = None
+    soma_ensure_tables = None
 
 
 DEFAULT_PI_SESSIONS = Path.home() / ".pi" / "agent" / "sessions"
 
 PI_TABLES_DDL: tuple[str, ...] = (
+    """
+    CREATE TABLE IF NOT EXISTS _pi_source_state (
+        source_path TEXT PRIMARY KEY,
+        session_id TEXT NOT NULL,
+        size_bytes INTEGER NOT NULL,
+        mtime_ns INTEGER NOT NULL
+    )
+    """,
     """
     CREATE TABLE IF NOT EXISTS _types_pi_session (
         source_id TEXT PRIMARY KEY,
@@ -114,6 +124,8 @@ def ensure_pi_cell_schema(conn: sqlite3.Connection) -> None:
     _ensure_core_tables(conn)
     _ensure_content_tables(conn)
     ensure_pi_tables(conn)
+    if soma_ensure_tables:
+        soma_ensure_tables(conn)
     conn.commit()
 
 
@@ -361,6 +373,7 @@ def _insert_pi_chunk(conn: sqlite3.Connection, chunk: dict[str, Any], raw: Any) 
                     "cwd": chunk.get("cwd"),
                     "source_id": chunk["doc_id"],
                 },
+                ensure_schema=False,
             )
         except Exception as exc:
             print(f"[pi] SOMA enrichment failed: {exc}", file=sys.stderr)
@@ -700,13 +713,17 @@ def _entry_chunks(
     return output
 
 
-def _clear_provider_rows(conn: sqlite3.Connection) -> None:
-    source_ids = [
-        row[0]
-        for row in conn.execute(
-            "SELECT DISTINCT source_id FROM _edges_source WHERE source_type = 'pi'"
-        )
-    ]
+def _clear_provider_rows(
+    conn: sqlite3.Connection, source_ids: list[str] | None = None
+) -> None:
+    if source_ids is None:
+        source_ids = [
+            row[0]
+            for row in conn.execute(
+                "SELECT DISTINCT source_id FROM _edges_source WHERE source_type = 'pi'"
+            )
+        ]
+        conn.execute("DELETE FROM _pi_source_state")
     if not source_ids:
         conn.execute("DELETE FROM _types_pi_entry")
         conn.execute("DELETE FROM _types_pi_session")
@@ -720,13 +737,25 @@ def _clear_provider_rows(conn: sqlite3.Connection) -> None:
     ]
     if chunk_ids:
         chunk_marks = ",".join("?" for _ in chunk_ids)
+        try:
+            conn.execute(
+                f"DELETE FROM _file_body_index WHERE parent_chunk_id IN ({chunk_marks})",
+                chunk_ids,
+            )
+        except sqlite3.OperationalError:
+            pass
         for table, column in (
             ("_edges_delegations", "chunk_id"),
             ("_edges_soft_ops", "chunk_id"),
             ("_edges_raw_content", "chunk_id"),
             ("_edges_tool_ops", "chunk_id"),
+            ("_edges_content_identity", "chunk_id"),
+            ("_edges_file_identity", "chunk_id"),
+            ("_edges_repo_identity", "chunk_id"),
+            ("_edges_url_identity", "chunk_id"),
             ("_types_message", "chunk_id"),
             ("_types_file_body", "chunk_id"),
+            ("_enrich_observations", "chunk_id"),
             ("_enrich_chunk_rollup", "chunk_id"),
             ("_raw_chunks", "id"),
         ):
@@ -740,8 +769,13 @@ def _clear_provider_rows(conn: sqlite3.Connection) -> None:
     conn.execute(f"DELETE FROM _types_pi_session WHERE source_id IN ({marks})", source_ids)
 
 
-def _transpile_session(path: Path, conn: sqlite3.Connection) -> tuple[str, int, int]:
-    file_entries = _read_entries(path)
+def _transpile_session(
+    path: Path,
+    conn: sqlite3.Connection,
+    file_entries: list[dict[str, Any]] | None = None,
+) -> tuple[str, int, int]:
+    if file_entries is None:
+        file_entries = _read_entries(path)
     if not file_entries:
         return "", 0, 0
     header = file_entries[0]
@@ -848,6 +882,111 @@ def _transpile_session(path: Path, conn: sqlite3.Connection) -> tuple[str, int, 
     return session_id, inserted, len(entries)
 
 
+def replace_session(
+    path: Path, conn: sqlite3.Connection, *, ensure_schema: bool = True,
+    stats: dict | None = None,
+) -> tuple[str, int, int]:
+    """Replace one Pi session without rebuilding or copying its owning cell.
+
+    When ``stats`` is given, the number of prior embeddings restored is added
+    to ``stats["reused_embeddings"]``.
+    """
+    path = Path(path).resolve()
+    source_stat = path.stat()
+    entries = _read_entries(path)
+    if not entries:
+        raise ValueError(f"Pi session header unavailable: {path}")
+    session_id = str(entries[0]["id"])
+    if ensure_schema:
+        ensure_pi_cell_schema(conn)
+    conn.execute("DROP TABLE IF EXISTS temp._pi_prior_embeddings")
+    conn.execute(
+        """
+        CREATE TEMP TABLE _pi_prior_embeddings AS
+        SELECT c.id,c.content,c.embedding
+        FROM _raw_chunks AS c
+        JOIN _edges_source AS e ON e.chunk_id=c.id
+        WHERE e.source_id=? AND e.source_type='pi' AND c.embedding IS NOT NULL
+        """,
+        (session_id,),
+    )
+    try:
+        conn.execute("SAVEPOINT pi_session_replace")
+        try:
+            _clear_provider_rows(conn, [session_id])
+            result = _transpile_session(path, conn, entries)
+            restored = conn.execute(
+                """
+                UPDATE _raw_chunks
+                SET embedding=(
+                    SELECT prior.embedding FROM temp._pi_prior_embeddings AS prior
+                    WHERE prior.id=_raw_chunks.id AND prior.content=_raw_chunks.content
+                )
+                WHERE id IN (SELECT id FROM temp._pi_prior_embeddings)
+                  AND EXISTS (
+                    SELECT 1 FROM temp._pi_prior_embeddings AS prior
+                    WHERE prior.id=_raw_chunks.id AND prior.content=_raw_chunks.content
+                  )
+                """
+            ).rowcount
+            if stats is not None:
+                stats["reused_embeddings"] = (
+                    stats.get("reused_embeddings", 0) + max(0, restored)
+                )
+            # A writer may append while we parse. Publish the committed prefix,
+            # but leave the source pending for the next pass in that case.
+            final_stat = path.stat()
+            if (source_stat.st_size, source_stat.st_mtime_ns) == (
+                final_stat.st_size, final_stat.st_mtime_ns
+            ):
+                conn.execute(
+                    """
+                    INSERT INTO _pi_source_state(source_path,session_id,size_bytes,mtime_ns)
+                    VALUES(?,?,?,?)
+                    ON CONFLICT(source_path) DO UPDATE SET
+                        session_id=excluded.session_id,
+                        size_bytes=excluded.size_bytes,
+                        mtime_ns=excluded.mtime_ns
+                    """,
+                    (str(path), session_id, source_stat.st_size, source_stat.st_mtime_ns),
+                )
+            conn.execute("RELEASE SAVEPOINT pi_session_replace")
+            conn.commit()
+            return result
+        except Exception:
+            conn.execute("ROLLBACK TO SAVEPOINT pi_session_replace")
+            conn.execute("RELEASE SAVEPOINT pi_session_replace")
+            raise
+    finally:
+        conn.execute("DROP TABLE IF EXISTS temp._pi_prior_embeddings")
+
+
+def remove_session(path: Path, conn: sqlite3.Connection) -> bool:
+    """Remove one vanished source after the complete source walk confirms absence."""
+    source_path = str(Path(path).resolve())
+    row = conn.execute(
+        "SELECT session_id FROM _pi_source_state WHERE source_path=?", (source_path,)
+    ).fetchone()
+    if row is None:
+        return False
+    session_id = str(row[0])
+    conn.execute("SAVEPOINT pi_session_remove")
+    try:
+        conn.execute("DELETE FROM _pi_source_state WHERE source_path=?", (source_path,))
+        other = conn.execute(
+            "SELECT 1 FROM _pi_source_state WHERE session_id=? LIMIT 1", (session_id,)
+        ).fetchone()
+        if other is None:
+            _clear_provider_rows(conn, [session_id])
+        conn.execute("RELEASE SAVEPOINT pi_session_remove")
+        conn.commit()
+        return True
+    except Exception:
+        conn.execute("ROLLBACK TO SAVEPOINT pi_session_remove")
+        conn.execute("RELEASE SAVEPOINT pi_session_remove")
+        raise
+
+
 def transpile(
     source: Path,
     conn: sqlite3.Connection,
@@ -871,6 +1010,18 @@ def transpile(
             sessions += 1
             chunks += inserted
             entries += native_entries
+            stat = path.stat()
+            conn.execute(
+                """
+                INSERT INTO _pi_source_state(source_path,session_id,size_bytes,mtime_ns)
+                VALUES(?,?,?,?)
+                ON CONFLICT(source_path) DO UPDATE SET
+                    session_id=excluded.session_id,
+                    size_bytes=excluded.size_bytes,
+                    mtime_ns=excluded.mtime_ns
+                """,
+                (str(path.resolve()), session_id, stat.st_size, stat.st_mtime_ns),
+            )
         if progress_cb:
             progress_cb(index, len(paths), sessions, chunks, time.monotonic() - started)
     conn.commit()

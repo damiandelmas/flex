@@ -382,6 +382,7 @@ def main():
         lifecycle=lifecycle,
         refresh_interval=None if args.no_schedule else args.refresh_interval,
         refresh_module=None if args.no_schedule else 'flex.modules.github.compile.refresh',
+        publish=True,
     )
 
     elapsed = time.time() - t0

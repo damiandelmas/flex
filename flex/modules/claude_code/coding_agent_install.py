@@ -218,6 +218,7 @@ def run_from_spec(args, console, spec: dict[str, Any]) -> None:
         cell_type=cell_type,
         description=description,
         **_registration_lifecycle_kwargs(spec, source),
+        publish=True,
     )
 
     if sys.platform != "win32":

@@ -38,7 +38,7 @@ class LifecycleCoordinator:
             # refresh and can overwrite a healthy append receipt with that
             # child's failure.
             if (
-                cell.get("detector") == "active_append"
+                cell.get("detector") in {"active_append", "poll"}
                 or (cell.get("detector") is None and cell.get("cell_type") == "codex")
             ):
                 continue

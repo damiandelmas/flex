@@ -16,7 +16,7 @@ from flex.registry import CELLS_DIR, register_cell, resolve_cell
 LEDGER_CELL = "ledger"
 EXT_DIR = Path(__file__).resolve().parent
 SCHEMA = EXT_DIR / "schema.sql"
-SCHEMA_VERSION = 5
+SCHEMA_VERSION = 7
 
 
 def _table_exists(conn: sqlite3.Connection, name: str) -> bool:
@@ -61,6 +61,13 @@ def _validate_schema(conn: sqlite3.Connection) -> None:
         raise RuntimeError(
             "Ledger annotation provenance is incomplete: " + ", ".join(missing_columns)
         )
+    for table in ("_types_annotation", "annotation_revisions",
+                  "annotations", "annotation_history"):
+        if "metadata" not in _columns(conn, table):
+            raise RuntimeError(f"Ledger metadata column is missing from {table}")
+    for table in ("_edges_annotation_target", "annotation_revisions", "annotations", "annotation_history"):
+        if "target_end_chunk_id" not in _columns(conn, table):
+            raise RuntimeError(f"Ledger range endpoint is missing from {table}")
     required_triggers = {
         "annotations_insert", "annotations_update", "annotations_delete",
     }
@@ -77,30 +84,39 @@ def _validate_schema(conn: sqlite3.Connection) -> None:
         )
 
 
-def ensure_schema(conn: sqlite3.Connection) -> bool:
-    """Apply the additive Ledger schema migration once.
-
-    Returns ``True`` only when a migration was applied. Legacy annotations are
-    retained with unknown (NULL) authorship and receive searchable FTS rows.
-    """
-    from flex.modules.extension.ledger.sql import register_functions
-    register_functions(conn)
-    conn.execute(
-        "CREATE TABLE IF NOT EXISTS _meta (key TEXT PRIMARY KEY, value TEXT)"
+def range_target_migration_sql() -> str:
+    """Rebuild the v6 target edge without changing annotation identities."""
+    return """
+CREATE TABLE _edges_annotation_target_v7 (
+    chunk_id TEXT PRIMARY KEY REFERENCES _raw_chunks(id),
+    target_cell_id TEXT NOT NULL,
+    target_chunk_id TEXT NOT NULL,
+    target_end_chunk_id TEXT CHECK (
+        target_end_chunk_id IS NULL OR
+        (length(target_end_chunk_id)>0 AND target_end_chunk_id<>target_chunk_id)
     )
-    current = _schema_version(conn)
+);
+INSERT INTO _edges_annotation_target_v7(chunk_id,target_cell_id,target_chunk_id)
+SELECT chunk_id,target_cell_id,target_chunk_id FROM _edges_annotation_target;
+DROP TABLE _edges_annotation_target;
+ALTER TABLE _edges_annotation_target_v7 RENAME TO _edges_annotation_target;
+"""
+
+
+def schema_migration_sql(conn: sqlite3.Connection) -> str:
+    """Build migration SQL without writing; the caller owns production transactions."""
+    current = _schema_version(conn) if _table_exists(conn, "_meta") else 0
     if current > SCHEMA_VERSION:
         raise RuntimeError(
             f"Ledger schema {current} is newer than supported {SCHEMA_VERSION}"
         )
     if current == SCHEMA_VERSION:
         _validate_schema(conn)
-        return False
+        return ""
 
     existing = _table_exists(conn, "_types_annotation")
     existing_columns = _columns(conn, "_types_annotation") if existing else set()
     statements = [
-        "BEGIN IMMEDIATE",
         "DROP TRIGGER IF EXISTS annotations_insert",
         "DROP TRIGGER IF EXISTS annotations_update",
         "DROP TRIGGER IF EXISTS annotations_delete",
@@ -113,20 +129,40 @@ def ensure_schema(conn: sqlite3.Connection) -> bool:
                 statements.append(
                     f"ALTER TABLE _types_annotation ADD COLUMN {column} TEXT"
                 )
-    statements.append(SCHEMA.read_text())
+    for table in ("_types_annotation", "annotation_revisions"):
+        if _table_exists(conn, table) and "metadata" not in _columns(conn, table):
+            statements.append(
+                f"ALTER TABLE {table} ADD COLUMN metadata TEXT "
+                "CHECK (metadata IS NULL OR json_valid(metadata))"
+            )
+    if _table_exists(conn, "_edges_annotation_target") and "target_end_chunk_id" not in _columns(conn, "_edges_annotation_target"):
+        statements.append(range_target_migration_sql())
+    if _table_exists(conn, "annotation_revisions") and "target_end_chunk_id" not in _columns(conn, "annotation_revisions"):
+        statements.append("ALTER TABLE annotation_revisions ADD COLUMN target_end_chunk_id TEXT")
+    # Distinguish trigger END from transaction control for a wrapper that manages transactions.
+    statements.append(SCHEMA.read_text().replace("\nEND;", "\n-- Close trigger body, not a transaction.\nEND;"))
     statements.extend([
         "INSERT INTO chunks_fts(chunks_fts) VALUES('rebuild')",
         "INSERT OR REPLACE INTO _meta(key,value) VALUES "
         "('cell_type','ledger'),"
         "('description','Annotations referencing objects in other Flex cells.'),"
-        "('schema','ledger.v5'),"
-        "('ledger_schema_version','5'),"
+        "('schema','ledger.v7'),"
+        "('ledger_schema_version','7'),"
         "('embed','false'),"
         "('lifecycle','authored')",
-        "COMMIT",
     ])
+    return ";\n".join(statements) + ";"
+
+
+def ensure_schema(conn: sqlite3.Connection) -> bool:
+    """Apply the migration on isolated/local connections; production callers manage their own transactions."""
+    from flex.modules.extension.ledger.sql import register_functions
+    register_functions(conn)
+    script = schema_migration_sql(conn)
+    if not script:
+        return False
     try:
-        conn.executescript(";\n".join(statements) + ";")
+        conn.executescript("BEGIN IMMEDIATE;\n" + script + "\nCOMMIT;")
     except Exception:
         conn.rollback()
         raise
@@ -135,17 +171,25 @@ def ensure_schema(conn: sqlite3.Connection) -> bool:
 
 
 def ensure_presets(conn: sqlite3.Connection) -> bool:
-    """Seed missing stock SQL programs without replacing database-owned rows."""
+    """Seed missing stock SQL programs without replacing database-owned rows.
+
+    A name listed in _presets_retired is never re-added (as in
+    flex.manage.install_presets). No compile check here: @index and @hydrate
+    read tables the engine materializes per query, so a plain connection
+    cannot judge them.
+    """
+    from flex.manage.install_presets import _retired
     from flex.retrieve.presets import parse_preset
 
     existing = {
         str(row[0]) for row in conn.execute("SELECT name FROM _presets")
     }
+    retired = _retired(conn)
     installed = False
     for path in sorted((EXT_DIR / "stock" / "presets").glob("*.sql")):
         text = path.read_text()
         preset = parse_preset(text, path.stem)
-        if preset["name"] in existing:
+        if preset["name"] in existing or preset["name"] in retired:
             continue
         cursor = conn.execute(
             "INSERT OR IGNORE INTO _presets(name,description,params,sql,source) "
@@ -183,6 +227,7 @@ def open_ledger() -> sqlite3.Connection:
             path,
             cell_type="ledger",
             description="Annotations referencing objects in other Flex cells.",
+            publish=True,
         )
     return conn
 
@@ -201,7 +246,7 @@ def install() -> dict:
         return {
             "cell": LEDGER_CELL,
             "path": str(ledger_path()),
-            "schema": "ledger.v5",
+            "schema": "ledger.v7",
             "presets": [p.stem for p in sorted((EXT_DIR / "stock" / "presets").glob("*.sql"))],
         }
     finally:

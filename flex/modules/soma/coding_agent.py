@@ -42,12 +42,15 @@ def operation_to_chunk(op: dict[str, Any]) -> dict[str, Any]:
     }
 
 
-def enrich_operation(conn: sqlite3.Connection, op: dict[str, Any]) -> bool:
+def enrich_operation(
+    conn: sqlite3.Connection, op: dict[str, Any], *, ensure_schema: bool = True
+) -> bool:
     """Enrich and insert SOMA identity edges for one canonical tool op."""
     chunk = operation_to_chunk(op)
     if not chunk.get("id"):
         return False
-    soma_compile.ensure_tables(conn)
+    if ensure_schema:
+        soma_compile.ensure_tables(conn)
     enriched = soma_compile.enrich(chunk)
     soma_compile.insert_edges(conn, enriched)
     return any(

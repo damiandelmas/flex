@@ -119,7 +119,8 @@ def sync_source_path(conn: sqlite3.Connection, observed_path: Path) -> int:
     return max(1, int(stats.get("chunks", 0)))
 
 
-def refresh(cell_path: str, graph: bool = False, dry_run: bool = False) -> dict:
+def refresh(cell_path: str, graph: bool = False, dry_run: bool = False,
+            *, semantic: bool = True) -> dict:
     conn = sqlite3.connect(str(cell_path), timeout=30.0)
     conn.row_factory = sqlite3.Row
     conn.execute("PRAGMA journal_mode=WAL")
@@ -157,13 +158,13 @@ def refresh(cell_path: str, graph: bool = False, dry_run: bool = False) -> dict:
 
         embedded = 0
         semantic_debt = _embedding_debt(conn)
-        if semantic_debt > 0 or graph:
+        if semantic and (semantic_debt > 0 or graph):
             try:
                 embedded = _batch_embed_chunks(conn, quiet=True)
             except Exception as e:
                 print(f"[goose.refresh] embed failed: {e}", file=sys.stderr)
                 conn.commit()
-        if stats.get("chunks", 0) > 0 or graph:
+        if semantic and (stats.get("chunks", 0) > 0 or graph):
             try:
                 run_enrichment(conn, cell_type="goose")
             except Exception as e:

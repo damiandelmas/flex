@@ -162,9 +162,15 @@ def _mint_identity(conn: sqlite3.Connection, result: ExtractionResult) -> None:
         return
     required = document_identity_required(conn)
     try:
-        from flex.modules.soma.lib.identity.file_identity import get_instance
+        from flex.modules.identity import get_instance
         absolute = str(Path(result.source_path).resolve())
-        file_uuid = get_instance().assign_batch([absolute]).get(absolute)
+        provider = get_instance(conn)
+        # The root is exact here (absolute path minus the relative source id);
+        # bind it so sd-store can mint even when _meta records no selections.
+        suffix = "/" + result.source_id
+        if hasattr(provider, "bind") and absolute.endswith(suffix):
+            provider.bind(absolute[: -len(suffix)])
+        file_uuid = provider.assign_batch([absolute]).get(absolute)
     except Exception as exc:
         if required:
             raise RuntimeError(

@@ -48,6 +48,54 @@ def _python_command(args: list[str]) -> str:
     return " ".join([sys.executable, *args])
 
 
+def _effective_memory_mb() -> int:
+    """Return the lower of host RAM and an enclosing cgroup memory limit."""
+    values = []
+    try:
+        values.append(
+            int(os.sysconf('SC_PAGE_SIZE')) * int(os.sysconf('SC_PHYS_PAGES'))
+        )
+    except (AttributeError, OSError, ValueError):
+        pass
+    for path in (
+        Path('/sys/fs/cgroup/memory.max'),
+        Path('/sys/fs/cgroup/memory/memory.limit_in_bytes'),
+    ):
+        try:
+            raw = path.read_text().strip()
+            if raw != 'max':
+                value = int(raw)
+                # Ignore sentinel/unbounded v1 values.
+                if 0 < value < (1 << 60):
+                    values.append(value)
+        except (OSError, ValueError):
+            pass
+    if not values:
+        return 8192
+    return max(1, min(values) // (1024 * 1024))
+
+
+def _service_memory_limits(effective_mb: int | None = None) -> dict[str, int]:
+    """Compute consumer-safe service caps from the real memory envelope."""
+    effective = int(effective_mb or _effective_memory_mb())
+    override = os.environ.get('FLEX_MEMORY_BUDGET_MB')
+    if override:
+        mcp_max = max(1024, int(override))
+        worker_max = max(512, min(2048, mcp_max // 2))
+    else:
+        mcp_max = max(1536, min(4096, effective // 4))
+        # The common owner includes bounded compiler children and their file
+        # cache. Retain the 12.5% lane but don't force an entire multi-repository
+        # build plus live capture into the old capture-only 2GiB ceiling.
+        worker_max = max(768, min(6144, effective // 8))
+    return {
+        'mcp_max': mcp_max,
+        'mcp_high': max(1, int(mcp_max * 0.8)),
+        'worker_max': worker_max,
+        'worker_high': max(1, int(worker_max * 0.8)),
+    }
+
+
 def _safe_write(path: Path, content: str):
     """Write content to path, replacing symlinks with regular files."""
     if path.is_symlink():
@@ -163,6 +211,14 @@ def _install_claude_assets(skill_names=None):
             "skills/flex-sessions-goose/",
             "skills/flex-sessions-goose/",
         ),
+        "flex:sessions:deepseek": (
+            "skills/flex-sessions-deepseek/",
+            "skills/flex-sessions-deepseek/",
+        ),
+        "flex:sessions:pi": (
+            "skills/flex-sessions-pi/",
+            "skills/flex-sessions-pi/",
+        ),
         "flex:reddit": ("skills/flex-reddit/", "skills/flex-reddit/"),
         "flex:hn": ("skills/flex-hn/", "skills/flex-hn/"),
         "flex:github": ("skills/flex-github/", "skills/flex-github/"),
@@ -202,6 +258,11 @@ def _install_claude_assets(skill_names=None):
 
         src_path = _claude_src / src_asset
         if src_path.is_dir():
+            # A prior editable install can leave the skill root as a (possibly
+            # broken) symlink. Remove it before creating child paths.
+            dest_root = CLAUDE_DIR / dest_asset
+            if dest_root.is_symlink():
+                dest_root.unlink()
             # Copy entire directory (skills)
             for src in src_path.rglob("*"):
                 if src.is_file():
@@ -239,9 +300,29 @@ def _install_systemd():
         return False
 
     SYSTEMD_DIR.mkdir(parents=True, exist_ok=True)
+    # Earlier development installs split local capture across Pi polling,
+    # event drains, watch reconciliation and semantic/code timers. They must
+    # not survive installation of the common owner as competing publishers.
+    # Keep unit files as rollback material; don't alter remote API scheduling.
+    obsolete = [name for name in (
+        "flex-event-drain.path", "flex-event-drain.timer", "flex-pi-poll.timer",
+        "flex-watch-refresh.timer", "flex-semantic.timer", "flex-code-refresh.timer",
+    ) if (SYSTEMD_DIR / name).exists()]
+    if obsolete:
+        subprocess.run(
+            ["systemctl", "--user", "disable", "--now", *obsolete],
+            capture_output=True, timeout=15,
+        )
+        subprocess.run(
+            ["systemctl", "--user", "stop", "flex-event-drain.service",
+             "flex-pi-poll.service", "flex-watch-refresh.service",
+             "flex-semantic.service", "flex-code-refresh.service"],
+            capture_output=True, timeout=15,
+        )
     python = sys.executable
     worker_cmd = _python_command(WORKER_DAEMON_ARGS)
     refresh_cmd = _python_command(REFRESH_DAEMON_ARGS)
+    memory = _service_memory_limits()
 
     _SYSTEMD_UNITS = {
         "flex-worker.service": (
@@ -260,13 +341,14 @@ def _install_systemd():
             "RestartSec=5\n"
             "Environment=PYTHONUNBUFFERED=1\n"
             "Environment=MALLOC_ARENA_MAX=2\n"
+            "Environment=FLEX_EMBED_SERVICE_ONLY=1\n"
             # memmap the embedding matrix → file-backed, reclaimable pages.
             "Environment=FLEX_VEC_MEMMAP=1\n"
-            # 64GB box: the cap is a RUNAWAY BACKSTOP, not a ration (working
-            # set ~6G; the graph build peaks ~4.2G). MemorySwapMax=0 is the
-            # real guard — a runaway is cgroup-OOM'd cleanly in RAM instead of
-            # spilling into swap and thrashing WSL to death (the 2026-06 mode).
-            "MemoryMax=24G\n"
+            # Size backstops from the lower of host and cgroup memory.  The
+            # capture parent is structural; semantic work is separately
+            # admitted and must not inherit a workstation-specific 24G cap.
+            f"MemoryHigh={memory['worker_high']}M\n"
+            f"MemoryMax={memory['worker_max']}M\n"
             "MemorySwapMax=0\n\n"
             "[Install]\n"
             "WantedBy=default.target\n"
@@ -286,10 +368,8 @@ def _install_systemd():
             "Environment=MALLOC_ARENA_MAX=2\n"
             # memmap the embedding matrix → file-backed, reclaimable pages.
             "Environment=FLEX_VEC_MEMMAP=1\n"
-            # 64GB box: the cap is a RUNAWAY BACKSTOP, not a ration (warm set
-            # is a few G with memmap). MemorySwapMax=0 forces a runaway to
-            # cgroup-OOM cleanly in RAM rather than thrash WSL via swap.
-            "MemoryMax=24G\n"
+            f"MemoryHigh={memory['mcp_high']}M\n"
+            f"MemoryMax={memory['mcp_max']}M\n"
             "MemorySwapMax=0\n"
             # KillMode=mixed: SIGTERM to main only, then SIGKILL the whole
             # cgroup after TimeoutStopSec. Ensures python children get
@@ -313,6 +393,11 @@ def _install_systemd():
             "Type=oneshot\n"
             f"ExecStart={refresh_cmd}\n"
             "Environment=PYTHONUNBUFFERED=1\n"
+            "Environment=MALLOC_ARENA_MAX=2\n"
+            "Environment=FLEX_EMBED_SERVICE_ONLY=1\n"
+            f"MemoryHigh={memory['worker_high']}M\n"
+            f"MemoryMax={memory['worker_max']}M\n"
+            "MemorySwapMax=0\n"
         ),
         "flex-refresh.timer": (
             "[Unit]\n"
@@ -390,6 +475,12 @@ def _install_launchd():
     <dict>
         <key>PYTHONUNBUFFERED</key>
         <string>1</string>
+        <key>MALLOC_ARENA_MAX</key>
+        <string>2</string>
+        <key>FLEX_VEC_MEMMAP</key>
+        <string>1</string>
+        <key>FLEX_EMBED_SERVICE_ONLY</key>
+        <string>1</string>
     </dict>
 </dict>
 </plist>""",
@@ -420,6 +511,10 @@ def _install_launchd():
     <dict>
         <key>PYTHONUNBUFFERED</key>
         <string>1</string>
+        <key>MALLOC_ARENA_MAX</key>
+        <string>2</string>
+        <key>FLEX_VEC_MEMMAP</key>
+        <string>1</string>
     </dict>
 </dict>
 </plist>""",
@@ -447,6 +542,8 @@ def _install_launchd():
     <key>EnvironmentVariables</key>
     <dict>
         <key>PYTHONUNBUFFERED</key>
+        <string>1</string>
+        <key>FLEX_EMBED_SERVICE_ONLY</key>
         <string>1</string>
     </dict>
 </dict>
@@ -574,8 +671,17 @@ def _start_services_direct():
             except (ValueError, OSError):
                 pid_file.unlink(missing_ok=True)
 
+        service_env = os.environ.copy()
+        service_env.setdefault("MALLOC_ARENA_MAX", "2")
+        service_env.setdefault("FLEX_VEC_MEMMAP", "1")
         with open(log_file, "a") as out, open(log_file.with_suffix(".err"), "a") as err:
-            proc = subprocess.Popen(cmd, stdout=out, stderr=err, start_new_session=True)
+            proc = subprocess.Popen(
+                cmd,
+                stdout=out,
+                stderr=err,
+                start_new_session=True,
+                env=service_env,
+            )
         pid_file.write_text(str(proc.pid))
 
     if not _is_worker_alive():
@@ -886,13 +992,12 @@ def _run_enrichment_quiet(conn, progress_cb=None) -> tuple[int, list[str]]:
 
 # ── Surface routing ───────────────────────────────────────────────────────
 # Present one filesystem compiler with compatibility aliases for the former
-# Instant, Markdown/Obsidian, and codegraph installation surfaces.
+# Markdown/Obsidian and codegraph installation surfaces.
 #
 #   filesystem -> mixed filesystem engine (embedded by default)
 #   codegraph   -> filesystem, code-only + no-embed compatibility mode
 #
 # Permanent aliases (old commands keep working):
-#   instant             -> filesystem, no-embed (except legacy regen/remove)
 #   obsidian / markdown -> filesystem, markdown-only
 #   code                -> codegraph compatibility mode
 def _resolve_module_surface(module: str, args) -> tuple[str, dict]:
@@ -902,13 +1007,9 @@ def _resolve_module_surface(module: str, args) -> tuple[str, dict]:
     applied onto `args` before dispatch. A name
     that is neither a surface verb nor an alias passes through untouched.
     """
-    if module in ("filesystem", "instant", "obsidian", "markdown"):
+    if module in ("filesystem", "obsidian", "markdown"):
         if module == "filesystem":
             return "filesystem", {}
-        if module == "instant":
-            if getattr(args, "regen", None) or getattr(args, "remove", None):
-                return "instant", {}
-            return "filesystem", {"no_embed": True}
         return "filesystem", {
             "obsidian": module == "obsidian",
             "_filesystem_file_kinds": ("markdown",),
@@ -932,6 +1033,7 @@ def cmd_init(args):
     console = Console()
     _warnings: list[str] = []
     _module = getattr(args, 'module', None)
+    modules = None
 
     # Route legacy surface verbs into the unified filesystem engine and apply
     # their compatibility flags before dispatch.
@@ -941,20 +1043,27 @@ def cmd_init(args):
         for _k, _v in _forced.items():
             setattr(args, _k, _v)
 
-    # Stop running worker/MCP before a FULL module install to avoid DB lock
-    # contention. Skip for lightweight instant recompiles (--regen/--path/--remove):
-    # they write their own no-embed cell and never touch the worker/mcp DBs. On the
-    # 60s instant-regen cron, this kill flapped flex-mcp every minute (it never
-    # stayed up long enough to finish warming). A regen recompiles the cell; it must
-    # not bounce the daemons. Externally managed container initialization must not
-    # stop the persistent host-owned runtime.
-    _regen_op = _module == "instant" and (
-        getattr(args, "regen", None)
-        or getattr(args, "path", None)
-        or getattr(args, "remove", None)
-    )
-    if _module and not _regen_op:
-        _quiesce_runtime_for_init(_module)
+        if _module == "instant":
+            console.print("  [red]Unknown module: instant[/red]")
+            console.print("  Instant was removed; use filesystem with --no-embed or --structural.")
+            console.print()
+            sys.exit(1)
+
+        # Reject a removed or misspelled module before service quiescence,
+        # storage setup, or an optional model download.
+        modules = _discover_install_modules()
+        if _module not in modules:
+            console.print(f"  [red]Unknown module: {_module}[/red]")
+            if modules:
+                console.print(f"  Available: {', '.join(sorted(modules.keys()))}")
+            else:
+                console.print("  No modules installed.")
+            console.print()
+            sys.exit(1)
+
+    # A complete install owns the service quiescence boundary so writers do
+    # not race the replacement database.
+    _quiesce_runtime_for_init(_module)
 
     console.print()
 
@@ -999,7 +1108,17 @@ def cmd_init(args):
     # 2. Model
     from flex.onnx.fetch import download_model, model_ready
     _model_ok = True
-    if not model_ready():
+    _model_not_required = (
+        _module == "filesystem"
+        and (
+            bool(getattr(args, "no_embed", False))
+            or bool(getattr(args, "structural", False))
+        )
+    )
+    if _model_not_required:
+        _model_ok = False
+        console.print("  model               [dim]not required[/dim]")
+    elif not model_ready():
         console.print("  model               downloading")
         try:
             download_model()
@@ -1028,16 +1147,6 @@ def cmd_init(args):
         console.print(Panel(panel_content, padding=(1, 2), highlight=False))
         console.print()
         return
-
-    modules = _discover_install_modules()
-    if _module not in modules:
-        console.print(f"  [red]Unknown module: {_module}[/red]")
-        if modules:
-            console.print(f"  Available: {', '.join(sorted(modules.keys()))}")
-        else:
-            console.print("  No modules installed.")
-        console.print()
-        sys.exit(1)
 
     entry = modules[_module]
     mod = entry['module']
@@ -1268,7 +1377,7 @@ def cmd_hub_pull(args):
             continue                              # collected below — never silent
         dest = download_cell(entry, CELLS_DIR)
         register_cell(name=name, path=str(dest), cell_type=entry.cell_type,
-                      source_url=entry.url, checksum=entry.checksum, origin=origin)
+                      source_url=entry.url, checksum=entry.checksum, origin=origin, publish=True)
         print(f"  {name}: installed")
 
     # GUARD 1 (PRIMARY). Cells that DID resolve are installed above — we don't roll
@@ -1448,66 +1557,6 @@ def cmd_relay(args):
     return cmd_hub_relay(args)
 
 
-# ============================================================
-# raw search implementation
-# ============================================================
-
-def _open_cell_for_search(cell_name: str, query: str | None = None):
-    """Open a cell, warming vectors only when the query actually needs them.
-
-    Routes through the same resolution as the MCP path (flex.engine.build_vec_state
-    / register_vec_udf) so a tagged cell (e.g. `vec:model=nomic-v1.5`) serves
-    identically here as it does over MCP or flex.retrieve.execute — no more
-    stale-default-embedder divergence for the CLI path."""
-    from flex.registry import resolve_cell
-    from flex.core import open_cell_readonly
-
-    path = resolve_cell(cell_name)
-    if path is None:
-        from flex.registry import retired_cell_message
-        retired = retired_cell_message(cell_name)
-        if retired:
-            print(retired, file=sys.stderr)
-            sys.exit(1)
-        print(f"Cell '{cell_name}' not found.", file=sys.stderr)
-        print("Run 'flex init' first, then use Claude Code to build your index.", file=sys.stderr)
-        sys.exit(1)
-
-    db = open_cell_readonly(path)
-
-    needs_vectors = 'vec_ops(' in (query or '')
-    if query and query.lstrip().startswith('@'):
-        preset_name = query.lstrip()[1:].split(None, 1)[0]
-        try:
-            from flex.retrieve.presets import PresetLoader
-
-            preset = PresetLoader(db).load(preset_name)
-            needs_vectors = any(
-                'vec_ops(' in str(item.get('sql') or '').lower()
-                for item in preset.get('queries', [])
-            )
-        except (KeyError, ValueError, sqlite3.Error):
-            needs_vectors = False
-
-    # Structural SQL/recovery must not pay to load a multi-gigabyte vector
-    # matrix. Semantic queries still use the exact shared engine resolver.
-    try:
-        if not needs_vectors:
-            return db
-        from flex import engine as _engine
-        from pathlib import Path as _Path
-
-        db_path = _Path(path)
-        mtime = db_path.stat().st_mtime if db_path.exists() else 0
-        state = _engine.build_vec_state(cell_name, db, mtime)
-        if state:
-            _engine.register_vec_udf(db, state)
-    except ImportError:
-        pass  # vec_ops won't work but plain SQL is fine
-
-    return db
-
-
 def _format_results(result_json: str, as_json: bool = False) -> str:
     """Format query results for terminal output."""
     if as_json:
@@ -1548,27 +1597,75 @@ def _format_results(result_json: str, as_json: bool = False) -> str:
 
 
 def cmd_search(args):
-    """Execute a query against a cell."""
-    # Lazy import — avoids pulling in mcp deps at CLI startup
-    from flex.mcp_server import execute_query
-
+    """Execute through the same target-capable query kernel as MCP."""
     query = args.query
     if query.startswith('!'):
         query = query[1:].lstrip()
-    if args.cell == "ledger":
-        # Ledger is self-provisioning at its query boundary. Route both reads
-        # and mutations through that shared kernel so a raw shell query has the
-        # same first-use behavior as MCP and does not require an install verb.
-        from flex.mcp_server import _execute_cell_query
-        print(_execute_cell_query(args.cell, query))
-        return
 
-    db = _open_cell_for_search(args.cell, query)
+    if not getattr(args, "direct", False):
+        result = _query_via_local_service(args.cell, query)
+        if result is not None:
+            print(result)
+            return
+
+    # Lazy import — direct mode is a diagnostic/fallback path.  Semantic
+    # direct queries may build process-local model/cache state; the normal CLI
+    # route reuses the long-lived local service instead.
+    from flex.mcp_server import _execute_cell_query
+    print(_execute_cell_query(args.cell, query))
+
+
+def _query_via_local_service(cell: str, query: str) -> str | None:
+    """Return kernel JSON from the local service, or None if it is absent.
+
+    Only connection refusal and an older server without `/query` permit direct
+    fallback.  A timeout is ambiguous for Ledger mutations and must never
+    cause the CLI to execute the same operation a second time.
+    """
+    import socket
+    import urllib.error
+    import urllib.request
+
+    runtime_keys = (
+        "CODEX_THREAD_ID", "CLAUDE_SESSION_ID",
+        "FLEX_RUNTIME_SESSION_ID", "FLEX_RUNTIME_PROVIDER",
+    )
+    payload = {
+        "cell": cell,
+        "query": query,
+        "runtime_environ": {
+            key: os.environ[key] for key in runtime_keys if os.environ.get(key)
+        },
+    }
+    request = urllib.request.Request(
+        "http://127.0.0.1:7134/query",
+        data=json.dumps(payload).encode("utf-8"),
+        headers={"Content-Type": "application/json"},
+        method="POST",
+    )
     try:
-        result = execute_query(db, query, cell=args.cell)
-        print(result)
-    finally:
-        db.close()
+        with urllib.request.urlopen(request, timeout=35) as response:
+            decoded = json.loads(response.read())
+    except urllib.error.HTTPError as exc:
+        if exc.code in (404, 405):
+            return None
+        try:
+            detail = json.loads(exc.read())
+        except Exception:
+            detail = {"error": f"local query service returned HTTP {exc.code}"}
+        return json.dumps(detail)
+    except urllib.error.URLError as exc:
+        if isinstance(exc.reason, ConnectionRefusedError):
+            return None
+        raise RuntimeError(f"local query service unavailable: {exc.reason}") from exc
+    except (TimeoutError, socket.timeout) as exc:
+        raise RuntimeError(
+            "local query timed out; result is unknown and was not retried"
+        ) from exc
+
+    if not isinstance(decoded, dict) or not isinstance(decoded.get("result"), str):
+        raise RuntimeError("local query service returned an invalid response")
+    return decoded["result"]
 
 
 # ============================================================
@@ -2207,7 +2304,7 @@ def cmd_status(args):
                 'active': bool(c.get('active', 1)),
                 'unlisted': bool(c.get('unlisted', 0)),
                 'discoverable': bool(c.get('active', 1)) and not bool(c.get('unlisted', 0)),
-                'warm_on_startup': bool(c.get('active', 1)) and not bool(c.get('unlisted', 0)),
+                'warm_on_startup': bool(c.get('prewarm', 0)),
                 'refresh_status': c.get('refresh_status'),
                 'effective_refresh_status': state['effective_refresh_status'],
                 'last_refresh_at': c.get('last_refresh_at'),
@@ -2284,11 +2381,10 @@ def cmd_warm(args):
     targets = list(getattr(args, 'cells', []) or [])
 
     if not targets:
-        active = sorted(c['name'] for c in cells
-                        if c.get('active', 1) and not c.get('unlisted', 0))
-        lazy = sorted(c['name'] for c in cells if not c.get('active', 1))
-        print(f"Warm at startup ({len(active)}):")
-        for n in active:
+        warm = sorted(c['name'] for c in cells if c.get('prewarm', 0))
+        lazy = sorted(c['name'] for c in cells if not c.get('prewarm', 0))
+        print(f"Warm at startup ({len(warm)}):")
+        for n in warm:
             print(f"  ● {n}")
         print(f"\nLazy — load on first query ({len(lazy)}):")
         for n in lazy:
@@ -2306,15 +2402,15 @@ def cmd_warm(args):
         changed = 0
         for c in cells:
             want = c['name'] in targets
-            if bool(c.get('active', 1)) != want:
-                registry.set_active(c['name'], want)
+            if bool(c.get('prewarm', 0)) != want:
+                registry.set_prewarm(c['name'], want)
                 changed += 1
         print(f"Warm-set is now exactly ({len(targets)}): {', '.join(sorted(targets))}"
               f"  [{changed} changed]")
     else:
         on = not getattr(args, 'off', False)
         for t in targets:
-            registry.set_active(t, on)
+            registry.set_prewarm(t, on)
         print(f"Set {len(targets)} cell(s) {'warm at startup' if on else 'lazy'}: "
               f"{', '.join(targets)}")
 
@@ -2644,6 +2740,10 @@ def main():
     search_p.add_argument("query", help="SQL query, @preset, or vec_ops expression")
     search_p.add_argument("--cell", default="claude_code", help="Cell to query (default: claude_code)")
     search_p.add_argument("--json", action="store_true", help="Output raw JSON")
+    search_p.add_argument(
+        "--direct", action="store_true",
+        help="Bypass the local service (may build process-local semantic state)",
+    )
 
     # flex sync
     sync_p = sub.add_parser("sync", help="Bring code, data, and services into parity")

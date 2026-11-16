@@ -171,6 +171,7 @@ def run(args, console) -> None:
         lifecycle="static" if getattr(args, "github_static", False) else "refresh",
         refresh_interval=None if getattr(args, "github_static", False) else refresh_interval,
         refresh_module=None if getattr(args, "github_static", False) else MODULE["refresh_module"],
+        publish=True,
     )
 
     if getattr(args, "github_graph", False):

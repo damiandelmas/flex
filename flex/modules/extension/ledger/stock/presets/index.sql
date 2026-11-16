@@ -22,7 +22,7 @@ SELECT
          THEN substr(summary,1,357) || '...'
          ELSE summary END AS summary,
     length(summary) AS summary_chars,
-    native_source_address,target_cell_id,target_cell_name,target_chunk_id,
+    native_source_address,target_cell_id,target_cell_name,target_chunk_id,target_end_chunk_id,
     annotation_id,revision,source_order,wing,hall,room,weight,target_readable,
     structural_child_count,outgoing_relationship_count
 FROM _ledger_index_cards
@@ -45,7 +45,7 @@ WITH target AS (
 SELECT
     c.address,c.parent_address,c.position,c.label,c.index_kind,c.captured_role,
     c.summary,c.native_source_address,c.target_cell_id,c.target_cell_name,
-    c.target_chunk_id,c.annotation_id,c.revision,c.source_order,c.created_at,
+    c.target_chunk_id,target_end_chunk_id,c.annotation_id,c.revision,c.source_order,c.created_at,
     c.author_provider,c.author_session_id,c.wing,c.hall,c.room,c.weight,
     c.target_readable,c.structural_child_count,c.outgoing_relationship_count
 FROM _ledger_index_cards c

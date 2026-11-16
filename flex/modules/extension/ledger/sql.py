@@ -18,11 +18,15 @@ _MUTATION_RE = re.compile(
 )
 
 
-def annotation_id(target_cell_id: str, target_chunk_id: str) -> str:
-    """Return the stable annotation identity for one exact target object."""
-    return str(uuid.uuid5(
-        ANNOTATION_NAMESPACE, f"{target_cell_id}:{target_chunk_id}"
-    ))
+def annotation_id(target_cell_id: str, target_chunk_id: str, target_end_chunk_id: str | None = None) -> str:
+    """Preserve single-target IDs; range IDs include both exact endpoints."""
+    if target_end_chunk_id is None:
+        identity = f"{target_cell_id}:{target_chunk_id}"
+    else:
+        if not target_end_chunk_id or target_end_chunk_id == target_chunk_id:
+            raise ValueError("range endpoint must differ from its start; use NULL for a single message")
+        identity = json.dumps(["range", target_cell_id, target_chunk_id, target_end_chunk_id], separators=(",", ":"), ensure_ascii=False)
+    return str(uuid.uuid5(ANNOTATION_NAMESPACE, identity))
 
 
 def mutation_operation(sql: str) -> str | None:
@@ -42,6 +46,7 @@ def register_functions(
 ) -> None:
     """Install deterministic identity and caller-scoped authorship functions."""
     conn.create_function("ledger_annotation_id", 2, annotation_id, deterministic=True)
+    conn.create_function("ledger_annotation_id", 3, annotation_id, deterministic=True)
     conn.create_function("ledger_author_provider", 0, lambda: author_provider)
     conn.create_function("ledger_author_session_id", 0, lambda: author_session_id)
     conn.create_function("ledger_author_source", 0, lambda: author_source)

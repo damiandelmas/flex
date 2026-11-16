@@ -417,9 +417,9 @@ def _mint_file_identity(conn: sqlite3.Connection, source_id: str, file_path: str
     """Mint (or resolve) this file's SOMA uuid → _edges_fs_identity. Never raises —
     identity must never fail a compile (instant/docpac discipline). Idempotent."""
     try:
-        from flex.modules.soma.lib.identity.file_identity import get_instance
+        from flex.modules.identity import get_instance
         rp = str(Path(file_path).resolve())
-        uuid = get_instance().assign_batch([rp]).get(rp)
+        uuid = get_instance(conn).assign_batch([rp]).get(rp)
         if uuid:
             conn.execute(
                 "INSERT OR REPLACE INTO _edges_fs_identity (source_id, file_uuid) "
@@ -829,7 +829,7 @@ def _scan_code_cell(cell: dict, size_cache: dict, identity) -> tuple[dict, int, 
         conn.close()
 
 
-def scan_code_cells(size_cache: dict) -> dict:
+def scan_code_cells(size_cache: dict, *, cell_names=None) -> dict:
     """Incremental drain for cell_type='code' cells. Mirrors scan_docpac_cells:
     stat-poll walk (pruned + exclude_dirs), content-hash skip inside
     index_file_code, per-file index_file_code, reconcile-delete, and committed
@@ -839,9 +839,9 @@ def scan_code_cells(size_cache: dict) -> dict:
         mark_refresh_started,
     )
     try:
-        # get_instance() (the singleton) — same mint entry point as docpac's
-        # _mint_file_identity, so a test can airtight-redirect the SOMA DB once.
-        from flex.modules.soma.lib.identity.file_identity.identity import get_instance
+        # The provider selector (SOMA by default, sd-store via FLEX_IDENTITY): the
+        # same mint entry point as the fs/docpac writers.
+        from flex.modules.identity import get_instance
     except Exception:
         get_instance = None
 
@@ -849,7 +849,8 @@ def scan_code_cells(size_cache: dict) -> dict:
     cells = [c for c in list_cells()
              if c.get('cell_type') == 'code' and c.get('corpus_path')
              and c.get('lifecycle') == 'watch'
-             and c.get('active', 1)]
+             and c.get('active', 1)
+             and (cell_names is None or c.get('name') in cell_names)]
     if not cells:
         return stats
     fid = get_instance() if get_instance else None

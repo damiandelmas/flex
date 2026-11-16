@@ -265,6 +265,16 @@ def _install_acp_views(db: sqlite3.Connection) -> None:
     message_type = _optional_col(db, "m", "_types_message", "type")
     tool_name = _optional_col(db, "t", "_edges_tool_ops", "tool_name")
     target_file = _optional_col(db, "t", "_edges_tool_ops", "target_file")
+    source_title = _optional_col(db, "src", "_raw_sources", "title")
+    source_summary = _optional_col(db, "src", "_raw_sources", "summary")
+    # A row is direct evidence when a native message or tool row describes it;
+    # only reference the joins this cell actually has (chat cells have no tools).
+    direct_checks = [
+        f"{alias}.chunk_id IS NOT NULL"
+        for alias, table in (("t", "_edges_tool_ops"), ("m", "_types_message"))
+        if _has_table(db, table)
+    ]
+    is_direct = " OR ".join(direct_checks) or "0"
 
     message_join = (
         "LEFT JOIN _types_message m ON r.id = m.chunk_id"
@@ -309,7 +319,7 @@ SELECT
     0 AS inferred,
     'session' AS event_type,
     NULL AS event_role,
-    COALESCE(src.title, src.summary, src.source_id) AS event_text,
+    COALESCE({source_title}, {source_summary}, src.source_id) AS event_text,
     NULL AS tool_name,
     NULL AS target_file,
     MIN(r.timestamp) AS timestamp
@@ -332,14 +342,8 @@ SELECT
     {source_path} AS source_path,
     {source_position} AS source_offset_or_rowid,
     NULL AS raw_payload_ref,
-    CASE
-        WHEN t.chunk_id IS NOT NULL OR m.chunk_id IS NOT NULL THEN 'direct'
-        ELSE 'inferred'
-    END AS fidelity_status,
-    CASE
-        WHEN t.chunk_id IS NOT NULL OR m.chunk_id IS NOT NULL THEN 0
-        ELSE 1
-    END AS inferred,
+    CASE WHEN {is_direct} THEN 'direct' ELSE 'inferred' END AS fidelity_status,
+    CASE WHEN {is_direct} THEN 0 ELSE 1 END AS inferred,
     CASE
         WHEN {tool_name} IS NOT NULL AND {tool_name} IN ('Bash', 'shell', 'local_shell')
             THEN 'terminal_create'

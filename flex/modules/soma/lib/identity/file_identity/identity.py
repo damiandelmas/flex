@@ -37,6 +37,31 @@ XATTR_NAME = "user.soma.file_uuid"
 DB_PATH = Path.home() / ".soma" / "file-identity.db"
 SCHEMA_PATH = Path(__file__).parent / "schema.sql"
 
+# Paths that never receive an identity. Mirrors IDENTITY_APPLICABILITY
+# ['file_uuid']['exclude_paths'] in flex.modules.soma.compile; kept here so the
+# rule holds for every caller, not only the chunk-enrichment path.
+EPHEMERAL_PREFIXES = ("/tmp/", "/var/tmp/", "/dev/")
+
+
+def is_ephemeral(path: str) -> bool:
+    """True for paths that must not be minted (/tmp, /var/tmp, /dev).
+
+    SOMA_ALLOW_EPHEMERAL=1 disables the rule; test suites that build their
+    fixtures under pytest's /tmp tmp_path set it. Production never does.
+    """
+    if os.environ.get("SOMA_ALLOW_EPHEMERAL") == "1":
+        return False
+    return str(path).startswith(EPHEMERAL_PREFIXES)
+
+
+def _dev_ino(path: str) -> tuple[Optional[int], Optional[int]]:
+    """(st_dev, st_ino) of the file behind path, or (None, None)."""
+    try:
+        st = os.stat(path)
+        return st.st_dev, st.st_ino
+    except OSError:
+        return None, None
+
 
 @dataclass
 class FileInfo:
@@ -81,6 +106,20 @@ class FileIdentity:
                 db.executescript(f.read())
             db.commit()
 
+        # Forward migration: inode columns back the copy-vs-move test. Older
+        # stores lack them; rows stay NULL until the file is next seen.
+        cols = {r[1] for r in db.execute("PRAGMA table_info(files)")}
+        for col in ("dev", "ino"):
+            if col not in cols:
+                try:
+                    db.execute(f"ALTER TABLE files ADD COLUMN {col} INTEGER")
+                except sqlite3.OperationalError as e:
+                    # Two processes can both see the column missing; the
+                    # second ALTER loses the race. That is success, not failure.
+                    if "duplicate column" not in str(e):
+                        raise
+        db.commit()
+
         return db
 
     # ─────────────────────────────────────────────────────────────────────────
@@ -98,6 +137,8 @@ class FileIdentity:
         Returns UUID string.
         """
         path = str(Path(path).resolve())
+        if is_ephemeral(path):
+            return None
 
         # Check DB first
         row = self.db.execute("SELECT uuid FROM files WHERE path = ?", (path,)).fetchone()
@@ -112,7 +153,7 @@ class FileIdentity:
 
         # Check xattr (file might have moved, DB has old path)
         existing_uuid = self._get_xattr(path)
-        if existing_uuid:
+        if existing_uuid and self._xattr_names_this_file(existing_uuid, path):
             # Update DB with new path. A False return means another uuid already
             # claims this path (collision) so the DB row was left untouched — but
             # the file's own xattr is authoritative, so returning existing_uuid
@@ -127,13 +168,14 @@ class FileIdentity:
         content_hash = self._content_hash(path)
         size = self._file_size(path)
         repo_root, repo_relative = self._git_info(path)
+        dev, ino = _dev_ino(path)
 
         # Store in DB
         now = datetime.now().isoformat()
         self.db.execute("""
-            INSERT INTO files (uuid, path, content_hash, size, repo_root_commit, repo_relative_path, last_seen, created_at)
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?)
-        """, (file_uuid, path, content_hash, size, repo_root, repo_relative, now, now))
+            INSERT INTO files (uuid, path, content_hash, size, repo_root_commit, repo_relative_path, last_seen, created_at, dev, ino)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+        """, (file_uuid, path, content_hash, size, repo_root, repo_relative, now, now, dev, ino))
 
         # Record initial path
         self.db.execute(
@@ -267,13 +309,17 @@ class FileIdentity:
                 path = Path(f["path"])
 
                 if path.exists():
-                    # Verify/update
+                    # Verify/update. The inode is refreshed with the hash: an
+                    # editor that saves via temp-file-and-rename, or a git
+                    # checkout, replaces the inode at the same path, and a
+                    # stale (dev, ino) would later make a plain mv look like a
+                    # copy.
                     current_hash = self._content_hash(str(path))
-                    if current_hash != f["content_hash"]:
-                        self.db.execute(
-                            "UPDATE files SET content_hash = ?, last_seen = ? WHERE uuid = ?",
-                            (current_hash, datetime.now().isoformat(), f["uuid"])
-                        )
+                    dev, ino = _dev_ino(str(path))
+                    self.db.execute(
+                        "UPDATE files SET content_hash = ?, dev = ?, ino = ?, last_seen = ? WHERE uuid = ?",
+                        (current_hash, dev, ino, datetime.now().isoformat(), f["uuid"])
+                    )
 
                     # Ensure xattr
                     self._set_xattr(str(path), f["uuid"])
@@ -400,6 +446,8 @@ class FileIdentity:
         for raw in paths:
             try:
                 path = str(Path(raw).resolve())
+                if is_ephemeral(path):
+                    continue
                 if path in results:
                     # already handled this batch (dup input path) — skip so we
                     # don't re-generate a UUID and orphan a path_history row
@@ -412,17 +460,19 @@ class FileIdentity:
                     self._set_xattr(path, row["uuid"], record=False)
                     continue
                 existing = self._get_xattr(path)
-                if existing:
-                    # moved/copied file carrying an xattr — rare in bulk indexing;
+                if existing and self._xattr_names_this_file(existing, path):
+                    # moved file carrying an xattr — rare in bulk indexing;
                     # delegate to the single-file path which records the new location
                     results[path] = self.assign(path)
                     continue
                 file_uuid = str(uuid_lib.uuid4())
                 repo_root, repo_relative = self._git_info(path)
                 now = datetime.now().isoformat()
+                dev, ino = _dev_ino(path)
                 pending.append((
                     file_uuid, path, self._content_hash(path), self._file_size(path),
                     repo_root, repo_relative, now, now,  # last_seen, created_at
+                    dev, ino,
                 ))
                 results[path] = file_uuid
             except Exception:
@@ -451,8 +501,8 @@ class FileIdentity:
                 self.db.executemany(
                     "INSERT OR IGNORE INTO files "
                     "(uuid, path, content_hash, size, repo_root_commit, "
-                    "repo_relative_path, last_seen, created_at) "
-                    "VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
+                    "repo_relative_path, last_seen, created_at, dev, ino) "
+                    "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
                     rows,
                 )
                 self.db.executemany(
@@ -632,6 +682,33 @@ def heal_file_refs():
     # Internal Helpers
     # ─────────────────────────────────────────────────────────────────────────
 
+    def _xattr_names_this_file(self, file_uuid: str, path: str) -> bool:
+        """Decide whether an xattr found on `path` belongs to that file or was
+        copied along with the bytes (cp -a, rsync -X, copy2 all preserve xattrs).
+
+        A move keeps the inode; a copy gets a new one. So when the DB knows the
+        uuid at another path with a recorded (dev, ino), reuse the uuid only if
+        the inode agrees, or if the recorded path is gone and the bytes match
+        (a cross-filesystem move: new inode, same content, old locator dead).
+        Unknown uuids, and rows without inode data, keep the old trusting rule.
+        """
+        row = self.db.execute(
+            "SELECT path, dev, ino, content_hash FROM files WHERE uuid = ?", (file_uuid,)
+        ).fetchone()
+        if not row:
+            return True  # xattr from another store; nothing to contradict it
+        if row["path"] == path:
+            return True
+        if row["dev"] is None or row["ino"] is None:
+            return True  # pre-migration row: no inode evidence yet
+        dev, ino = _dev_ino(path)
+        if (dev, ino) == (row["dev"], row["ino"]):
+            return True  # same inode: a rename or same-filesystem move
+        if not os.path.lexists(row["path"]) and row["content_hash"] and \
+                row["content_hash"] == self._content_hash(path):
+            return True  # old locator gone, same bytes: cross-filesystem move
+        return False  # different inode, original still there: a copy
+
     def _get_xattr(self, path: str) -> Optional[str]:
         """Read UUID from file's extended attributes."""
         getxattr = getattr(os, "getxattr", None)
@@ -727,14 +804,15 @@ def heal_file_refs():
         content_hash = self._content_hash(new_path)
         size = self._file_size(new_path)
         repo_root, repo_relative = self._git_info(new_path)
+        dev, ino = _dev_ino(new_path)
 
         self.db.execute("""
             UPDATE files SET
                 path = ?, content_hash = ?, size = ?,
                 repo_root_commit = ?, repo_relative_path = ?,
-                last_seen = ?
+                last_seen = ?, dev = ?, ino = ?
             WHERE uuid = ?
-        """, (new_path, content_hash, size, repo_root, repo_relative, now, file_uuid))
+        """, (new_path, content_hash, size, repo_root, repo_relative, now, dev, ino, file_uuid))
 
         # Record in history
         self.db.execute(

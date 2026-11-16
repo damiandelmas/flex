@@ -42,6 +42,9 @@ _ALLOWED_PRAGMAS = frozenset(
         "data_version",
         "page_count",
         "page_size",
+        # Read-only introspection: @orient derives the retrieval operations it
+        # advertises from what this connection actually registered.
+        "function_list",
     }
 )
 

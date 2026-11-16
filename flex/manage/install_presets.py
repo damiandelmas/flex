@@ -79,6 +79,51 @@ def _packaged_variants(cell_type: str | None) -> dict[str, set[str]]:
     return variants
 
 
+RETIRED_DDL = (
+    "CREATE TABLE IF NOT EXISTS _presets_retired ("
+    "name TEXT PRIMARY KEY, reason TEXT, retired_at TEXT DEFAULT (datetime('now')))"
+)
+
+
+def _retired(conn: sqlite3.Connection) -> set[str]:
+    """Stock preset names this database has retired; seeding never re-adds them.
+
+    Retire a preset by deleting its _presets row and inserting its name here,
+    for example when its tables exist but hold nothing for this database.
+    """
+    conn.execute(RETIRED_DDL)
+    return {row[0] for row in conn.execute("SELECT name FROM _presets_retired")}
+
+
+def _runs_here(conn: sqlite3.Connection, parsed: dict) -> bool:
+    """Whether every query of a preset compiles against this database.
+
+    A stock group can carry presets for tables a given database lacks (chat
+    cells share the coding-agent group but have no tool or delegation edges).
+    Seeding those would install programs that always fail, and re-seed them
+    after every refresh even when someone deleted them. EXPLAIN prepares each
+    statement without running it; parameters bind as NULL.
+    """
+    import re
+    for query in parsed.get("queries") or []:
+        sql = (query.get("sql") or "").strip().rstrip(";")
+        if not sql:
+            continue
+        names = set(re.findall(r"(?<![:\w]):([A-Za-z_]\w*)", sql))
+        try:
+            conn.execute("EXPLAIN " + sql, {name: None for name in names}).fetchall()
+        except sqlite3.Error as exc:
+            # keyword() and vec_ops() are registered by the engine at query
+            # time, not stored in the file; their absence here says nothing.
+            message = str(exc)
+            if "no such function" in message or re.search(
+                r"no such table: (?:\w+\.)?(?:keyword|vec_ops)\b", message
+            ):
+                continue
+            return False
+    return True
+
+
 def ensure_cell_presets(
     conn: sqlite3.Connection,
     cell_type: str | None,
@@ -93,13 +138,18 @@ def ensure_cell_presets(
     )
     before = conn.total_changes
     variants = _packaged_variants(cell_type)
+    retired = _retired(conn)
     for name, sql in _expected_presets(cell_type).items():
+        if name in retired:
+            continue
         parsed = PresetLoader._parse(sql, name)
         existing = conn.execute(
             "SELECT sql FROM _presets WHERE name=?", (name,)
         ).fetchone()
         values = (parsed.get("description", ""), parsed.get("params", ""), sql, name)
         if existing is None:
+            if not _runs_here(conn, parsed):
+                continue
             conn.execute(
                 "INSERT INTO _presets(name,description,params,sql) VALUES (?,?,?,?)",
                 (name, *values[:3]),
@@ -145,10 +195,13 @@ def install_cell(cell_name: str, preset_dirs: list[Path] = None):
             "name TEXT PRIMARY KEY, description TEXT, params TEXT DEFAULT '', "
             "sql TEXT, source TEXT)"
         )
+        retired = _retired(conn)
         for directory in preset_dirs:
             for path in sorted(Path(directory).glob("*.sql")):
                 text = path.read_text(encoding="utf-8")
                 parsed = PresetLoader._parse(text, path.stem)
+                if parsed["name"] in retired or not _runs_here(conn, parsed):
+                    continue
                 conn.execute(
                     "INSERT OR IGNORE INTO _presets"
                     "(name,description,params,sql) VALUES (?,?,?,?)",

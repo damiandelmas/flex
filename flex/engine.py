@@ -26,14 +26,37 @@ def _touch_embedder(name: str) -> None:
     _embedder_last_used[name] = time.monotonic()
 
 
+_query_waiting = 0
+_query_cv = threading.Condition()
+
+
 def _encode_with_owner(name: str, embedder, text, **kwargs):
-    """Serialize inference so one owner cannot multiply peak workspaces."""
-    with _inference_lock:
-        _touch_embedder(name)
-        try:
-            return embedder.encode(text, **kwargs)
-        finally:
+    """Serialize inference so one owner cannot multiply peak workspaces.
+
+    threading.Lock is not FIFO, so a document drain would re-take it after
+    every slice. Query encodes (prefix 'search_query: ') therefore announce
+    themselves, and document encodes wait until none is pending.
+    """
+    global _query_waiting
+    is_query = kwargs.get('prefix') == 'search_query: '
+    with _query_cv:
+        if is_query:
+            _query_waiting += 1
+        else:
+            # Bounded: a steady query stream delays a drain slice, never starves it.
+            _query_cv.wait_for(lambda: _query_waiting == 0, timeout=10)
+    try:
+        with _inference_lock:
             _touch_embedder(name)
+            try:
+                return embedder.encode(text, **kwargs)
+            finally:
+                _touch_embedder(name)
+    finally:
+        if is_query:
+            with _query_cv:
+                _query_waiting -= 1
+                _query_cv.notify_all()
 
 
 def get_embedder():

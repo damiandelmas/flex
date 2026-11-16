@@ -81,6 +81,17 @@ DEFAULT_CODEX_SESSIONS_DIR = Path.home() / ".codex" / "sessions"
 DEFAULT_CODEX_STATE_DB = Path.home() / ".codex" / "state_5.sqlite"
 
 
+class CodexSessionCollision(RuntimeError):
+    """A rollout shares its session ID with a different indexed rollout.
+
+    Codex writes continuation rollouts (``…-<session>_<thread>.jsonl``) that
+    carry the parent's session ID. Indexing one would merge or replace the
+    parent's history, so the rollout is refused. Callers skip that one path:
+    raised out of a sync loop, it failed the whole job on every retry and
+    starved the cell's semantic turn.
+    """
+
+
 # ── Tool-name mapping ───────────────────────────────────────────────────────
 
 # Codex raw → CC canonical tool name. We map only when the tool's *function*
@@ -1894,9 +1905,22 @@ def backfill_exec_command_wrappers(
     return repaired
 
 
-def _rollout_generation(stat: os.stat_result) -> str:
+def _rollout_generation(stat: os.stat_result, path: Path) -> str:
     """Stable local identity used to reject a replaced rollout at one path."""
-    return f"{stat.st_dev}:{stat.st_ino}"
+    # Linux device numbers change when the same WSL filesystem is mounted
+    # again. Path-scoped inode identity still detects atomic replacements.
+    return f"fs:{os.statvfs(path).f_fsid}:{stat.st_ino}"
+
+
+def _same_rollout_generation(recorded: str | None, current: str) -> bool:
+    if not recorded:
+        return False
+    if recorded == current:
+        return True
+    # Upgrade the former device:inode receipt across WSL remounts. Keep the
+    # inode check: a replacement at this path must still reconcile safely.
+    device, separator, inode = recorded.partition(":")
+    return bool(separator and device.isdigit() and current.rsplit(":", 1)[-1] == inode)
 
 
 def _stable_jsonl_end(path: Path, offset: int, *, max_bytes: int | None = None) -> int:
@@ -2109,6 +2133,26 @@ def sync_rollout_path(
            FROM _codex_source_state WHERE source_path=?""",
         (str(rollout_path),),
     ).fetchone()
+    if prior is None:
+        try:
+            with rollout_path.open("r", encoding="utf-8") as handle:
+                first = json.loads(handle.readline())
+        except (OSError, json.JSONDecodeError):
+            first = {}
+        if isinstance(first, dict) and first.get("type") == "session_meta":
+            payload = first.get("payload")
+            session_id = payload.get("id") if isinstance(payload, dict) else None
+            if session_id:
+                sibling = conn.execute(
+                    "SELECT source_path FROM _codex_source_state "
+                    "WHERE session_id=? AND source_path<>? LIMIT 1",
+                    (session_id, str(rollout_path)),
+                ).fetchone()
+                if sibling is not None:
+                    raise CodexSessionCollision(
+                        "cannot index a new Codex rollout sharing session ID "
+                        f"{session_id} with {sibling[0]}: preserving indexed history"
+                    )
     if prior and prior[0:2] == (stat.st_size, stat.st_mtime_ns):
         # Pre-receipt installations are common. Do not turn their whole
         # historical archive into work merely because this code was upgraded;
@@ -2118,7 +2162,7 @@ def sync_rollout_path(
             return 0
 
     state_path = Path(state_db) if state_db is not None else DEFAULT_CODEX_STATE_DB
-    generation = _rollout_generation(stat)
+    generation = _rollout_generation(stat, rollout_path)
     append_state: dict | None = None
     append_offset = 0
     append_limit: int | None = None
@@ -2134,7 +2178,7 @@ def sync_rollout_path(
             append_state = None
         if (
             append_state is not None
-            and prior[4] == generation
+            and _same_rollout_generation(prior[4], generation)
             and prior[5] == append_state.get("session_id")
             and 0 <= append_offset <= stat.st_size
         ):
@@ -2144,6 +2188,15 @@ def sync_rollout_path(
             # No newline-complete records is not an error and must not advance
             # the receipt beyond the known good prefix.
             if append_limit == append_offset:
+                if append_offset == stat.st_size:
+                    # A fully consumed source needs only a receipt upgrade
+                    # after remount, never a destructive history replacement.
+                    conn.execute(
+                        "UPDATE _codex_source_state SET size_bytes=?,mtime_ns=?,"
+                        "source_generation=? WHERE source_path=?",
+                        (stat.st_size, stat.st_mtime_ns, generation, str(rollout_path)),
+                    )
+                    conn.commit()
                 return 0
         else:
             append_state = None
@@ -2182,8 +2235,18 @@ def sync_rollout_path(
         # for first capture and any source-generation/cursor failure.
         if (
             prior and prior[5]
-            and (prior[4] != generation or (prior[2] is not None and stat.st_size < prior[2]))
+            and (not _same_rollout_generation(prior[4], generation) or (prior[2] is not None and stat.st_size < prior[2]))
         ):
+            sibling = conn.execute(
+                "SELECT source_path FROM _codex_source_state "
+                "WHERE session_id=? AND source_path<>? LIMIT 1",
+                (prior[5], str(rollout_path)),
+            ).fetchone()
+            if sibling is not None:
+                raise CodexSessionCollision(
+                    "cannot replace a Codex rollout sharing session ID "
+                    f"{prior[5]} with {sibling[0]}: preserving indexed history"
+                )
             _clear_codex_session(conn, str(prior[5]))
         append_state = {}
         added = _sync_session_jsonl(
@@ -2263,14 +2326,16 @@ def _record_codex_rollout_completion(
     conn.commit()
 
 
+_CODEX_COLLISION_PREFIX = "codex_collision:"
+
 _CODEX_SCAN_LOCK = threading.Lock()
 
 
 def drain_codex_paths(invalidations, *, deadline: float | None = None) -> dict:
     """Publish watcher-selected Codex rollouts in the public worker fallback.
 
-    The private aggregate engine has a general provider path drainer. Public
-    wheels deliberately omit that integration, so Codex needs this narrow
+    A general provider path drainer, when present, is used for every cell type.
+    Without one, Codex needs this narrow
     provider-owned adapter rather than sending Codex events to the Filesystem
     handler (which correctly ignores non-Filesystem cells).
     """
@@ -2394,18 +2459,28 @@ def _scan_codex_cells(
         source_by_path = {}
         sources = [source for source in resolve_sources(conn) if source.usable]
 
-        # Stat recently synchronized rollouts first. An active long-running
-        # session already has a durable source-state row, so this detects its
-        # growth without first walking the entire Codex archive. The bounded
-        # discovery pass below remains responsible for never-before-seen files.
+        # Every durable receipt is the skip set. A rollout is work only when
+        # its (size, mtime_ns) moved or its committed cursor lags the file
+        # (an unindexed tail). Bounding this read by recency made every older
+        # receipted rollout look "new" to discovery and kept the pass from
+        # ever converging.
         known_rows = conn.execute(
             """SELECT source_path,size_bytes,mtime_ns,committed_offset,
                       source_generation,session_id,parser_state
-               FROM _codex_source_state """
-            "ORDER BY mtime_ns DESC LIMIT ?",
-            (max(limit * 4, 256),),
+               FROM _codex_source_state
+               ORDER BY mtime_ns DESC"""
         ).fetchall()
         known_paths = {str(row[0]) for row in known_rows}
+        # Collision-skipped rollouts carry a (size, mtime_ns) marker in _meta.
+        # It is deliberately not a _codex_source_state row: a receipt with the
+        # parent's session_id would make the parent's own sync see a sibling.
+        collision_marks = {
+            str(k)[len(_CODEX_COLLISION_PREFIX):]: str(v)
+            for k, v in conn.execute(
+                "SELECT key,value FROM _meta WHERE key LIKE ?",
+                (_CODEX_COLLISION_PREFIX + "%",),
+            )
+        }
         deferred_reconciles = 0
         for source_path, prior_size, prior_mtime, committed_offset, prior_generation, prior_session, parser_state in known_rows:
             if deadline is not None and time.time() >= deadline:
@@ -2425,17 +2500,27 @@ def _scan_codex_cells(
             except OSError:
                 continue
             resolved = str(resolved_path)
-            source_by_path[resolved] = source
-            if (prior_size, prior_mtime) != (stat.st_size, stat.st_mtime_ns):
+            if collision_marks.get(resolved) == f"{stat.st_size}:{stat.st_mtime_ns}":
+                continue
+            moved = (prior_size, prior_mtime) != (stat.st_size, stat.st_mtime_ns)
+            lagging = (
+                discover and not moved
+                and committed_offset is not None
+                and committed_offset < stat.st_size
+                and _same_rollout_generation(prior_generation, _rollout_generation(stat, resolved_path))
+            )
+            if moved:
                 # A two-second active tick is allowed only to advance a
                 # generation-qualified append receipt. Anything else is
                 # explicit reconciliation debt for the ordinary owner.
                 if not discover and (
                     committed_offset is None or not prior_session or not parser_state
-                    or prior_generation != _rollout_generation(stat)
+                    or not _same_rollout_generation(prior_generation, _rollout_generation(stat, resolved_path))
                 ):
                     deferred_reconciles += 1
                     continue
+            if moved or lagging:
+                source_by_path[resolved] = source
                 candidates.append((resolved, resolved))
 
         if deferred_reconciles:
@@ -2448,7 +2533,7 @@ def _scan_codex_cells(
         # Discover new rollouts within the same absolute budget. Check the
         # clock on every yielded path so a large historical tree cannot turn a
         # two-second structural pass into a minute-long query blackout.
-        if discover and not candidates:
+        if discover:
             for source in sources:
                 if deadline is not None and time.time() >= deadline:
                     break
@@ -2458,41 +2543,73 @@ def _scan_codex_cells(
                     resolved = str(path.resolve())
                     if resolved in known_paths:
                         continue
-                    source_by_path[resolved] = source
                     try:
-                        path.stat()
+                        stat = path.stat()
                     except OSError:
                         continue
+                    if collision_marks.get(resolved) == f"{stat.st_size}:{stat.st_mtime_ns}":
+                        continue
+                    source_by_path[resolved] = source
                     candidates.append((resolved, resolved))
         batch = _select_codex_rollout_batch(conn, candidates, limit)
         changed = 0
         completed = 0
         deadline_hit = False
-        for rollout_key, resolved in batch:
-            # Do not begin a potentially long structural transaction after its
-            # caller's absolute drain window has closed.
-            if deadline is not None and time.time() >= deadline:
-                deadline_hit = True
-                break
-            source = source_by_path[resolved]
-            changed += sync_rollout_path(
-                conn, Path(resolved), state_db=source.state_db,
-                deadline=deadline,
-                allow_reconcile=discover,
-                ensure_schema=discover,
-                source_meta={
-                    'source_kind': source.source_kind,
-                    'codex_home': str(source.codex_home),
-                    'sessions_dir': str(source.sessions_dir),
-                    'state_db': str(source.state_db),
-                    'rollout_path': resolved,
-                },
-            )
-            completed += 1
+        last_key = None
+        try:
+            for rollout_key, resolved in batch:
+                # Do not begin a potentially long structural transaction after
+                # its caller's absolute drain window has closed.
+                if deadline is not None and time.time() >= deadline:
+                    deadline_hit = True
+                    break
+                source = source_by_path[resolved]
+                try:
+                    # Schema was ensured once above; per-rollout repair cost
+                    # ~0.2 s of state_5 reads and UPDATEs on a large cell.
+                    changed += sync_rollout_path(
+                        conn, Path(resolved), state_db=source.state_db,
+                        deadline=deadline,
+                        allow_reconcile=discover,
+                        ensure_schema=False,
+                        source_meta={
+                            'source_kind': source.source_kind,
+                            'codex_home': str(source.codex_home),
+                            'sessions_dir': str(source.sessions_dir),
+                            'state_db': str(source.state_db),
+                            'rollout_path': resolved,
+                        },
+                    )
+                    if resolved in collision_marks:
+                        conn.execute(
+                            "DELETE FROM _meta WHERE key=?",
+                            (_CODEX_COLLISION_PREFIX + resolved,),
+                        )
+                        collision_marks.pop(resolved, None)
+                except CodexSessionCollision as exc:
+                    print(f"[codex] skipped {resolved}: {exc}", file=sys.stderr)
+                    # Remember this exact file state so the collision is not
+                    # re-attempted every pass; any size/mtime change re-admits.
+                    try:
+                        st = Path(resolved).stat()
+                        mark = f"{st.st_size}:{st.st_mtime_ns}"
+                        conn.execute(
+                            "INSERT OR REPLACE INTO _meta (key,value) VALUES (?,?)",
+                            (_CODEX_COLLISION_PREFIX + resolved, mark),
+                        )
+                        collision_marks[resolved] = mark
+                        conn.commit()
+                    except OSError:
+                        pass
+                completed += 1
+                last_key = rollout_key
+        finally:
             # sync_rollout_path commits the corpus plus its source-state
-            # receipt as one rollout transaction. Only then may fair resume
-            # advance past it; an expired tick leaves untouched rollouts next.
-            _record_codex_rollout_completion(conn, rollout_key)
+            # receipt as one rollout transaction, so the fair cursor may move
+            # past every completed rollout with a single commit per pass. An
+            # expired tick leaves untouched rollouts next.
+            if last_key is not None:
+                _record_codex_rollout_completion(conn, last_key)
 
         if not embed:
             embedded = 0
@@ -2607,6 +2724,14 @@ def transpile(
                 == (after.st_size, after.st_mtime_ns)
                 and committed_offset == after.st_size
                 and parser_state.get("session_id")
+                # A continuation rollout shares its parent's session ID; it
+                # must not take an append receipt (sync_rollout_path refuses
+                # it as a collision on discovery).
+                and conn.execute(
+                    "SELECT 1 FROM _codex_source_state "
+                    "WHERE session_id=? AND source_path<>? LIMIT 1",
+                    (parser_state["session_id"], str(jsonl.resolve())),
+                ).fetchone() is None
             ):
                 conn.execute(
                     """INSERT INTO _codex_source_state(
@@ -2623,7 +2748,7 @@ def transpile(
                          parser_state=excluded.parser_state""",
                     (str(jsonl.resolve()), after.st_size, after.st_mtime_ns,
                      committed_offset, _count_jsonl_lines(jsonl, 0, committed_offset),
-                     _rollout_generation(after), parser_state["session_id"],
+                     _rollout_generation(after, jsonl), parser_state["session_id"],
                      json.dumps(parser_state, separators=(",", ":"))),
                 )
             n_chunks += added

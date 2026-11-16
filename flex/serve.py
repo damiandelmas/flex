@@ -218,16 +218,29 @@ def run_http_server(port: int = 7134, active_names: list[str] | None = None, no_
             or dim not in {64, 128, 256, 512, 768}
             or not isinstance(texts, list)
             or not 1 <= len(texts) <= 64
-            or any(not isinstance(text, str) or len(text) > 32768 for text in texts)
+            or any(not isinstance(text, str) for text in texts)
         ):
             return JSONResponse({"error": "invalid embedding request"}, status_code=400)
 
         def _encode():
+            import numpy as np
             from flex.engine import _query_embedder_for
 
             query_fn, document_fn = _query_embedder_for(model, dim)
-            fn = query_fn if mode == "query" else document_fn
-            return fn(texts, batch_size=64)
+            if mode == "query":
+                return query_fn(texts, batch_size=64)
+            # Each slice is its own call, so the inference lock is released
+            # between slices and queries are not stuck behind a whole drain.
+            # Shortest-first keeps padding tight; rows are restored to request order.
+            order = sorted(range(len(texts)), key=lambda i: len(texts[i]))
+            parts = [
+                document_fn([texts[i] for i in order[start:start + 8]], batch_size=8)
+                for start in range(0, len(order), 8)
+            ]
+            vectors = np.concatenate(parts)
+            result = np.empty_like(vectors)
+            result[order] = vectors
+            return result
 
         try:
             vectors = await asyncio.get_running_loop().run_in_executor(None, _encode)

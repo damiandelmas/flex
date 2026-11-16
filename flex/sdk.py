@@ -457,6 +457,7 @@ def register(
     refresh_script: Optional[str] = None,
     watch_path: Optional[str] = None,
     watch_pattern: Optional[str] = None,
+    publish: bool = True,
 ) -> str:
     """Register cell: validate, generate views, install presets, activate for MCP.
 
@@ -541,6 +542,7 @@ def register(
         refresh_script=refresh_script,
         watch_path=watch_path,
         watch_pattern=watch_pattern,
+        publish=publish,
     )
 
     return cell_id

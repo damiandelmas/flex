@@ -10,19 +10,10 @@ SELECT datetime('now', 'localtime') as now,
 -- @query: about
 SELECT value as description FROM _meta WHERE key = 'description';
 
--- @query: cell_docs
-SELECT scope, name, path, mtime, chars, content
-FROM _flex_docs
-ORDER BY
-    CASE scope
-        WHEN 'cell_instructions' THEN 0
-        WHEN 'local_notes' THEN 1
-        ELSE 2
-    END,
-    name;
-
 -- @query: query_surface
--- Everything composable in one section: views (primary), table functions, edge tables for explicit JOIN.
+-- Everything composable in one section: views (primary), retrieval operations, edge tables for explicit JOIN.
+-- Retrieval rows are derived from what this connection registered: the Flex
+-- engine (no sqlite-vec loaded) offers vec_ops/keyword; a connection with sqlite-vec and sqlite-ai loaded offers llm_embed_generate and vec_distance_*.
 SELECT 'view' as kind, m.name as name, GROUP_CONCAT(p.name, ', ') as columns,
     CASE m.name
         WHEN 'chunks' THEN 'UNIFIED search surface. Treat content as retrieval clues; tool-output chunks may be clipped. Use @full id=... for source body recovery.'
@@ -38,10 +29,18 @@ WHERE m.type = 'view'
 GROUP BY m.name
 UNION ALL
 SELECT 'table_function', 'vec_ops [_raw_chunks]', 'id, score', 'Semantic retrieval — use after FROM/JOIN. Args: table, query, tokens, pre_filter_sql'
+WHERE NOT EXISTS (SELECT 1 FROM pragma_function_list WHERE name = 'vec_distance_cosine')
 UNION ALL
 SELECT 'table_function', 'keyword', 'id, rank, snippet', 'FTS5 keyword search — use after FROM/JOIN. keyword(''term'', ''pre_filter_sql'') — optional 2nd arg scopes BM25 ranking'
+WHERE NOT EXISTS (SELECT 1 FROM pragma_function_list WHERE name = 'vec_distance_cosine')
 UNION ALL
-SELECT 'table_function', 'chunks_fts', 'rowid, content', 'Raw FTS5 table (prefer keyword() instead). Bridge to vec_ops via: SELECT c.id FROM chunks_fts f JOIN _raw_chunks c ON f.rowid = c.rowid'
+SELECT 'function', 'llm_embed_generate', 'text -> float32[768]', 'Embed a question in SQL: vec_slice(llm_embed_generate(''search_query: '' || :q), 0, 256). Compute once in a MATERIALIZED CTE.'
+WHERE EXISTS (SELECT 1 FROM pragma_function_list WHERE name = 'llm_embed_generate')
+UNION ALL
+SELECT 'function', 'vec_distance_cosine / vec_distance_l2', 'distance', 'Exact semantic scoring over _raw_chunks.embedding (768 float32; score at 256 with vec_slice). score = 1 - vec_distance_cosine(...).'
+WHERE EXISTS (SELECT 1 FROM pragma_function_list WHERE name = 'vec_distance_cosine')
+UNION ALL
+SELECT 'table_function', 'chunks_fts', 'rowid, content', 'FTS5 index over _raw_chunks (rowid = _raw_chunks.rowid). chunks_fts MATCH ''term'' or ''"exact phrase"''; bm25(chunks_fts) ascending is best.'
 UNION ALL
 SELECT 'edge_table', '_edges_raw_content', 'chunk_id, content_hash', 'Bridge to _raw_content(hash, content). Use file_body in messages view instead'
 UNION ALL
@@ -66,8 +65,8 @@ SELECT 'path_timeline',
        'Ordered mutations, reads, target-file touches, and stdout observations.'
 UNION ALL
 SELECT 'exact_phrase',
-       'keyword(''\"multi word phrase\"'', ''SELECT id FROM chunks'')',
-       'Quote multi-word names/brands/titles inside keyword() to avoid tokenization noise.'
+       'chunks_fts MATCH ''"multi word phrase"''',
+       'Quote multi-word names/brands/titles as an FTS5 phrase to avoid tokenization noise.'
 UNION ALL
 SELECT 'manual_check',
        'SELECT id, length(content), length(file_body) FROM messages WHERE id = ...',

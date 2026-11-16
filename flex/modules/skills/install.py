@@ -109,6 +109,7 @@ def run(args, console) -> None:
         lifecycle="refresh",
         refresh_interval=DEFAULT_REFRESH_INTERVAL,
         refresh_module=MODULE["refresh_module"],
+        publish=True,
     )
 
     if getattr(args, "tools_refresh", False):
