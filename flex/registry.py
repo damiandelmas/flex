@@ -357,6 +357,11 @@ def register_cell(
 
     if existing is None and unlisted is None:
         unlisted = not publish
+    # A new row is explicitly active: an unset value would be stored as NULL
+    # (the column default does not apply to an explicit NULL). An explicit
+    # argument still wins, and an existing row keeps its state.
+    if existing is None and active is None:
+        active = True
 
     # Publishing is checked: a cell reaches the flex tool only if it is a
     # self-describing flex cell. A failing cell is still registered (services

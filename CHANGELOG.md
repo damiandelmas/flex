@@ -4,6 +4,20 @@ Public changes to **flex** ([getflex.dev](https://getflex.dev)).
 
 ---
 
+## 0.56.1 — November 16, 2026
+
+A small fix release for the MCP tool list and cell registration.
+
+- The MCP tool list now also skips a cell that resolves but cannot be opened,
+  such as a file that is not a SQLite database. It is logged once, and every
+  other cell stays listed and queryable.
+- Skipped cells no longer appear in the tool's cell examples or in the
+  unknown-cell error.
+- Registering a new cell now stores `active=1` explicitly. An explicit value
+  still wins, and re-registering keeps the existing state.
+
+---
+
 ## 0.56.0 — November 11, 2026
 
 This release gives local capture one scheduler, moves embedding onto its own

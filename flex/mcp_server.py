@@ -328,6 +328,14 @@ def discover_cells() -> list[str]:
 _unresolvable_logged: set[str] = set()
 
 
+def _skip_unavailable_cell(name: str, reason: str) -> None:
+    """Drop an unusable cell from discovery and log it once."""
+    _known_cells.discard(name)
+    if name not in _unresolvable_logged:
+        _unresolvable_logged.add(name)
+        print(f"[flex-mcp] Skipping cell '{name}': {reason}", file=sys.stderr)
+
+
 def _db_path(name: str) -> Path:
     p = registry_resolve(name)
     if p is None:
@@ -377,17 +385,28 @@ def get_cell(name: str, warm_vec: bool = True):
     # it must not take down schema generation for every other cell.
     p = registry_resolve(name)
     if p is None:
-        if name not in _unresolvable_logged:
-            _unresolvable_logged.add(name)
-            print(f"[flex-mcp] Skipping cell '{name}': path does not resolve "
-                  f"to a trusted location", file=sys.stderr)
+        _skip_unavailable_cell(name, "path does not resolve to a trusted location")
         yield None
         return
     if not p.exists():
+        _known_cells.discard(name)
         yield None
         return
 
-    db = _open_query_cell(p)
+    # A path that resolves but is not a usable SQLite database is equally
+    # unavailable. Probe it once, here, so schema generation and other cells'
+    # queries never see the failure.
+    try:
+        db = _open_query_cell(p)
+        try:
+            db.execute("SELECT 1 FROM sqlite_master LIMIT 1").fetchone()
+        except Exception:
+            db.close()
+            raise
+    except Exception as e:
+        _skip_unavailable_cell(name, f"cannot open: {e}")
+        yield None
+        return
     try:
         is_listed = not bool(metadata.get("unlisted", 0))
         is_new = is_listed and name not in _known_cells
@@ -867,13 +886,15 @@ def _build_tool_description() -> str:
 
 def _build_tool_schema() -> dict:
     """Build JSON Schema. The query parameter description carries the starter contract."""
+    # Describe first: visiting each cell drops unusable ones from _known_cells.
+    query_description = _build_query_description()
     cell_list = sorted(_known_cells)
     return {
         "type": "object",
         "properties": {
             "query": {
                 "type": "string",
-                "description": _build_query_description(),
+                "description": query_description,
             },
             "cell": {
                 "type": "string",
@@ -1213,7 +1234,7 @@ def _unknown_cell_result(cell: str) -> str:
     if retired:
         return json.dumps({"error": retired, "retired": True})
     available = sorted(_known_cells)
-    on_disk = set(discover_cells()) - set(available)
+    on_disk = set(discover_cells()) - set(available) - _unresolvable_logged
     msg = {"error": f"Unknown cell: {cell}", "available": available}
     if on_disk:
         msg["also_on_disk"] = sorted(on_disk)
